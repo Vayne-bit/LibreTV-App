@@ -1,6 +1,7 @@
-// 详情弹层：多线路、分组选集、继续观看
+// 详情弹层：多源测速、多线路、分组选集、继续观看
 
 const DETAIL_EPISODES_PER_GROUP = 50;
+const DETAIL_PROBE_WAIT_MS = 5000;
 
 const detailState = {
     token: 0,
@@ -13,7 +14,11 @@ const detailState = {
     lineIndex: 0,
     group: 0,
     reversed: false,
-    watchedIndex: -1
+    watchedIndex: -1,
+    sources: [],
+    sourceIndex: -1,
+    sourcePicked: false,
+    autoPicked: false
 };
 
 function getSourceDisplayName(sourceCode) {
@@ -55,6 +60,27 @@ function preferredLineIndex(lines) {
     return index >= 0 ? index : 0;
 }
 
+function preferredEpisodeCount(lines) {
+    const line = lines[preferredLineIndex(lines)];
+    return line ? line.episodes.length : 0;
+}
+
+async function fetchVodDetail(id, sourceCode) {
+    const response = await tauriInvoke('make_http_request', {
+        options: { url: getDetailApiUrl(id, sourceCode), method: 'GET', headers: API_CONFIG.detail.headers, timeout_secs: 15 }
+    });
+    if (!(response.status >= 200 && response.status < 300)) throw new Error(`接口返回 ${response.status}`);
+    let data;
+    try {
+        data = JSON.parse(response.body);
+    } catch (e) {
+        throw new Error('返回的数据格式不是有效的 JSON');
+    }
+    const video = data && Array.isArray(data.list) && data.list.length > 0 ? data.list[0] : null;
+    if (!video) throw new Error('没有找到该视频');
+    return video;
+}
+
 function currentDetailLine() {
     return detailState.lines[detailState.lineIndex] || { name: '', episodes: [] };
 }
@@ -88,72 +114,193 @@ function renderDetailSkeleton(title) {
             <div style="flex:0 0 104px;aspect-ratio:2/3"></div>
             <div style="flex:1;height:120px"></div>
         </div>
+        ${detailSourcesHtml()}
         <div class="detail-episodes" style="margin-top:24px">
             ${'<button type="button" disabled style="opacity:.4">&nbsp;</button>'.repeat(12)}
         </div>`;
 }
 
-async function showDetails(id, vod_name, sourceCode) {
-    if (window.isPasswordProtected && window.isPasswordVerified && window.isPasswordProtected() && !window.isPasswordVerified()) {
-        if (typeof showPasswordModal === 'function') showPasswordModal();
-        return;
-    }
+function showDetails(id, vod_name, sourceCode) {
     if (!id) {
         showToast('视频ID无效', 'error');
+        return;
+    }
+    showDetailSources([{ id, sourceCode }], vod_name);
+}
+
+function showDetailSources(items, title) {
+    if (window.isPasswordProtected && window.isPasswordVerified && window.isPasswordProtected() && !window.isPasswordVerified()) {
+        if (typeof showPasswordModal === 'function') showPasswordModal();
         return;
     }
 
     const token = ++detailState.token;
     Object.assign(detailState, {
-        id, sourceCode, title: vod_name || '', sourceName: getSourceDisplayName(sourceCode),
+        id: '', sourceCode: '', sourceName: '', title: title || '',
         video: null, lines: [], lineIndex: 0, group: 0,
-        reversed: localStorage.getItem('episodesReversed') === 'true', watchedIndex: -1
+        reversed: localStorage.getItem('episodesReversed') === 'true', watchedIndex: -1,
+        sources: items.map(item => ({
+            id: String(item.id),
+            sourceCode: item.sourceCode,
+            sourceName: getSourceDisplayName(item.sourceCode),
+            status: 'loading',
+            error: '',
+            video: null,
+            lines: [],
+            probe: 'pending',
+            ms: 0
+        })),
+        sourceIndex: -1,
+        sourcePicked: false,
+        autoPicked: false
     });
-    renderDetailSkeleton(vod_name);
+    renderDetailSkeleton(title);
     openDetailSheet();
 
+    detailState.sources.forEach(source => loadDetailSource(token, source));
+    if (detailState.sources.length > 1) setTimeout(() => autoPickFastestSource(token), DETAIL_PROBE_WAIT_MS);
+}
+
+async function loadDetailSource(token, source) {
     try {
-        const response = await tauriInvoke('make_http_request', {
-            options: { url: getDetailApiUrl(id, sourceCode), method: 'GET', headers: API_CONFIG.detail.headers, timeout_secs: 15 }
-        });
+        const video = await fetchVodDetail(source.id, source.sourceCode);
         if (token !== detailState.token) return;
-        if (!(response.status >= 200 && response.status < 300)) throw new Error(`接口返回 ${response.status}`);
-        let data;
-        try {
-            data = JSON.parse(response.body);
-        } catch (e) {
-            throw new Error('返回的数据格式不是有效的 JSON');
+        Object.assign(source, { status: 'ok', video, lines: parsePlayLines(video) });
+        if (isFavorite(source.sourceCode, source.id)) {
+            markFavoriteSeen(source.sourceCode, source.id, preferredEpisodeCount(source.lines), video.vod_remarks || '');
+            renderFavoritesPage();
         }
-        const video = data && Array.isArray(data.list) && data.list.length > 0 ? data.list[0] : null;
-        if (!video) throw new Error('没有找到该视频');
-
-        detailState.video = video;
-        detailState.title = vod_name || video.vod_name || '未知视频';
-        detailState.lines = parsePlayLines(video);
-        detailState.lineIndex = preferredLineIndex(detailState.lines);
-
-        const historyItem = getViewingHistory().find(item => item.title === detailState.title);
-        if (historyItem && typeof historyItem.episodeIndex === 'number') detailState.watchedIndex = historyItem.episodeIndex;
-        const total = currentDetailLine().episodes.length;
-        detailState.group = detailState.watchedIndex >= 0 && detailState.watchedIndex < total
-            ? Math.floor(detailState.watchedIndex / DETAIL_EPISODES_PER_GROUP) : 0;
-
-        renderDetailContent();
+        const index = detailState.sources.indexOf(source);
+        if (detailState.sourceIndex < 0 || detailState.sourceIndex === index) applyDetailSource(index);
+        else renderDetailSources();
+        if (detailState.sources.length > 1) probeDetailSource(token, source);
     } catch (error) {
         if (token !== detailState.token) return;
         console.error('获取详情错误:', error);
-        document.getElementById('modalContent').innerHTML = `
-            <div class="empty-state">
-                <p>获取详情失败</p>
-                <span>${escapeHtml(error && error.message ? error.message : '请稍后重试或换一个数据源')}</span>
-            </div>`;
+        Object.assign(source, { status: 'error', error: error && error.message ? error.message : '', probe: 'fail' });
+        const index = detailState.sources.indexOf(source);
+        const allFailed = detailState.sourceIndex < 0 && detailState.sources.every(s => s.status === 'error');
+        if (detailState.sourceIndex === index || allFailed) applyDetailSource(index);
+        else renderDetailSources();
+        finishProbeIfDone(token);
     }
+}
+
+function applyDetailSource(index) {
+    const source = detailState.sources[index];
+    Object.assign(detailState, {
+        sourceIndex: index, id: source.id, sourceCode: source.sourceCode, sourceName: source.sourceName,
+        video: source.video, lines: source.lines, lineIndex: preferredLineIndex(source.lines), group: 0, watchedIndex: -1
+    });
+    if (source.status !== 'ok') {
+        renderDetailPending(source);
+        return;
+    }
+
+    if (!detailState.title) detailState.title = source.video.vod_name || '未知视频';
+    const historyItem = getViewingHistory().find(item => item.title === detailState.title);
+    if (historyItem && typeof historyItem.episodeIndex === 'number') detailState.watchedIndex = historyItem.episodeIndex;
+    const total = currentDetailLine().episodes.length;
+    detailState.group = detailState.watchedIndex >= 0 && detailState.watchedIndex < total
+        ? Math.floor(detailState.watchedIndex / DETAIL_EPISODES_PER_GROUP) : 0;
+    renderDetailContent();
+}
+
+function selectDetailSource(index) {
+    const source = detailState.sources[index];
+    if (!source || (index === detailState.sourceIndex && source.status !== 'error')) return;
+    detailState.sourcePicked = true;
+    if (source.status === 'error') {
+        Object.assign(source, { status: 'loading', error: '', probe: 'pending' });
+        loadDetailSource(detailState.token, source);
+    }
+    applyDetailSource(index);
+}
+
+async function probeDetailSource(token, source) {
+    const line = source.lines[preferredLineIndex(source.lines)];
+    const url = line && line.episodes[0] ? line.episodes[0].url : '';
+    let result = null;
+    if (url) {
+        try {
+            result = await tauriInvoke('probe_url', { url, timeoutSecs: 5 });
+        } catch (e) { /* counted as unavailable */ }
+    }
+    if (token !== detailState.token) return;
+    Object.assign(source, result && result.ok ? { probe: 'ok', ms: result.ms } : { probe: 'fail', ms: 0 });
+    renderDetailSources();
+    finishProbeIfDone(token);
+}
+
+function finishProbeIfDone(token) {
+    const done = detailState.sources.every(s => s.status === 'error' || (s.status === 'ok' && s.probe !== 'pending'));
+    if (done) autoPickFastestSource(token);
+}
+
+function fastestDetailSourceIndex() {
+    let best = -1;
+    detailState.sources.forEach((source, index) => {
+        if (source.probe === 'ok' && (best < 0 || source.ms < detailState.sources[best].ms)) best = index;
+    });
+    return best;
+}
+
+function autoPickFastestSource(token) {
+    if (token !== detailState.token || detailState.autoPicked || detailState.sources.length < 2) return;
+    detailState.autoPicked = true;
+    if (detailState.sourcePicked) return;
+    const fastest = fastestDetailSourceIndex();
+    if (fastest >= 0 && fastest !== detailState.sourceIndex) applyDetailSource(fastest);
+}
+
+function detailSourceStatus(source) {
+    if (source.probe === 'ok') return `${source.ms}ms`;
+    if (source.probe === 'fail') return '不可用';
+    return '测速中';
+}
+
+function detailSourceChipsHtml() {
+    const measured = detailState.sources.filter(s => s.probe === 'ok').length;
+    const fastest = measured >= 2 ? fastestDetailSourceIndex() : -1;
+    const rank = source => ({ ok: 0, pending: 1, fail: 2 })[source.probe];
+    return detailState.sources
+        .map((source, index) => ({ source, index }))
+        .sort((a, b) => rank(a.source) - rank(b.source) || a.source.ms - b.source.ms)
+        .map(({ source, index }) => {
+            const classes = ['chip', 'source-chip'];
+            if (index === detailState.sourceIndex) classes.push('active');
+            if (source.probe === 'fail') classes.push('unavailable');
+            return `<button type="button" class="${classes.join(' ')}" data-source-index="${index}">${escapeHtml(source.sourceName || source.sourceCode)} · ${detailSourceStatus(source)}${index === fastest ? '<em>最快</em>' : ''}</button>`;
+        }).join('');
+}
+
+function detailSourcesHtml() {
+    if (detailState.sources.length < 2) return '';
+    return `<div class="detail-section-head"><h3>播放源</h3></div>
+        <div id="detailSources" class="chip-row">${detailSourceChipsHtml()}</div>`;
+}
+
+function renderDetailSources() {
+    const row = document.getElementById('detailSources');
+    if (row) row.innerHTML = detailSourceChipsHtml();
+}
+
+function detailSheetTitle() {
+    return [detailState.title, detailState.sourceName].filter(Boolean).join(' · ');
+}
+
+function renderDetailPending(source) {
+    document.getElementById('modalTitle').textContent = detailSheetTitle() || '加载中';
+    const message = source.status === 'error'
+        ? `<p>获取详情失败</p><span>${escapeHtml(source.error || '请稍后重试或换一个数据源')}</span>`
+        : '<p>正在获取详情…</p>';
+    document.getElementById('modalContent').innerHTML = `${detailSourcesHtml()}<div class="empty-state">${message}</div>`;
 }
 
 function renderDetailContent() {
     const video = detailState.video;
     const line = currentDetailLine();
-    document.getElementById('modalTitle').textContent = detailState.sourceName ? `${detailState.title} · ${detailState.sourceName}` : detailState.title;
+    document.getElementById('modalTitle').textContent = detailSheetTitle();
 
     const tags = [video.type_name, video.vod_year, video.vod_area, video.vod_lang].filter(Boolean);
     const rows = [['状态', video.vod_remarks], ['导演', video.vod_director], ['主演', video.vod_actor]].filter(([, v]) => v);
@@ -169,12 +316,16 @@ function renderDetailContent() {
                 <div class="detail-title">${escapeHtml(detailState.title)}</div>
                 ${tags.length ? `<div class="detail-tags">${tags.map(t => `<span>${escapeHtml(t)}</span>`).join('')}</div>` : ''}
                 ${rows.map(([k, v]) => `<p class="detail-row"><span>${k}</span>${escapeHtml(v)}</p>`).join('')}
-                ${line.episodes.length ? `<button type="button" class="btn-primary detail-play" data-play-index="${resumeIndex}">
-                    <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5z"/></svg>
-                    ${escapeHtml(playLabel)}</button>` : ''}
+                <div class="detail-actions">
+                    ${line.episodes.length ? `<button type="button" class="btn-primary" data-play-index="${resumeIndex}">
+                        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5z"/></svg>
+                        ${escapeHtml(playLabel)}</button>` : ''}
+                    ${detailFavoriteButtonHtml()}
+                </div>
             </div>
         </div>
         ${desc ? `<p class="detail-desc" data-action="toggle-desc">${escapeHtml(desc)}</p>` : ''}
+        ${detailSourcesHtml()}
         ${line.episodes.length ? `
             <div class="detail-section-head">
                 <h3>选集 <span class="text-sm font-normal text-gray-500">共 ${line.episodes.length} 集</span></h3>
@@ -191,6 +342,43 @@ function renderDetailContent() {
         : '<div class="empty-state"><p>没有找到可播放的视频</p><span>换一个数据源试试</span></div>'}`;
 
     renderDetailEpisodes();
+}
+
+// 同一部影片可能已从别的源收藏过，按"已收藏"处理，避免重复收藏
+function detailFavoriteSource() {
+    const current = detailState.sources[detailState.sourceIndex];
+    if (current && isFavorite(current.sourceCode, current.id)) return current;
+    return detailState.sources.find(source => isFavorite(source.sourceCode, source.id)) || null;
+}
+
+function detailFavoriteButtonHtml() {
+    const active = !!detailFavoriteSource();
+    return `<button type="button" class="btn-secondary detail-fav ${active ? 'active' : ''}" data-action="favorite">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="${active ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 3.5l2.6 5.3 5.9.9-4.3 4.1 1 5.8L12 16.9l-5.2 2.7 1-5.8-4.3-4.1 5.9-.9z"/></svg>
+        ${active ? '已收藏' : '收藏'}</button>`;
+}
+
+function toggleDetailFavorite(button) {
+    const favorited = detailFavoriteSource();
+    if (favorited) {
+        removeFavorite(favorited.sourceCode, favorited.id);
+    } else {
+        const video = detailState.video || {};
+        toggleFavorite({
+            id: detailState.id,
+            sourceCode: detailState.sourceCode,
+            sourceName: detailState.sourceName,
+            title: detailState.title,
+            cover: video.vod_pic || '',
+            type: video.type_name || '',
+            year: video.vod_year || '',
+            remarks: video.vod_remarks || '',
+            episodeCount: preferredEpisodeCount(detailState.lines)
+        });
+    }
+    button.outerHTML = detailFavoriteButtonHtml();
+    renderFavoritesPage();
+    showToast(favorited ? '已取消收藏' : '已加入收藏', 'success');
 }
 
 function stripDetailHtml(value) {
@@ -258,7 +446,9 @@ function playDetailEpisode(index) {
             remarks: video.vod_remarks || '',
             desc: stripDetailHtml(video.vod_content || video.vod_blurb || ''),
             sourceName: detailState.sourceName,
-            lineName: line.name
+            lineName: line.name,
+            vodId: detailState.id,
+            sourceCode: detailState.sourceCode
         }
     });
 }
@@ -292,6 +482,8 @@ function setupDetailSheet() {
     content.addEventListener('click', (e) => {
         const playBtn = e.target.closest('[data-play-index]');
         if (playBtn) { playDetailEpisode(parseInt(playBtn.dataset.playIndex, 10)); return; }
+        const sourceBtn = e.target.closest('[data-source-index]');
+        if (sourceBtn) { selectDetailSource(parseInt(sourceBtn.dataset.sourceIndex, 10)); return; }
         const lineBtn = e.target.closest('[data-line]');
         if (lineBtn) {
             detailState.lineIndex = parseInt(lineBtn.dataset.line, 10);
@@ -309,6 +501,7 @@ function setupDetailSheet() {
         if (!action) return;
         if (action.dataset.action === 'order') toggleEpisodeOrder();
         else if (action.dataset.action === 'copy') copyLinks();
+        else if (action.dataset.action === 'favorite') toggleDetailFavorite(action);
         else if (action.dataset.action === 'toggle-desc') action.classList.toggle('expanded');
     });
 

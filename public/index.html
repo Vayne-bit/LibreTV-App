@@ -9,8 +9,9 @@
     <link rel="icon" href="./image/retrotv_5520.png">
     <link rel="apple-touch-icon" href="./image/retrotv_5520.png">
     <link rel="manifest" href="manifest.json">
-    <script src="libs/tailwindcss.min.js"></script>
+    <link rel="stylesheet" href="css/tailwind-base.css">
     <link rel="stylesheet" href="css/app.css">
+    <link rel="stylesheet" href="css/tailwind-utilities.css">
 </head>
 <body class="app-body">
     <nav id="sideRail" class="side-rail" aria-label="主导航">
@@ -24,8 +25,8 @@
             <span>搜索</span>
         </button>
         <button type="button" class="nav-item" data-page="history">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
-            <span>历史</span>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>
+            <span>我的</span>
         </button>
         <button type="button" class="nav-item" data-page="settings">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
@@ -121,16 +122,22 @@
             </div>
         </section>
 
-        <!-- 历史 -->
+        <!-- 我的：历史 / 收藏 -->
         <section id="page-history" class="page hidden">
             <header class="page-header">
                 <div class="page-header-bar">
-                    <h2 class="page-title">观看历史</h2>
-                    <button type="button" class="text-btn" onclick="clearViewingHistory()">清空</button>
+                    <h2 class="page-title">我的</h2>
+                    <button type="button" id="historyClearBtn" class="text-btn" onclick="clearViewingHistory()">清空</button>
+                    <button type="button" id="favoritesManageBtn" class="text-btn hidden">管理</button>
+                </div>
+                <div id="mineTabs" class="channel-tabs" role="tablist">
+                    <button type="button" role="tab" data-mine-tab="history" class="active" aria-selected="true">历史</button>
+                    <button type="button" role="tab" data-mine-tab="fav" aria-selected="false">收藏<i class="tab-dot hidden"></i></button>
                 </div>
             </header>
             <div class="page-body">
                 <div id="historyList"></div>
+                <div id="favoritesList" class="hidden"></div>
             </div>
         </section>
 
@@ -248,8 +255,8 @@
             <span>搜索</span>
         </button>
         <button type="button" class="nav-item" data-page="history">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
-            <span>历史</span>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>
+            <span>我的</span>
         </button>
         <button type="button" class="nav-item" data-page="settings">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
@@ -339,6 +346,7 @@
     <script src="js/config_io.js"></script>
     <script src="js/douban_api.js"></script>
     <script src="js/home_feed.js"></script>
+    <script src="js/favorites.js"></script>
     <script src="js/history_page.js"></script>
     <script src="js/app_shell.js"></script>
     <script src="js/version-check.js"></script>

@@ -6,9 +6,10 @@
     <meta name="theme-color" content="#000000">
     <title>LibreTV 播放器</title>
     <link rel="icon" href="image/retrotv_5520.png">
-    <script src="libs/tailwindcss.min.js"></script>
+    <link rel="stylesheet" href="css/tailwind-base.css">
     <link rel="stylesheet" href="css/app.css">
     <link rel="stylesheet" href="css/player.css">
+    <link rel="stylesheet" href="css/tailwind-utilities.css">
     <script>
         window.__ENV__ = window.__ENV__ || {};
         window.__ENV__.PASSWORD = "{{PASSWORD}}";
@@ -58,6 +59,10 @@
                     <button id="copyLinkBtn" type="button" class="action-btn">
                         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1"/><path d="M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1"/></svg>
                         <span>复制链接</span>
+                    </button>
+                    <button id="favoriteBtn" type="button" class="action-btn hidden">
+                        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 3.5l2.6 5.3 5.9.9-4.3 4.1 1 5.8L12 16.9l-5.2 2.7 1-5.8-4.3-4.1 5.9-.9z"/></svg>
+                        <span>收藏</span>
                     </button>
                 </div>
             </div>
@@ -112,6 +117,7 @@
     <script src="js/password.js"></script>
     <script src="js/ui.js"></script>
     <script src="js/common.js"></script>
+    <script src="js/favorites.js"></script>
     <script src="js/player_vars.js"></script>
     <script src="js/player_utils.js"></script>
     <script src="js/player_ui_helpers.js"></script>

@@ -6,10 +6,13 @@
 
 console.log('douban_api.js loaded');
 
-const DOUBAN_API_CACHE_DURATION_MS = 10 * 60 * 1000; // 10 minutes cache
-const DOUBAN_API_MAX_RETRIES = 5; // Original attempt + 5 retries (total 6 attempts)
-const INITIAL_RETRY_DELAY_MS = 1500; // 1.5 seconds initial delay
-const MAX_SINGLE_RETRY_DELAY_MS = 15000; // Max delay for a single retry (15 seconds)
+const DOUBAN_API_CACHE_DURATION_MS = 30 * 60 * 1000;
+const DOUBAN_API_STALE_MAX_MS = 24 * 60 * 60 * 1000;
+const DOUBAN_API_CACHE_PREFIX = 'douban_cache_v1:';
+const DOUBAN_API_CACHE_MAX_ENTRIES = 80;
+const DOUBAN_API_MAX_RETRIES = 2;
+const INITIAL_RETRY_DELAY_MS = 1000;
+const MAX_SINGLE_RETRY_DELAY_MS = 4000;
 
 // Correct API base URL for the new search subjects endpoint.
 const DOUBAN_NEW_SEARCH_API_BASE = 'https://movie.douban.com/j/new_search_subjects';
@@ -90,159 +93,120 @@ async function fetchNewDoubanSearch(params = {}) {
     return fetchDoubanData(urlToFetch); // Use the common fetchDoubanData for the actual request
 }
 
-// Common function to fetch data from Douban, used by both old and new API calls.
-async function fetchDoubanData(url) {
-    const cacheKey = `douban_api_cache_${url}`; // Prefix to avoid potential key collisions
+const doubanInflightRequests = new Map();
 
-    // Try to retrieve from cache first
+function readDoubanCache(url) {
     try {
-        const cachedItemRaw = sessionStorage.getItem(cacheKey);
-        if (cachedItemRaw) {
-            const cachedItem = JSON.parse(cachedItemRaw);
-            if (cachedItem && cachedItem.timestamp && cachedItem.data) {
-                if ((Date.now() - cachedItem.timestamp) < DOUBAN_API_CACHE_DURATION_MS) {
-                    console.log(`[Douban API Cache] Using cached response for ${url}`);
-                    return Promise.resolve(cachedItem.data); // Return cached data
-                } else {
-                    console.log(`[Douban API Cache] Cache expired for ${url}`);
-                    sessionStorage.removeItem(cacheKey); // Remove expired item
-                }
-            }
-        }
+        const item = JSON.parse(localStorage.getItem(DOUBAN_API_CACHE_PREFIX + url) || 'null');
+        return item && item.timestamp && item.data ? item : null;
     } catch (e) {
-        console.warn(`[Douban API Cache] Error reading from cache for ${url}:`, e);
-        sessionStorage.removeItem(cacheKey); // Remove potentially corrupted item
+        return null;
     }
+}
 
-    console.log('[MY_APP_DEBUG_DOUBAN] fetchDoubanData called with URL (via Rust - no valid cache):', url);
+function pruneDoubanCache(maxEntries) {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith(DOUBAN_API_CACHE_PREFIX)) keys.push(key);
+    }
+    if (keys.length <= maxEntries) return;
+    const entries = keys.map(key => {
+        let timestamp = 0;
+        try { timestamp = JSON.parse(localStorage.getItem(key)).timestamp || 0; } catch (e) { /* corrupted entry sorts first */ }
+        return { key, timestamp };
+    });
+    entries.sort((a, b) => a.timestamp - b.timestamp);
+    entries.slice(0, entries.length - maxEntries).forEach(entry => localStorage.removeItem(entry.key));
+}
 
-    let currentDelay = INITIAL_RETRY_DELAY_MS;
+function writeDoubanCache(url, data) {
+    const value = JSON.stringify({ timestamp: Date.now(), data });
+    try {
+        localStorage.setItem(DOUBAN_API_CACHE_PREFIX + url, value);
+        pruneDoubanCache(DOUBAN_API_CACHE_MAX_ENTRIES);
+    } catch (e) {
+        // Storage full: drop the whole Douban cache so history and settings keep working.
+        pruneDoubanCache(0);
+    }
+}
+
+// Common function to fetch data from Douban, used by both old and new API calls.
+function fetchDoubanData(url) {
+    const cached = readDoubanCache(url);
+    if (cached && Date.now() - cached.timestamp < DOUBAN_API_CACHE_DURATION_MS) return Promise.resolve(cached.data);
+    if (doubanInflightRequests.has(url)) return doubanInflightRequests.get(url);
+    const request = requestDoubanData(url, cached).finally(() => doubanInflightRequests.delete(url));
+    doubanInflightRequests.set(url, request);
+    return request;
+}
+
+async function requestDoubanData(url, cached) {
+    const fallback = (error) => {
+        if (cached && Date.now() - cached.timestamp < DOUBAN_API_STALE_MAX_MS) return cached.data;
+        return url.includes('search_tags') ? { tags: [], error } : { subjects: [], error };
+    };
+    if (!isTauriApp()) return fallback({ msg: 'Tauri API unavailable' });
+
+    let lastError = null;
     for (let attempt = 0; attempt <= DOUBAN_API_MAX_RETRIES; attempt++) {
-        const requestOptions = {
-            url: url, method: "GET",
-            headers: {
-                'User-Agent': getRandomUserAgent(), // Use a random User-Agent
-                'Referer': 'https://movie.douban.com/',
-                'Accept': 'application/json, text/plain, */*',
-                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                'X-Requested-With': 'XMLHttpRequest'
-            },
-            timeout_secs: 20 
-        };
-        
         if (attempt > 0) {
-            console.log(`[Douban API] Retrying request for ${url}, attempt ${attempt + 1}/${DOUBAN_API_MAX_RETRIES + 1}`);
-        } else {
-            console.log('[MY_APP_DEBUG_DOUBAN] Invoking make_http_request with options:', JSON.stringify(requestOptions));
+            const delay = Math.min(INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt - 1), MAX_SINGLE_RETRY_DELAY_MS);
+            await new Promise(resolve => setTimeout(resolve, delay));
         }
 
-        if (attempt === 0) {
-            // For the very first attempt in the app's lifecycle for a Douban API call,
-            // add a small delay to give Tauri's invoke mechanism a bit more time if it's a cold start.
-            // This is a targeted fix for the initial load issue.
-            console.log('[Douban API] First attempt for this URL, adding a small pre-delay.');
-            await new Promise(resolve => setTimeout(resolve, 500)); // 500ms delay
-        }
-
+        let response;
         try {
-            if (typeof tauriConstants === 'undefined' || !tauriConstants.invoke) {
-                 console.warn('Tauri API (invoke) not available for Douban request.');
-                 return { subjects: [] }; 
-            }
-
-            const response = await tauriConstants.invoke('make_http_request', { options: requestOptions });
-            console.log(`[MY_APP_DEBUG_DOUBAN] Response from Rust command (Attempt ${attempt + 1}). Status:`, response.status);
-
-            if (response.status >= 200 && response.status < 300) {
-                try {
-                    let jsonData = JSON.parse(response.body);
-
-                    // Handle different Douban API response structures
-                    if (url.startsWith(DOUBAN_NEW_SEARCH_API_BASE) && typeof jsonData.data !== 'undefined' && Array.isArray(jsonData.data) && typeof jsonData.subjects === 'undefined') {
-                        // New search API: data is in jsonData.data
-                        console.log('[MY_APP_DEBUG_DOUBAN] New API (/j/new_search_subjects) response detected with "data" array. Reformatting to "subjects".');
-                        jsonData = { subjects: jsonData.data };
-                    } else if (url.startsWith('https://movie.douban.com/j/chart/top_list') && Array.isArray(jsonData)) {
-                        // Chart API: data is the array itself
-                        console.log('[MY_APP_DEBUG_DOUBAN] Chart API (/j/chart/top_list) response detected as direct array. Wrapping in "subjects".');
-                        // No, we don't wrap here. fetchDoubanData should return the raw JSON structure.
-                        // The calling function (fetchDoubanChartTopList) will handle the wrapping.
-                        // So, if it's an array from chart/top_list, we return it as is.
-                        // The cache will store the array.
-                    }
-                    // For /j/search_subjects, data is already in jsonData.subjects
-                    // For /j/search_tags, data is in jsonData.tags
-                    
-                    const isRateLimited = jsonData.msg && jsonData.msg.includes("检测到有异常请求");
-
-                    // Check for successful data structure or rate limit
-                    // For chart/top_list, jsonData itself is the array of subjects.
-                    const hasData = typeof jsonData.subjects !== 'undefined' || 
-                                    typeof jsonData.tags !== 'undefined' ||
-                                    (url.startsWith('https://movie.douban.com/j/chart/top_list') && Array.isArray(jsonData));
-
-                    if (!isRateLimited && hasData) {
-                        try {
-                            const itemToCache = { timestamp: Date.now(), data: jsonData };
-                            sessionStorage.setItem(cacheKey, JSON.stringify(itemToCache));
-                            console.log(`[Douban API Cache] Response for ${url} cached.`);
-                        } catch (e) {
-                            console.warn(`[Douban API Cache] Error saving to cache for ${url}:`, e);
-                        }
-                        return jsonData; // Successful fetch and not rate-limited
-                    } else if (isRateLimited) {
-                        console.warn(`[MY_APP_DEBUG_DOUBAN] Douban rate limit detected for ${url} on attempt ${attempt + 1}.`, jsonData);
-                        if (attempt < DOUBAN_API_MAX_RETRIES) {
-                            const delayForThisAttempt = Math.min(INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt), MAX_SINGLE_RETRY_DELAY_MS);
-                            console.log(`[Douban API] Rate limit. Waiting ${delayForThisAttempt}ms before retry ${attempt + 2}.`);
-                            await new Promise(resolve => setTimeout(resolve, delayForThisAttempt));
-                            continue; // Go to next retry attempt
-                        } else {
-                            // Max retries reached for rate limit
-                            if (url.includes('search_tags')) return { tags: [], error: jsonData };
-                            return { subjects: [], error: jsonData }; 
-                        }
-                    } else { 
-                         console.warn(`[MY_APP_DEBUG_DOUBAN] API response for ${url} (Attempt ${attempt+1}) did not contain 'subjects' or 'tags' key, and not a rate limit. Normalizing. Response:`, jsonData);
-                        if (url.includes('search_tags')) return { tags: [] }; 
-                        return { subjects: [] }; 
-                    }
-                } catch (parseError) {
-                    console.error(`[MY_APP_DEBUG_DOUBAN] Failed to parse response body (Attempt ${attempt+1}) from Rust as JSON. Error:`, parseError, 'Body:', response.body);
-                    // Don't retry on parse error, likely malformed response
-                    if (url.includes('search_tags')) return { tags: [] };
-                    return { subjects: [] }; 
+            response = await tauriInvoke('make_http_request', {
+                options: {
+                    url,
+                    method: 'GET',
+                    headers: {
+                        'User-Agent': getRandomUserAgent(),
+                        'Referer': 'https://movie.douban.com/',
+                        'Accept': 'application/json, text/plain, */*',
+                        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    timeout_secs: 15
                 }
-            } else { // HTTP error (e.g., 4xx, 5xx from Douban itself, not network error caught by outer catch)
-                console.error(`[MY_APP_DEBUG_DOUBAN] Douban API request via Rust failed (Attempt ${attempt+1}). Status: ${response.status}, Body: ${response.body.substring(0, 200)}`);
-                if (attempt < DOUBAN_API_MAX_RETRIES) { // Retry on server-side errors too
-                    const delayForThisAttempt = Math.min(INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt), MAX_SINGLE_RETRY_DELAY_MS);
-                    console.log(`[Douban API] HTTP error. Waiting ${delayForThisAttempt}ms before retry ${attempt + 2}.`);
-                    await new Promise(resolve => setTimeout(resolve, delayForThisAttempt));
-                    continue;
-                } else {
-                    if (url.includes('search_tags')) return { tags: [] };
-                    return { subjects: [] }; 
-                }
-            }
-        } catch (error) { // Network error or error invoking tauri command
-            console.error(`[MY_APP_DEBUG_DOUBAN] Error invoking make_http_request (Attempt ${attempt+1}) for URL:`, url, 'Error:', error);
-            if (attempt < DOUBAN_API_MAX_RETRIES) {
-                const delayForThisAttempt = Math.min(INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt), MAX_SINGLE_RETRY_DELAY_MS);
-                console.log(`[Douban API] Invoke/Network error. Waiting ${delayForThisAttempt}ms before retry ${attempt + 2}.`);
-                await new Promise(resolve => setTimeout(resolve, delayForThisAttempt));
-                continue; // Crucial for retry loop on network/invoke errors
-            } else {
-                // Max retries reached for network/invoke errors
-                if (url.includes('search_tags')) return { tags: [] };
-                return { subjects: [] }; 
-            }
+            });
+        } catch (error) {
+            lastError = { msg: error && error.error ? error.error : String(error) };
+            continue;
         }
+
+        if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+            return fallback({ msg: `HTTP ${response.status}` });
+        }
+        if (!(response.status >= 200 && response.status < 300)) {
+            lastError = { msg: `HTTP ${response.status}` };
+            continue;
+        }
+
+        let jsonData;
+        try {
+            jsonData = JSON.parse(response.body);
+        } catch (e) {
+            return fallback({ msg: 'Invalid JSON from Douban' });
+        }
+        if (url.startsWith(DOUBAN_NEW_SEARCH_API_BASE) && Array.isArray(jsonData.data) && typeof jsonData.subjects === 'undefined') {
+            jsonData = { subjects: jsonData.data };
+        }
+        if (jsonData.msg && String(jsonData.msg).includes('检测到有异常请求')) {
+            lastError = jsonData;
+            continue;
+        }
+
+        const hasData = typeof jsonData.subjects !== 'undefined' ||
+            typeof jsonData.tags !== 'undefined' ||
+            (url.startsWith('https://movie.douban.com/j/chart/top_list') && Array.isArray(jsonData));
+        if (!hasData) return fallback();
+
+        writeDoubanCache(url, jsonData);
+        return jsonData;
     }
-    // Fallback if all retries fail
-    console.error(`[Douban API] All retries failed for ${url}.`);
-    if (url.includes('search_tags')) return { tags: [], error: { msg: "All retries failed."} };
-    return { subjects: [], error: { msg: "All retries failed."} };
+    return fallback(lastError || { msg: 'All retries failed.' });
 }
 
 // Depends on: fetchDoubanData (now in this file)

@@ -136,6 +136,42 @@ function stripHtml(value) {
     return (div.textContent || '').replace(/\s+/g, ' ').trim();
 }
 
+function currentFavoriteEntry() {
+    const info = getCurrentVideoInfo();
+    if (!info.vodId || !info.sourceCode || (info.title && info.title !== currentVideoTitle)) return null;
+    return {
+        id: info.vodId,
+        sourceCode: info.sourceCode,
+        sourceName: info.sourceName || '',
+        title: currentVideoTitle,
+        cover: info.cover || localStorage.getItem('currentVideoCover') || '',
+        type: info.type || '',
+        year: info.year || '',
+        remarks: info.remarks || '',
+        episodeCount: currentEpisodes.length
+    };
+}
+
+function updateFavoriteButton() {
+    const btn = document.getElementById('favoriteBtn');
+    if (!btn) return;
+    const entry = currentFavoriteEntry();
+    btn.classList.toggle('hidden', !entry);
+    if (!entry) return;
+    const active = isFavorite(entry.sourceCode, entry.id);
+    btn.classList.toggle('active', active);
+    const label = btn.querySelector('span');
+    if (label) label.textContent = active ? '已收藏' : '收藏';
+}
+
+function togglePlayerFavorite() {
+    const entry = currentFavoriteEntry();
+    if (!entry) return;
+    const added = toggleFavorite(entry);
+    updateFavoriteButton();
+    showToast(added ? '已加入收藏' : '已取消收藏', 'success');
+}
+
 function switchWatchTab(tab) {
     document.querySelectorAll('.watch-tabs [data-tab]').forEach(btn => btn.classList.toggle('active', btn.dataset.tab === tab));
     document.querySelectorAll('.watch-tab-panel').forEach(panel => panel.classList.toggle('hidden', panel.id !== `tab-${tab}`));
@@ -181,9 +217,11 @@ function setupPlayerPageEvents() {
     bind('nextButton', playNextEpisode);
     bind('orderBtn', toggleEpisodeOrder);
     bind('copyLinkBtn', copyLinks);
+    bind('favoriteBtn', togglePlayerFavorite);
     bind('switchSourceBtn', searchOtherSources);
     bind('errorSwitchSourceBtn', searchOtherSources);
     bind('retryBtn', () => switchPlayerUrl(currentVideoUrl, getPlaybackState().position));
     bind('backBtn', goBack);
     bind('homeBtn', () => { saveCurrentProgress(); window.location.href = 'index.html'; });
+    updateFavoriteButton();
 }

@@ -66,6 +66,10 @@ async function exportConfig() {
     if (viewingHistory) {
         items['viewingHistory'] = viewingHistory;
     }
+    const favorites = localStorage.getItem(FAVORITES_KEY);
+    if (favorites) {
+        items[FAVORITES_KEY] = favorites;
+    }
     // SEARCH_HISTORY_KEY is assumed to be global or defined elsewhere
     const searchHistory = localStorage.getItem(SEARCH_HISTORY_KEY); 
     if (searchHistory) {

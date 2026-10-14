@@ -43,6 +43,18 @@ function vodCardHtml(item, { showSource = false } = {}) {
     });
 }
 
+function vodGroupCardHtml(items, key) {
+    const first = items[0];
+    const withCover = items.find(item => item.vod_pic) || first;
+    return posterCardHtml({
+        title: first.vod_name || '',
+        cover: withCover.vod_pic || '',
+        badge: `${items.length} 个源`,
+        subtitle: [first.type_name, first.vod_year].filter(Boolean).join(' · '),
+        attrs: { card: 'vodgroup', key, title: first.vod_name || '' }
+    });
+}
+
 function skeletonCardsHtml(count) {
     return Array.from({ length: count }, () => `
         <div class="poster-card skeleton" aria-hidden="true">

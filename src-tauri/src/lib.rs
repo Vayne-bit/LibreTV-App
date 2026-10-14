@@ -1,8 +1,12 @@
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 use tauri;
-use once_cell::sync::Lazy; // For lazy static initialization
+use tauri::Manager;
+use once_cell::sync::{Lazy, OnceCell}; // For lazy static initialization
 
 // --- API Configuration Structures ---
 
@@ -339,6 +343,13 @@ pub struct HttpError {
     details: Option<String>,
 }
 
+// One pooled client so repeated requests to the same source reuse connections.
+static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+});
+
 #[tauri::command]
 async fn make_http_request(options: HttpRequestOptions) -> Result<HttpResponse, HttpError> { // Removed pub
     log::debug!("[Rust] make_http_request called with URL: {}, Method: {:?}, Headers: {:?}, Timeout: {:?}", 
@@ -348,13 +359,7 @@ async fn make_http_request(options: HttpRequestOptions) -> Result<HttpResponse, 
         options.timeout_secs
     );
 
-    let client_builder = reqwest::Client::builder();
-    
-    let timeout_duration = std::time::Duration::from_secs(options.timeout_secs.unwrap_or(20));
-    let client = client_builder
-        .timeout(timeout_duration)
-        .build()
-        .map_err(|e| HttpError { error: "Failed to build HTTP client".to_string(), details: Some(e.to_string()) })?;
+    let timeout_duration = Duration::from_secs(options.timeout_secs.unwrap_or(20));
 
     let method_str = options.method.unwrap_or_else(|| "GET".to_string());
     let method_for_reqwest = match method_str.to_uppercase().as_str() {
@@ -365,7 +370,9 @@ async fn make_http_request(options: HttpRequestOptions) -> Result<HttpResponse, 
         _ => reqwest::Method::GET,
     };
 
-    let mut request_builder = client.request(method_for_reqwest.clone(), &options.url);
+    let mut request_builder = HTTP_CLIENT
+        .request(method_for_reqwest.clone(), &options.url)
+        .timeout(timeout_duration);
 
     let mut req_headers = HeaderMap::new();
     req_headers.insert(USER_AGENT, HeaderValue::from_static("LibreTV-TauriApp/1.0"));
@@ -451,6 +458,33 @@ fn set_window_fullscreen(window: tauri::WebviewWindow, fullscreen: bool) -> Resu
     Ok(())
 }
 
+#[derive(Serialize)]
+struct ProbeResult {
+    ok: bool,
+    status: u16,
+    ms: u64,
+}
+
+// Measures time to response headers only; the body is never read, so probing an mp4 does not download it.
+#[tauri::command]
+async fn probe_url(url: String, timeout_secs: Option<u64>) -> ProbeResult {
+    let started = Instant::now();
+    let result = HTTP_CLIENT
+        .get(&url)
+        .header(USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        .timeout(Duration::from_secs(timeout_secs.unwrap_or(5)))
+        .send()
+        .await;
+    let ms = started.elapsed().as_millis() as u64;
+    match result {
+        Ok(response) => {
+            let status = response.status();
+            ProbeResult { ok: status.is_success(), status: status.as_u16(), ms }
+        }
+        Err(_) => ProbeResult { ok: false, status: 0, ms },
+    }
+}
+
 // --- Image proxy (imgproxy://localhost/?u=<encoded url>) ---
 // Douban and many collection sites reject hotlinked covers, so images are fetched natively with a suitable Referer.
 
@@ -487,10 +521,122 @@ fn image_proxy_error(status: u16) -> tauri::http::Response<Vec<u8>> {
         .unwrap()
 }
 
+fn image_response(bytes: Vec<u8>, content_type: &str) -> tauri::http::Response<Vec<u8>> {
+    tauri::http::Response::builder()
+        .status(200)
+        .header("Content-Type", content_type)
+        .header("Cache-Control", "max-age=86400")
+        .header("Access-Control-Allow-Origin", "*")
+        .body(bytes)
+        .unwrap_or_else(|_| image_proxy_error(500))
+}
+
+// --- Image disk cache: the WebView does not cache custom-scheme responses, so covers are kept on disk. ---
+
+static IMAGE_CACHE_DIR: OnceCell<PathBuf> = OnceCell::new();
+const IMAGE_CACHE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const IMAGE_CACHE_MAX_BYTES: u64 = 200 * 1024 * 1024;
+const IMAGE_CACHE_TARGET_BYTES: u64 = 150 * 1024 * 1024;
+
+// FNV-1a 64: stable across builds, so cache file names survive app updates.
+fn image_cache_key(url: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in url.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:016x}", hash)
+}
+
+fn is_fresh_cache_file(meta: &std::fs::Metadata) -> bool {
+    meta.modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .map_or(false, |age| age < IMAGE_CACHE_MAX_AGE)
+}
+
+fn read_cached_image(path: &Path) -> Option<Vec<u8>> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || !is_fresh_cache_file(&meta) {
+        return None;
+    }
+    std::fs::read(path).ok().filter(|bytes| !bytes.is_empty())
+}
+
+static IMAGE_CACHE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn write_cached_image(path: &Path, bytes: &[u8]) {
+    let tmp = path.with_extension(format!("tmp{}", IMAGE_CACHE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed)));
+    if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+fn sniff_image_type(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else if bytes.starts_with(b"\x89PNG") {
+        "image/png"
+    } else if bytes.starts_with(b"GIF8") {
+        "image/gif"
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" && (&bytes[8..12] == b"avif" || &bytes[8..12] == b"avis") {
+        "image/avif"
+    } else if bytes.starts_with(b"<") {
+        "image/svg+xml"
+    } else {
+        "image/jpeg"
+    }
+}
+
+fn prune_image_cache(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if !is_fresh_cache_file(&meta) {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        files.push((path, meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), meta.len()));
+    }
+    let mut total: u64 = files.iter().map(|file| file.2).sum();
+    if total <= IMAGE_CACHE_MAX_BYTES {
+        return;
+    }
+    files.sort_by_key(|file| file.1);
+    for (path, _, size) in files {
+        if total <= IMAGE_CACHE_TARGET_BYTES {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
+}
+
 async fn proxy_image(uri: tauri::http::Uri) -> tauri::http::Response<Vec<u8>> {
     let Some(url) = image_proxy_target(&uri) else {
         return image_proxy_error(400);
     };
+    let cache_path = IMAGE_CACHE_DIR.get().map(|dir| dir.join(image_cache_key(url.as_str())));
+    if let Some(path) = cache_path.clone() {
+        let cached = tauri::async_runtime::spawn_blocking(move || read_cached_image(&path))
+            .await
+            .ok()
+            .flatten();
+        if let Some(bytes) = cached {
+            let content_type = sniff_image_type(&bytes);
+            return image_response(bytes, content_type);
+        }
+    }
     let referer = image_proxy_referer(&url);
     let response = match IMAGE_CLIENT
         .get(url)
@@ -516,13 +662,16 @@ async fn proxy_image(uri: tauri::http::Uri) -> tauri::http::Response<Vec<u8>> {
         return image_proxy_error(415);
     }
     match response.bytes().await {
-        Ok(bytes) => tauri::http::Response::builder()
-            .status(200)
-            .header("Content-Type", content_type)
-            .header("Cache-Control", "max-age=86400")
-            .header("Access-Control-Allow-Origin", "*")
-            .body(bytes.to_vec())
-            .unwrap_or_else(|_| image_proxy_error(500)),
+        Ok(bytes) => {
+            let bytes = bytes.to_vec();
+            if let Some(path) = cache_path {
+                if !bytes.is_empty() {
+                    let data = bytes.clone();
+                    tauri::async_runtime::spawn_blocking(move || write_cached_image(&path, &data));
+                }
+            }
+            image_response(bytes, &content_type)
+        }
         Err(_) => image_proxy_error(502),
     }
 }
@@ -554,10 +703,17 @@ pub fn run() {
     .invoke_handler(tauri::generate_handler![
         make_http_request,
         search_videos,
-        set_window_fullscreen
+        set_window_fullscreen,
+        probe_url
     ])
-    .setup(|_app| {
-      // 可以在这里执行应用启动时的设置代码
+    .setup(|app| {
+      if let Ok(cache_dir) = app.path().app_cache_dir() {
+          let dir = cache_dir.join("imgcache");
+          if std::fs::create_dir_all(&dir).is_ok() {
+              let _ = IMAGE_CACHE_DIR.set(dir.clone());
+              tauri::async_runtime::spawn_blocking(move || prune_image_cache(&dir));
+          }
+      }
       Ok(())
     })
     .run(tauri::generate_context!())

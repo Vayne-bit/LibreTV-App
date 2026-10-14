@@ -8,7 +8,7 @@
     "dev": "npx tauri dev",
     "tauri": "tauri",
     "serve:public": "serve public -l 3000 -s",
-    "build:css": "tailwindcss -i ./public/css/input.css -o ./public/css/styles.css --minify"
+    "build:css": "tailwindcss -c tailwind.config.cjs -i scripts/tailwind/base.css -o public/css/tailwind-base.css --minify && tailwindcss -c tailwind.config.cjs -i scripts/tailwind/utilities.css -o public/css/tailwind-utilities.css --minify"
   },
   "dependencies": {
     "axios": "^1.9.0",
@@ -23,6 +23,6 @@
     "autoprefixer": "^10.4.21",
     "postcss": "^8.5.3",
     "serve": "^14.2.4",
-    "tailwindcss": "^4.1.7"
+    "tailwindcss": "3.4.16"
   }
 }

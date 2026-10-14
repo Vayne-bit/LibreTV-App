@@ -423,6 +423,16 @@ button {
     transform: translateX(-50%);
 }
 
+.tab-dot {
+    position: absolute;
+    top: 8px;
+    right: -9px;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #f43f5e;
+}
+
 .page-body { padding: 12px var(--page-x) 24px; }
 
 /* ============ Banner ============ */
@@ -1032,6 +1042,43 @@ button {
 
 .history-delete:hover { color: #f87171; }
 
+/* ============ Favorites ============ */
+.favorites-status {
+    margin-bottom: 10px;
+    font-size: 13px;
+    color: var(--text-faint);
+}
+
+.favorite-update {
+    position: absolute;
+    top: 0;
+    left: 0;
+    z-index: 1;
+    padding: 2px 6px;
+    border-bottom-right-radius: var(--radius);
+    font-size: 11px;
+    font-weight: 700;
+    color: #fff;
+    background: #ef4444;
+}
+
+.favorite-remove {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    z-index: 2;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    color: #fff;
+    background: rgba(0, 0, 0, .65);
+}
+
+.poster-grid.managing .favorite-remove { display: flex; }
+
 /* ============ Settings ============ */
 .settings-wrap {
     display: flex;
@@ -1313,7 +1360,14 @@ button {
 
 .detail-row span { margin-right: 6px; color: var(--text-faint); }
 
-.detail-play { margin-top: 12px; }
+.detail-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.detail-fav.active { color: var(--accent); }
 
 .detail-desc {
     margin-top: 14px;
@@ -1340,7 +1394,20 @@ button {
 
 .detail-tools { display: flex; gap: 12px; }
 
-#detailLines, #detailGroups { margin-bottom: 10px; }
+#detailLines, #detailGroups, #detailSources { margin-bottom: 10px; }
+
+.source-chip.unavailable:not(.active) { color: var(--text-faint); }
+
+.source-chip em {
+    margin-left: 6px;
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-style: normal;
+    font-weight: 600;
+    color: #fff;
+    background: #22c55e;
+}
 
 .detail-episodes {
     display: grid;

@@ -88,6 +88,34 @@ function searchRelevance(item) {
     return 3;
 }
 
+function normalizeVodTitle(name) {
+    return String(name || '').replace(/[\s\p{P}]/gu, '').toLowerCase();
+}
+
+// 同名合并，每个源只取一条；同一个源里的重名条目单独成卡
+function groupSearchResults(items) {
+    const groups = [];
+    const byTitle = new Map();
+    items.forEach(item => {
+        const key = normalizeVodTitle(item.vod_name);
+        const group = key ? byTitle.get(key) : null;
+        if (group && !group.some(other => other.source_code === item.source_code)) {
+            group.push(item);
+            return;
+        }
+        const fresh = [item];
+        groups.push(fresh);
+        if (key && !group) byTitle.set(key, fresh);
+    });
+    return groups;
+}
+
+function openSearchGroup(key, title) {
+    const group = groupSearchResults(searchState.results).find(items => items.length > 1 && normalizeVodTitle(items[0].vod_name) === key);
+    if (!group) return;
+    showDetailSources(group.map(item => ({ id: item.vod_id, sourceCode: item.source_code })), title);
+}
+
 function renderSearchResults() {
     const resultsDiv = document.getElementById('results');
     const chips = document.getElementById('searchSourceChips');
@@ -95,11 +123,12 @@ function renderSearchResults() {
     const status = document.getElementById('searchStatus');
     if (!resultsDiv) return;
 
-    if (count) count.textContent = searchState.results.length;
+    const groupCount = groupSearchResults(searchState.results).length;
+    if (count) count.textContent = groupCount;
     if (status) status.textContent = searchState.pending > 0 ? `正在搜索，还剩 ${searchState.pending} 个源…` : '';
 
     if (chips) {
-        const all = `<button type="button" class="chip ${searchState.activeSource === 'all' ? 'active' : ''}" data-source="all">全部 ${searchState.results.length}</button>`;
+        const all = `<button type="button" class="chip ${searchState.activeSource === 'all' ? 'active' : ''}" data-source="all">全部 ${groupCount}</button>`;
         chips.innerHTML = all + searchState.sources.map(s =>
             `<button type="button" class="chip ${searchState.activeSource === s.code ? 'active' : ''}" data-source="${escapeHtml(s.code)}">${escapeHtml(s.name)} ${s.count}</button>`
         ).join('');
@@ -121,9 +150,15 @@ function renderSearchResults() {
         return;
     }
 
+    if (searchState.activeSource === 'all') {
+        const groups = groupSearchResults(visible).sort((a, b) => searchRelevance(a[0]) - searchRelevance(b[0]));
+        resultsDiv.innerHTML = groups.map(group =>
+            group.length > 1 ? vodGroupCardHtml(group, normalizeVodTitle(group[0].vod_name)) : vodCardHtml(group[0], { showSource: true })
+        ).join('');
+        return;
+    }
     const sorted = [...visible].sort((a, b) => searchRelevance(a) - searchRelevance(b));
-    const showSource = searchState.activeSource === 'all';
-    resultsDiv.innerHTML = sorted.map(item => vodCardHtml(item, { showSource })).join('');
+    resultsDiv.innerHTML = sorted.map(item => vodCardHtml(item)).join('');
 }
 
 async function search(queryOverride) {

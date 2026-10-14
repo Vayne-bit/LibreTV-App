@@ -1,4 +1,4 @@
-// App shell: hash routing (#home[/channel], #search?q=, #list/<row>, #history, #settings),
+// App shell: hash routing (#home[/channel], #search?q=, #list/<row>, #history[/fav], #settings),
 // navigation, global card clicks and per-route scroll restore.
 
 const SHELL_PAGES = ['home', 'search', 'list', 'history', 'settings'];
@@ -65,7 +65,7 @@ function renderRoute() {
             showListPage(route.sub);
             break;
         case 'history':
-            renderHistoryPage();
+            showMineTab(route.sub === 'fav' ? 'fav' : 'history');
             break;
     }
     restoreScrollPosition(route.key);
@@ -185,6 +185,8 @@ function setupShellEvents() {
                 window.location.hash = `#search?q=${encodeURIComponent(card.dataset.title || '')}`;
             } else if (card.dataset.card === 'vod') {
                 showDetails(card.dataset.id, card.dataset.title, card.dataset.source);
+            } else if (card.dataset.card === 'vodgroup') {
+                openSearchGroup(card.dataset.key, card.dataset.title);
             }
             return;
         }
