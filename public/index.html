@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#0f0f11">
+    <title>LibreTV</title>
+    <meta name="description" content="LibreTV 是一个免费的视频聚合搜索与播放工具，所有内容来自第三方公开接口。">
+    <link rel="icon" href="./image/retrotv_5520.png">
+    <link rel="apple-touch-icon" href="./image/retrotv_5520.png">
+    <link rel="manifest" href="manifest.json">
+    <script src="libs/tailwindcss.min.js"></script>
+    <link rel="stylesheet" href="css/app.css">
+</head>
+<body class="app-body">
+    <nav id="sideRail" class="side-rail" aria-label="主导航">
+        <img src="image/retrotv_5520.png" alt="LibreTV" class="rail-logo">
+        <button type="button" class="nav-item" data-page="home">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5L12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg>
+            <span>首页</span>
+        </button>
+        <button type="button" class="nav-item" data-page="search">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+            <span>搜索</span>
+        </button>
+        <button type="button" class="nav-item" data-page="history">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
+            <span>历史</span>
+        </button>
+        <button type="button" class="nav-item" data-page="settings">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+            <span>设置</span>
+        </button>
+    </nav>
+
+    <main class="app-main">
+        <!-- 首页 -->
+        <section id="page-home" class="page hidden">
+            <header class="page-header">
+                <div class="home-top">
+                    <div class="home-logo"><img src="image/retrotv_5520.png" alt="">LibreTV</div>
+                    <button type="button" class="search-pill" data-go="search">
+                        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+                        <span id="searchPillText">搜索电影、剧集、动漫</span>
+                    </button>
+                    <button type="button" class="icon-btn" data-go="history" aria-label="观看历史">
+                        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
+                    </button>
+                </div>
+                <div id="channelTabs" class="channel-tabs" role="tablist"></div>
+            </header>
+
+            <div id="homeRecommend">
+                <div id="homeBanner" class="banner hidden"></div>
+                <div id="homeRows"></div>
+                <div id="doubanDisabledTip" class="empty-state hidden">
+                    <p>首页推荐已关闭</p>
+                    <span>可以在「设置 → 功能开关」里打开「豆瓣热门推荐」</span>
+                </div>
+            </div>
+
+            <div id="homeChannel" class="page-body hidden">
+                <div id="channelFilters" class="filter-panel"></div>
+                <p id="channelHint" class="filter-hint hidden"></p>
+                <div id="channelGrid" class="poster-grid"></div>
+                <div id="channelSentinel" class="load-more"></div>
+            </div>
+        </section>
+
+        <!-- 搜索 -->
+        <section id="page-search" class="page hidden">
+            <header class="page-header">
+                <div class="page-header-bar">
+                    <button type="button" class="icon-btn" data-back aria-label="返回">
+                        <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+                    </button>
+                    <div class="search-bar">
+                        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" class="text-gray-500"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+                        <input type="search" id="searchInput" placeholder="搜索电影、剧集、动漫" autocomplete="off" enterkeyhint="search" aria-label="视频搜索框">
+                        <button type="button" id="searchClearBtn" class="search-clear hidden" aria-label="清空">
+                            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm4.2 12.8-1.4 1.4L12 13.4l-2.8 2.8-1.4-1.4 2.8-2.8-2.8-2.8 1.4-1.4 2.8 2.8 2.8-2.8 1.4 1.4-2.8 2.8z"/></svg>
+                        </button>
+                    </div>
+                    <button type="button" class="search-submit" onclick="search()">搜索</button>
+                </div>
+            </header>
+
+            <div class="page-body">
+                <div id="searchIdle">
+                    <div id="recentSearches" aria-label="最近搜索记录"></div>
+                    <div id="hotSearch" class="hidden">
+                        <div class="section-title">热门搜索</div>
+                        <div id="hotSearchList" class="hot-list"></div>
+                    </div>
+                </div>
+
+                <div id="resultsArea" class="hidden">
+                    <div class="results-head">
+                        <span>共 <b id="searchResultsCount">0</b> 个结果</span>
+                        <span id="searchStatus"></span>
+                    </div>
+                    <div id="searchSourceChips" class="chip-row hidden"></div>
+                    <div id="results" class="poster-grid"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 更多（豆瓣榜单列表） -->
+        <section id="page-list" class="page hidden">
+            <header class="page-header">
+                <div class="page-header-bar">
+                    <button type="button" class="icon-btn" data-back aria-label="返回">
+                        <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+                    </button>
+                    <h2 id="listTitle" class="page-title"></h2>
+                </div>
+            </header>
+            <div class="page-body">
+                <div id="listGrid" class="poster-grid"></div>
+                <div id="listSentinel" class="load-more"></div>
+            </div>
+        </section>
+
+        <!-- 历史 -->
+        <section id="page-history" class="page hidden">
+            <header class="page-header">
+                <div class="page-header-bar">
+                    <h2 class="page-title">观看历史</h2>
+                    <button type="button" class="text-btn" onclick="clearViewingHistory()">清空</button>
+                </div>
+            </header>
+            <div class="page-body">
+                <div id="historyList"></div>
+            </div>
+        </section>
+
+        <!-- 设置 -->
+        <section id="page-settings" class="page hidden">
+            <header class="page-header">
+                <div class="page-header-bar">
+                    <h2 class="page-title">设置</h2>
+                </div>
+            </header>
+            <div class="page-body">
+                <div class="settings-wrap">
+                    <div class="settings-card">
+                        <div class="settings-card-title">数据源</div>
+                        <div class="settings-actions">
+                            <button type="button" onclick="selectAllAPIs(true)">全选</button>
+                            <button type="button" onclick="selectAllAPIs(false)">全不选</button>
+                            <button type="button" onclick="selectAllAPIs(true, true)">全选普通资源</button>
+                        </div>
+                        <div class="api-box">
+                            <div id="apiCheckboxes"></div>
+                        </div>
+                        <div class="settings-meta">
+                            <span>已选数据源：<span id="selectedApiCount" class="text-white">0</span></span>
+                            <span id="siteStatus"></span>
+                        </div>
+                    </div>
+
+                    <div class="settings-card">
+                        <div class="settings-card-title flex items-center justify-between">
+                            <span>自定义数据源</span>
+                            <button type="button" onclick="showAddCustomApiForm()" class="btn-secondary" style="min-height:32px;padding:0 12px;font-size:13px">添加</button>
+                        </div>
+                        <div id="customApisList" class="max-h-48 overflow-y-auto"></div>
+                        <div id="addCustomApiForm" class="hidden mt-2 p-3 rounded-lg" style="background:var(--bg)">
+                            <input type="text" id="customApiName" placeholder="名称" class="w-full bg-[#1d1d21] border border-[#2a2a30] text-white rounded mb-2" autocomplete="off">
+                            <input type="text" id="customApiUrl" placeholder="https://abc.com" class="w-full bg-[#1d1d21] border border-[#2a2a30] text-white rounded mb-2" autocomplete="off">
+                            <input type="text" id="customApiDetail" placeholder="detail 地址（可选）" class="w-full bg-[#1d1d21] border border-[#2a2a30] text-white rounded mb-2" autocomplete="off">
+                            <div class="flex items-center mb-3">
+                                <input type="checkbox" id="customApiIsAdult" class="form-checkbox">
+                                <label for="customApiIsAdult" class="ml-2 text-xs text-pink-400">黄色资源站</label>
+                            </div>
+                            <div class="flex gap-2">
+                                <button type="button" onclick="addCustomApi()" class="btn-primary" style="min-height:34px">添加</button>
+                                <button type="button" onclick="cancelAddCustomApi()" class="btn-secondary" style="min-height:34px">取消</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="settings-card">
+                        <div class="settings-card-title">功能开关</div>
+                        <div class="setting-row">
+                            <div class="setting-text">
+                                <label for="yellowFilterToggle">黄色内容过滤</label>
+                                <p class="filter-description">过滤"伦理片"等黄色内容</p>
+                            </div>
+                            <div class="toggle">
+                                <input type="checkbox" id="yellowFilterToggle">
+                                <span class="toggle-bg"></span>
+                                <span class="toggle-dot"></span>
+                            </div>
+                        </div>
+                        <div class="setting-row">
+                            <div class="setting-text">
+                                <label for="adFilterToggle">分片广告过滤</label>
+                                <p>去掉视频里插播的广告分片，播放卡顿时可关闭</p>
+                            </div>
+                            <div class="toggle">
+                                <input type="checkbox" id="adFilterToggle">
+                                <span class="toggle-bg"></span>
+                                <span class="toggle-dot"></span>
+                            </div>
+                        </div>
+                        <div class="setting-row">
+                            <div class="setting-text">
+                                <label for="doubanToggle">豆瓣热门推荐</label>
+                                <p>首页展示豆瓣热门影视和分类片库</p>
+                            </div>
+                            <div class="toggle">
+                                <input type="checkbox" id="doubanToggle">
+                                <span class="toggle-bg"></span>
+                                <span class="toggle-dot"></span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="settings-card">
+                        <div class="settings-card-title">数据</div>
+                        <div class="settings-buttons">
+                            <button type="button" onclick="importConfig()" class="btn-secondary">导入配置</button>
+                            <button type="button" onclick="exportConfig()" class="btn-secondary">导出配置</button>
+                            <button type="button" onclick="clearLocalStorage()" class="btn-danger btn-secondary">清除本地数据</button>
+                        </div>
+                    </div>
+
+                    <div class="settings-card footer">
+                        <div class="container">
+                            <div>
+                                <p class="text-gray-500 text-sm">LibreTV 仅提供视频搜索服务，不存储、上传或分发任何视频内容，所有内容均来自第三方接口。</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <nav id="bottomNav" class="bottom-nav" aria-label="主导航">
+        <button type="button" class="nav-item" data-page="home">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5L12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg>
+            <span>首页</span>
+        </button>
+        <button type="button" class="nav-item" data-page="search">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+            <span>搜索</span>
+        </button>
+        <button type="button" class="nav-item" data-page="history">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
+            <span>历史</span>
+        </button>
+        <button type="button" class="nav-item" data-page="settings">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+            <span>设置</span>
+        </button>
+    </nav>
+
+    <!-- 详情弹层：手机为底部抽屉，平板/桌面为居中弹窗 -->
+    <div id="modal" class="sheet-mask hidden">
+        <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+            <div class="sheet-handle"></div>
+            <div class="sheet-header">
+                <h2 id="modalTitle"></h2>
+                <button type="button" class="icon-btn" id="modalCloseBtn" aria-label="关闭">
+                    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+                </button>
+            </div>
+            <div id="modalContent" class="sheet-body"></div>
+        </div>
+    </div>
+
+    <div id="passwordModal" class="password-modal" style="display:none">
+        <div class="password-box">
+            <h2>访问验证</h2>
+            <p>请输入密码继续访问</p>
+            <form id="passwordForm" onsubmit="handlePasswordSubmit(); return false;">
+                <input type="text" name="username" id="username" autocomplete="username" style="display:none" tabindex="-1" aria-hidden="true">
+                <input type="password" id="passwordInput" class="input" placeholder="密码..." autocomplete="new-password">
+                <button id="passwordSubmitBtn" type="submit" class="btn-primary w-full mt-3">提交</button>
+            </form>
+            <p id="passwordError" class="text-red-500 mt-2 hidden">密码错误，请重试</p>
+        </div>
+    </div>
+
+    <div id="disclaimerModal" class="dialog-mask" style="display:none">
+        <div class="dialog">
+            <h2>使用声明</h2>
+            <div class="dialog-content">
+                <p>欢迎使用 LibreTV。在开始使用前，请您了解并同意以下条款：</p>
+                <p><strong>服务性质：</strong>LibreTV 仅提供视频搜索服务，不直接提供、存储或上传任何视频内容。所有搜索结果均来自第三方公开接口。</p>
+                <p><strong>用户责任：</strong>用户在使用本应用时，须遵守相关法律法规，不得利用搜索结果从事侵权行为，如下载、传播未经授权的作品等。</p>
+                <p><strong>广告风险提示：</strong>所有视频均来自第三方采集站，视频中出现的广告与本应用无关，请勿相信或点击视频中的任何广告内容，谨防上当受骗。</p>
+            </div>
+            <div class="dialog-actions">
+                <button id="acceptDisclaimerBtn" type="button" class="btn-primary">我已了解并接受</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast" class="fixed left-1/2 -translate-x-1/2 text-white shadow-lg transition-all duration-300 opacity-0">
+        <p id="toastMessage"></p>
+    </div>
+
+    <div id="loading" style="display:none">
+        <div class="loading-box">
+            <div class="spinner"></div>
+            <p>加载中...</p>
+        </div>
+    </div>
+
+    <script>
+        window.__ENV__ = window.__ENV__ || {};
+        window.__ENV__.PASSWORD = "{{PASSWORD}}";
+    </script>
+    <script src="libs/sha256.min.js"></script>
+    <script>
+        // 保存原始 js-sha256 实现，避免被 password.js 覆盖
+        window._jsSha256 = window.sha256;
+    </script>
+    <script src="js/config.js"></script>
+    <script src="js/ui.js"></script>
+    <script src="js/common.js"></script>
+    <script src="js/media_card.js"></script>
+    <script src="js/apiUtils.js"></script>
+    <script src="js/apiRequestCore.js"></script>
+    <script src="js/apiSearchHandlers.js"></script>
+    <script src="js/apiDetailHandlers.js"></script>
+    <script src="js/api.js"></script>
+    <script src="js/password.js"></script>
+    <script src="js/app_globals.js"></script>
+    <script src="js/app_init.js"></script>
+    <script src="js/api_management.js"></script>
+    <script src="js/app_event_listeners.js"></script>
+    <script src="js/search_logic.js"></script>
+    <script src="js/details_modal.js"></script>
+    <script src="js/player_navigation.js"></script>
+    <script src="js/config_io.js"></script>
+    <script src="js/douban_api.js"></script>
+    <script src="js/home_feed.js"></script>
+    <script src="js/history_page.js"></script>
+    <script src="js/app_shell.js"></script>
+    <script src="js/version-check.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', function () {
+            if (localStorage.getItem('hasSeenDisclaimer')) return;
+            const disclaimerModal = document.getElementById('disclaimerModal');
+            disclaimerModal.style.display = 'flex';
+            document.getElementById('acceptDisclaimerBtn').addEventListener('click', function () {
+                localStorage.setItem('hasSeenDisclaimer', 'true');
+                disclaimerModal.style.display = 'none';
+            });
+        });
+    </script>
+</body>
+</html>

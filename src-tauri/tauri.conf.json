@@ -1,0 +1,44 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "LibreTV",
+  "version": "1.1.0",
+  "identifier": "com.libretv.app",
+  "build": {
+    "frontendDist": "../public",
+    "beforeDevCommand": ""
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "LibreTV",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 360,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": true,
+        "maximized": true
+      }
+    ],
+    "security": {
+      "csp": null,
+      "capabilities": ["default"]
+    }
+  },
+  "plugins": {},
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "android": {
+      "minSdkVersion": 24
+    }
+  }
+}

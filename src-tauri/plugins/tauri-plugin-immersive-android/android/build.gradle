@@ -1,0 +1,19 @@
+// It's often simpler to start with an empty build.gradle for a minimal plugin,
+// as Tauri's build system will integrate it.
+// However, if you need specific dependencies for your plugin's Android part,
+// you would add them here like in a standard Android library module.
+
+// For this specific plugin, we need AndroidX Core for WindowInsetsControllerCompat.
+// Ensure your main app's build.gradle also has compatible versions.
+// This assumes your main app already includes common AndroidX libraries.
+
+dependencies {
+    implementation "androidx.core:core-ktx:1.9.0" // Example version, align with your project
+    // No explicit tauri-android dependency needed here usually,
+    // as it's provided by the main app's Tauri integration.
+}
+
+// You might need to specify a namespace if your AGP version requires it
+// android {
+//     namespace "com.tauriplugin.immersive" // Match your plugin's Kotlin package
+// }

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.tauriplugin.immersive"> 
+    <!-- The package name here is for the plugin's own manifest. -->
+    <!-- It should be unique if this plugin were to be published, -->
+    <!-- but for a local plugin, it's less critical as long as it doesn't clash. -->
+    <!-- It does not need to match your main app's package name. -->
+</manifest>

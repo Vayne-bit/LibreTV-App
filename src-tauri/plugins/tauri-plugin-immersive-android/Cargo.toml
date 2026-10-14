@@ -1,0 +1,16 @@
+[package]
+name = "tauri-plugin-immersive-android"
+version = "0.1.0"
+authors = [ "Your Name" ] # Optional: Add your name/email
+edition = "2021"
+rust-version = "1.60" # Or your project's Rust version (ensure it's compatible with Tauri 2.x)
+
+[dependencies]
+tauri = { version = "2.0.0-rc.13" } # Align version with main app (resolved to 2.5.1), try without explicit mobile features for the plugin
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+
+[lib]
+name = "tauri_plugin_immersive_android"
+crate-type = ["staticlib", "cdylib", "rlib"]

@@ -1,0 +1,170 @@
+name: Build
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  NDK_VERSION: 27.0.12077973
+
+jobs:
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: |
+          sdkmanager --install "ndk;${NDK_VERSION}"
+          echo "NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            node -e "const fs=require('fs');const f='src-tauri/tauri.conf.json';const c=JSON.parse(fs.readFileSync(f,'utf8'));c.version=process.argv[1];fs.writeFileSync(f,JSON.stringify(c,null,2)+'\n')" "$VERSION"
+          else
+            VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")-${GITHUB_SHA::7}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate Android project
+        run: |
+          rm -rf src-tauri/gen/android
+          npx tauri android init --ci
+          node scripts/apply-android-overrides.mjs
+          npx tauri icon src-tauri/icons/icon.png
+
+      - name: Build universal APK
+        run: npx tauri android build --apk --target aarch64 armv7 x86_64 --ci
+
+      - name: Sign APK
+        env:
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          UNSIGNED=$(find src-tauri/gen/android/app/build/outputs/apk/universal/release -name '*.apk' | head -n 1)
+          if [ -z "$UNSIGNED" ]; then
+            echo "::error::Universal release APK not found"
+            exit 1
+          fi
+          BUILD_TOOLS=$(ls -d "${ANDROID_HOME}"/build-tools/* | sort -V | tail -n 1)
+
+          if [ -n "${ANDROID_KEYSTORE}" ]; then
+            echo "${ANDROID_KEYSTORE}" | base64 -d > release.jks
+            STORE_PASS="${ANDROID_KEYSTORE_PASSWORD}"
+            KEY_ALIAS="${ANDROID_KEY_ALIAS}"
+            KEY_PASS="${ANDROID_KEY_PASSWORD:-$ANDROID_KEYSTORE_PASSWORD}"
+          else
+            echo "::warning::ANDROID_KEYSTORE secret is not set. Signing with a throwaway key: this APK cannot be installed over builds signed with a different key."
+            STORE_PASS=android
+            KEY_PASS=android
+            KEY_ALIAS=libretv
+            keytool -genkeypair -keystore release.jks -storepass "$STORE_PASS" -keypass "$KEY_PASS" \
+              -alias "$KEY_ALIAS" -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=LibreTV"
+          fi
+
+          mkdir -p dist
+          OUT="dist/LibreTV_${VERSION}_android_universal.apk"
+          "${BUILD_TOOLS}/zipalign" -f -p 4 "$UNSIGNED" aligned.apk
+          "${BUILD_TOOLS}/apksigner" sign --ks release.jks --ks-pass "pass:${STORE_PASS}" \
+            --key-pass "pass:${KEY_PASS}" --ks-key-alias "$KEY_ALIAS" --out "$OUT" aligned.apk
+          "${BUILD_TOOLS}/apksigner" verify --print-certs "$OUT"
+          rm -f release.jks aligned.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: dist/*.apk
+          if-no-files-found: error
+
+  windows:
+    name: Windows installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Set version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          node -e "const fs=require('fs');const f='src-tauri/tauri.conf.json';const c=JSON.parse(fs.readFileSync(f,'utf8'));c.version=process.argv[1];fs.writeFileSync(f,JSON.stringify(c,null,2)+'\n')" "${GITHUB_REF_NAME#v}"
+
+      - name: Build installers
+        run: npx tauri build
+
+      - name: Collect installers
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp src-tauri/target/release/bundle/nsis/*.exe dist/
+          cp src-tauri/target/release/bundle/msi/*.msi dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [android, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

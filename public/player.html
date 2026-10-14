@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#000000">
+    <title>LibreTV 播放器</title>
+    <link rel="icon" href="image/retrotv_5520.png">
+    <script src="libs/tailwindcss.min.js"></script>
+    <link rel="stylesheet" href="css/app.css">
+    <link rel="stylesheet" href="css/player.css">
+    <script>
+        window.__ENV__ = window.__ENV__ || {};
+        window.__ENV__.PASSWORD = "{{PASSWORD}}";
+    </script>
+</head>
+<body class="app-body watch-page">
+    <header class="watch-topbar">
+        <button id="backBtn" type="button" class="icon-btn" aria-label="返回">
+            <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+        </button>
+        <h1 id="videoTitle" class="watch-topbar-title"></h1>
+        <button id="homeBtn" type="button" class="icon-btn" aria-label="首页">
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5L12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg>
+        </button>
+    </header>
+
+    <main class="watch-layout">
+        <section class="watch-main">
+            <div class="player-shell">
+                <div id="player" class="player-box"></div>
+                <div id="playerError" class="player-error hidden">
+                    <svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><path d="M12 7v6M12 16.5v.5" stroke-linecap="round"/></svg>
+                    <p id="playerErrorText">视频加载失败</p>
+                    <div class="player-error-actions">
+                        <button id="retryBtn" type="button" class="btn-secondary">重试</button>
+                        <button id="errorSwitchSourceBtn" type="button" class="btn-primary">换个源</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="watch-info">
+                <h2 id="videoMainTitle" class="watch-info-title"></h2>
+                <p id="videoSubtitle" class="watch-info-sub"></p>
+                <div class="watch-actions">
+                    <button id="prevButton" type="button" class="action-btn">
+                        <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M18 17.5v-11a1 1 0 0 0-1.52-.85l-8.5 5.5a1 1 0 0 0 0 1.7l8.5 5.5A1 1 0 0 0 18 17.5zM5 6h2v12H5z"/></svg>
+                        <span>上一集</span>
+                    </button>
+                    <button id="nextButton" type="button" class="action-btn">
+                        <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M6 6.5v11a1 1 0 0 0 1.52.85l8.5-5.5a1 1 0 0 0 0-1.7l-8.5-5.5A1 1 0 0 0 6 6.5zM17 6h2v12h-2z"/></svg>
+                        <span>下一集</span>
+                    </button>
+                    <button id="switchSourceBtn" type="button" class="action-btn">
+                        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h13l-3-3M20 17H7l3 3"/></svg>
+                        <span>换源</span>
+                    </button>
+                    <button id="copyLinkBtn" type="button" class="action-btn">
+                        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1"/><path d="M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1"/></svg>
+                        <span>复制链接</span>
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <aside class="watch-side">
+            <div class="watch-tabs" role="tablist">
+                <button type="button" class="active" data-tab="episodes" role="tab">选集</button>
+                <button type="button" data-tab="intro" role="tab">简介</button>
+            </div>
+
+            <div id="tab-episodes" class="watch-tab-panel">
+                <div class="episode-toolbar">
+                    <span id="episodeInfo" class="episode-info"></span>
+                    <div class="episode-tools">
+                        <label class="switch" title="自动连播">
+                            <span>自动连播</span>
+                            <input id="autoplayToggle" type="checkbox" checked>
+                            <i></i>
+                        </label>
+                        <button id="orderBtn" type="button" class="text-btn">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4v16M3 16l4 4 4-4M17 20V4M13 8l4-4 4 4"/></svg>
+                            <span id="orderText">正序</span>
+                        </button>
+                    </div>
+                </div>
+                <div id="episodeGroups" class="chip-row hidden"></div>
+                <div id="episodesList" class="episode-grid"></div>
+            </div>
+
+            <div id="tab-intro" class="watch-tab-panel hidden">
+                <div id="introContent" class="intro"></div>
+            </div>
+        </aside>
+    </main>
+
+    <div id="passwordModal" class="password-modal" style="display:none">
+        <div class="password-box">
+            <h2>访问验证</h2>
+            <p>请输入密码继续访问</p>
+            <input type="password" id="passwordInput" class="input" placeholder="请输入密码...">
+            <button id="passwordSubmitBtn" type="button" class="btn-primary w-full mt-3">提交</button>
+            <p id="passwordError" class="text-red-500 mt-2 hidden">密码错误，请重试</p>
+        </div>
+    </div>
+
+    <script src="libs/sha256.min.js"></script>
+    <script src="libs/hls.min.js"></script>
+    <script src="libs/mpegts.js"></script>
+    <script src="libs/artplayer.js"></script>
+    <script src="js/config.js"></script>
+    <script src="js/password.js"></script>
+    <script src="js/ui.js"></script>
+    <script src="js/common.js"></script>
+    <script src="js/player_vars.js"></script>
+    <script src="js/player_utils.js"></script>
+    <script src="js/player_ui_helpers.js"></script>
+    <script src="js/player_artplayer_handler.js"></script>
+    <script src="js/player_core_logic.js"></script>
+</body>
+</html>
