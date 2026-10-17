@@ -111,6 +111,10 @@ class MainActivity : TauriActivity() {
   }
 
   inner class PlayerBridge {
+    // 进入播放页时记录原始音量与亮度，退出时还原
+    private var originalVolume = -1
+    private var originalBrightness = Float.NaN
+
     @JavascriptInterface
     fun setFullscreen(enabled: Boolean, landscape: Boolean) {
       runOnUiThread { applyFullscreen(enabled, landscape) }
@@ -132,9 +136,30 @@ class MainActivity : TauriActivity() {
     fun setBrightness(value: Double) {
       val level = value.coerceIn(0.0, 1.0).toFloat()
       runOnUiThread {
+        if (originalBrightness.isNaN()) originalBrightness = window.attributes.screenBrightness
         window.attributes = window.attributes.apply {
           screenBrightness = level
         }
+      }
+    }
+
+    // 读取当前屏幕亮度，用于进入播放页时按系统值初始化
+    @JavascriptInterface
+    fun getBrightness(): Double {
+      return try {
+        val current = window.attributes.screenBrightness
+        if (current >= 0f) {
+          current.toDouble()
+        } else {
+          // 尚未覆盖时返回系统亮度
+          android.provider.Settings.System.getInt(
+            contentResolver,
+            android.provider.Settings.System.SCREEN_BRIGHTNESS,
+            255
+          ) / 255.0
+        }
+      } catch (e: Exception) {
+        1.0
       }
     }
 
@@ -157,11 +182,32 @@ class MainActivity : TauriActivity() {
       runOnUiThread {
         try {
           val manager = getSystemService(AUDIO_SERVICE) as AudioManager
+          if (originalVolume < 0) originalVolume = manager.getStreamVolume(AudioManager.STREAM_MUSIC)
           val max = manager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
           val target = Math.round(max * clamped / 100f)
           manager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
         } catch (e: SecurityException) {
           // 部分设备在勿扰模式等情况下受限，静默忽略
+        }
+      }
+    }
+
+    // 离开播放页时把音量和亮度还原成进入前的样子
+    @JavascriptInterface
+    fun restoreAudioBrightness() {
+      runOnUiThread {
+        try {
+          if (originalVolume >= 0) {
+            val manager = getSystemService(AUDIO_SERVICE) as AudioManager
+            manager.setStreamVolume(AudioManager.STREAM_MUSIC, originalVolume, 0)
+            originalVolume = -1
+          }
+        } catch (e: Exception) { /* ignore */ }
+        if (!originalBrightness.isNaN()) {
+          window.attributes = window.attributes.apply {
+            screenBrightness = originalBrightness
+          }
+          originalBrightness = Float.NaN
         }
       }
     }

@@ -140,11 +140,14 @@ function toggleEpisodeOrder() {
 
 function searchOtherSources() {
     saveCurrentProgress();
+    if (typeof restoreAudioBrightness === 'function') restoreAudioBrightness();
     window.location.href = `index.html#search?q=${encodeURIComponent(currentVideoTitle)}`;
 }
 
 function goBack() {
     saveCurrentProgress();
+    // 返回前先还原音量与亮度，不能依赖 pagehide 一定触发
+    if (typeof restoreAudioBrightness === 'function') restoreAudioBrightness();
     if (window.history.length > 1) {
         window.history.back();
     } else {

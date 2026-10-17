@@ -2,12 +2,12 @@
 // 安卓走原生屏幕亮度与系统媒体音量；其他环境退回 CSS 遮罩与 H5 音量
 
 const GESTURE_STORAGE_KEY = 'playerGestureEnabled';
-const GESTURE_BRIGHTNESS_KEY = 'playerBrightness';
-const GESTURE_VOLUME_KEY = 'playerVolume';
 const GESTURE_MIN_BRIGHTNESS = 0.3;
 // 判定阈值：垂直位移超过这个距离且明显大于水平位移，才接管手势
 const GESTURE_TRIGGER_PX = 16;
 const GESTURE_AXIS_RATIO = 1.2;
+// 屏幕顶部这个范围内开始的触摸交给系统状态栏
+const GESTURE_TOP_IGNORE_PX = 48;
 
 const gestureState = {
     active: false,
@@ -64,13 +64,21 @@ function applyBrightnessOverlay(value) {
     applyBrightness(value);
 }
 
+// 打开播放页时按系统当前亮度初始化，不沿用上次的调节值
 function initBrightness() {
-    const saved = parseFloat(localStorage.getItem(GESTURE_BRIGHTNESS_KEY) || '1');
-    applyBrightness(isNaN(saved) ? 1 : saved);
-}
-
-function persistBrightness() {
-    localStorage.setItem(GESTURE_BRIGHTNESS_KEY, String(gestureState.brightness));
+    gestureState.brightness = 1;
+    const bridge = nativeBridge();
+    if (bridge && typeof bridge.getBrightness === 'function') {
+        try {
+            const system = bridge.getBrightness();
+            if (typeof system === 'number' && system > 0) {
+                gestureState.brightness = Math.min(1, Math.max(GESTURE_MIN_BRIGHTNESS, system));
+                return;
+            }
+        } catch (e) { /* 读不到就用默认值 */ }
+    }
+    // 遮罩模式下默认不做任何压暗
+    if (gestureState.overlay) gestureState.overlay.style.opacity = '0';
 }
 
 function gestureVolume() {
@@ -91,13 +99,11 @@ function setGestureVolume(value) {
         try {
             // 系统媒体音量：0-100
             bridge.setVolume(Math.round(clamped * 100));
-            localStorage.setItem(GESTURE_VOLUME_KEY, String(clamped));
             return;
         } catch (e) { /* 退回 H5 音量 */ }
     }
     if (typeof art === 'undefined' || !art) return;
     art.volume = clamped;
-    localStorage.setItem(GESTURE_VOLUME_KEY, String(clamped));
 }
 
 function gestureStartValueFor(mode) {
@@ -116,10 +122,20 @@ function ensureGestureHud() {
     const hud = document.createElement('div');
     hud.className = 'player-gesture-hud hidden';
     hud.innerHTML = '<span class="player-gesture-label"></span><span class="player-gesture-bar"><i></i></span>';
-    // 全屏时播放器会被移到 body 下，HUD 也挂到 body，保证两种形态都可见
-    document.body.appendChild(hud);
+    // HUD 挂在播放器容器内，限定在视频区域内居中，不跑到整个屏幕
+    const surface = gestureSurface();
+    (surface || document.body).appendChild(hud);
     gestureState.hud = hud;
     return hud;
+}
+
+// 播放器容器可能因全屏切换被重建，HUD 需要跟着重新挂载
+function remountGestureHud() {
+    if (!gestureState.hud) return;
+    const surface = gestureSurface();
+    if (surface && gestureState.hud.parentNode !== surface) {
+        surface.appendChild(gestureState.hud);
+    }
 }
 
 function showGestureHud(kind, value) {
@@ -146,9 +162,14 @@ function onGestureStart(event) {
     if (!isGestureEnabled()) return;
     if (event.touches && event.touches.length !== 1) return;
     const touch = event.touches ? event.touches[0] : event;
+    // 从屏幕最顶部下拉是系统状态栏，不能当作亮度/音量手势
+    if ((touch.clientY || 0) < GESTURE_TOP_IGNORE_PX) return;
     const surface = gestureSurface();
     if (!surface) return;
     const rect = surface.getBoundingClientRect();
+    // 触摸点不在播放器区域内时也不接管
+    if (rect.width && (touch.clientX < rect.left || touch.clientX > rect.right)) return;
+    if (rect.height && (touch.clientY < rect.top || touch.clientY > rect.bottom)) return;
     const x = (touch.clientX || 0) - rect.left;
     gestureState.active = true;
     gestureState.decided = false;
@@ -173,6 +194,13 @@ function onGestureMove(event) {
         gestureState.decided = true;
         // 垂直位移必须明显大于水平位移才接管，否则视为调进度，完全放行给 ArtPlayer
         if (absY > GESTURE_TRIGGER_PX && absY > absX * GESTURE_AXIS_RATIO) {
+            // 向下滑且起点贴近顶部，可能是下拉通知栏，不接管
+            if (dy > 0 && gestureState.startY < GESTURE_TOP_IGNORE_PX * 2) {
+                gestureState.mode = '';
+                gestureState.active = false;
+                return;
+            }
+            remountGestureHud();
             gestureState.mode = gestureState.target;
             gestureState.startValue = gestureStartValueFor(gestureState.mode);
         } else {
@@ -185,7 +213,7 @@ function onGestureMove(event) {
 
     const rect = gestureSurface()?.getBoundingClientRect();
     const height = rect && rect.height ? rect.height : window.innerHeight;
-    // 整屏高度对应 100% 变化量
+    // 播放器高度对应 100% 变化量
     const delta = -dy / height;
     const next = Math.min(1, Math.max(0, gestureState.startValue + delta));
     applyGestureValue(gestureState.mode, next);
@@ -196,24 +224,33 @@ function onGestureMove(event) {
 
 function onGestureEnd() {
     if (!gestureState.active) return;
-    if (gestureState.mode === 'brightness') persistBrightness();
-    if (gestureState.mode === 'volume') {
-        localStorage.setItem(GESTURE_VOLUME_KEY, String(gestureVolume()));
-    }
     gestureState.active = false;
     gestureState.decided = false;
     gestureState.mode = '';
     setTimeout(hideGestureHud, 400);
 }
 
+// 离开播放页时把音量和亮度还原成进入前的样子
+function restoreAudioBrightness() {
+    const bridge = nativeBridge();
+    if (!bridge || typeof bridge.restoreAudioBrightness !== 'function') return;
+    try {
+        bridge.restoreAudioBrightness();
+    } catch (e) { /* ignore */ }
+}
+
 // 全屏切换会重挂播放器节点，监听绑在 document 上才能覆盖两种形态
 function setupPlayerGestures() {
     initBrightness();
     if (!isMobileDevice()) return;
-    if (gestureState.bound) return;
-    document.addEventListener('touchstart', onGestureStart, { passive: true, capture: true });
-    document.addEventListener('touchmove', onGestureMove, { passive: false, capture: true });
-    document.addEventListener('touchend', onGestureEnd, { passive: true, capture: true });
-    document.addEventListener('touchcancel', onGestureEnd, { passive: true, capture: true });
-    gestureState.bound = true;
+    if (!gestureState.bound) {
+        document.addEventListener('touchstart', onGestureStart, { passive: true, capture: true });
+        document.addEventListener('touchmove', onGestureMove, { passive: false, capture: true });
+        document.addEventListener('touchend', onGestureEnd, { passive: true, capture: true });
+        document.addEventListener('touchcancel', onGestureEnd, { passive: true, capture: true });
+        // 离开播放页时还原音量和亮度
+        window.addEventListener('pagehide', restoreAudioBrightness);
+        window.addEventListener('beforeunload', restoreAudioBrightness);
+        gestureState.bound = true;
+    }
 }

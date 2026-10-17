@@ -240,15 +240,54 @@ function readCustomSourceList() {
     return [];
 }
 
+// 直接拼搜索接口地址。播放页不能用 handleSingleSourceSearch：
+// 它依赖 window.__TAURI__.core，而 Tauri 2 只暴露 __TAURI_INTERNALS__，调用必失败
+function switchSourceSearchUrl(sourceCode, title) {
+    const encoded = encodeURIComponent(title);
+    if (sourceCode === 'custom') return '';
+    const site = typeof API_SITES !== 'undefined' ? API_SITES[sourceCode] : null;
+    if (!site) return null;
+    return site.api + API_CONFIG.search.path + encoded;
+}
+
+async function switchSourceSearchOne(sourceCode, title) {
+    const url = switchSourceSearchUrl(sourceCode, title);
+    if (!url) return [];
+    const response = await tauriInvoke('make_http_request', {
+        options: {
+            url,
+            method: 'GET',
+            headers: API_CONFIG.search.headers,
+            timeout_secs: 8
+        }
+    });
+    if (!(response.status >= 200 && response.status < 300)) return [];
+    let data;
+    try {
+        data = JSON.parse(response.body);
+    } catch (e) {
+        return [];
+    }
+    const list = data && Array.isArray(data.list) ? data.list : [];
+    const site = API_SITES[sourceCode];
+    return list.map(item => ({
+        ...item,
+        source_code: sourceCode,
+        source_name: site && site.name ? site.name : sourceCode
+    }));
+}
+
 async function loadSwitchSources() {
     const token = ++switchSourceState.token;
     const context = switchSourceContext();
     switchSourceState.items = [];
+    switchSourceState.error = '';
     switchSourceState.loading = true;
     renderSwitchSourceList();
 
     if (!context.title) {
         switchSourceState.loading = false;
+        switchSourceState.error = '没有拿到片名，无法搜索其他源';
         renderSwitchSourceList();
         return;
     }
@@ -256,10 +295,30 @@ async function loadSwitchSources() {
     const sources = readSelectedSourceCodes();
     const customAPIsList = readCustomSourceList();
     const jobs = [];
-    sources.forEach(code => jobs.push(handleSingleSourceSearch(context.title, code, null)));
+    sources.forEach(code => jobs.push(switchSourceSearchOne(code, context.title)));
     customAPIsList.forEach(custom => {
         const url = custom && (custom.url || custom.api);
-        if (url) jobs.push(handleSingleSourceSearch(context.title, 'custom', url));
+        if (!url) return;
+        jobs.push((async () => {
+            const base = url.replace(/\/+$/, '');
+            const response = await tauriInvoke('make_http_request', {
+                options: {
+                    url: base + API_CONFIG.search.path + encodeURIComponent(context.title),
+                    method: 'GET',
+                    headers: API_CONFIG.search.headers,
+                    timeout_secs: 8
+                }
+            });
+            if (!(response.status >= 200 && response.status < 300)) return [];
+            let data;
+            try { data = JSON.parse(response.body); } catch (e) { return []; }
+            const list = data && Array.isArray(data.list) ? data.list : [];
+            return list.map(item => ({
+                ...item,
+                source_code: 'custom_' + (custom.name || ''),
+                source_name: custom.name || '自定义源'
+            }));
+        })());
     });
 
     if (!jobs.length) {
@@ -274,8 +333,7 @@ async function loadSwitchSources() {
 
     const found = [];
     settled.forEach(result => {
-        if (result.status !== 'fulfilled' || !result.value || !Array.isArray(result.value.list)) return;
-        found.push(...result.value.list);
+        if (result.status === 'fulfilled' && Array.isArray(result.value)) found.push(...result.value);
     });
 
     const matches = collectSwitchSourceMatches(found, context.title).map((item, index) => ({
@@ -295,6 +353,9 @@ async function loadSwitchSources() {
 
     switchSourceState.items = matches;
     switchSourceState.loading = false;
+    if (!matches.length) {
+        switchSourceState.error = `已搜索 ${jobs.length} 个源，没有找到同名影片`;
+    }
     renderSwitchSourceList();
 
     for (const item of matches) {

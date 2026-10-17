@@ -223,7 +223,11 @@ function setupPlayerPageEvents() {
     bind('errorSwitchSourceBtn', openSwitchSourceModal);
     bind('retryBtn', () => switchPlayerUrl(currentVideoUrl, getPlaybackState().position));
     bind('backBtn', goBack);
-    bind('homeBtn', () => { saveCurrentProgress(); window.location.href = 'index.html'; });
+    bind('homeBtn', () => {
+        saveCurrentProgress();
+        if (typeof restoreAudioBrightness === 'function') restoreAudioBrightness();
+        window.location.href = 'index.html';
+    });
     updateFavoriteButton();
     if (typeof setupSwitchSourceModal === 'function') setupSwitchSourceModal();
 }
