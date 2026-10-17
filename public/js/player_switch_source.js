@@ -33,11 +33,13 @@ function switchSourceRowHtml(item) {
     const active = item.source_code === switchSourceContext().sourceCode;
     const classes = ['switch-source-row'];
     if (active) classes.push('active');
+    // 只显示真实探测到的结果，探测不到就不显示，避免误导
+    const quality = item.resolution ? formatResolution(item.resolution.width, item.resolution.height) : '';
     const status = item.probe === 'ok'
-        ? `${item.ms}ms${item.quality ? ` · ${item.quality}` : ''}`
+        ? `${item.ms}ms`
         : item.probe === 'fail' ? '不可用'
         : item.probe === 'pending' ? '测速中' : '';
-    const badge = item.quality ? `<em class="switch-source-quality">${escapeHtml(item.quality)}</em>` : '';
+    const badge = quality ? `<em class="switch-source-quality">${escapeHtml(quality)}</em>` : '';
     const episodes = item.episodeCount ? `<span class="switch-source-meta">${item.episodeCount} 集</span>` : '';
     return `<button type="button" class="${classes.join(' ')}" data-switch-index="${item.index}">
         <span class="switch-source-name">${escapeHtml(item.source_name || item.source_code)}${active ? ' · 当前' : ''}</span>
@@ -61,7 +63,9 @@ function renderSwitchSourceList() {
         return;
     }
     if (!switchSourceState.items.length) {
-        list.innerHTML = '<div class="empty-state"><p>没有找到其他源</p><span>可以换个关键词再试</span></div>';
+        const hint = switchSourceState.error || '没有找到其他源';
+        const sub = switchSourceState.error ? '' : '<span>片名可能与其他源的命名不一致</span>';
+        list.innerHTML = `<div class="empty-state"><p>${escapeHtml(hint)}</p>${sub}</div>`;
         return;
     }
     const rank = item => {
@@ -141,14 +145,21 @@ async function probeSwitchSource(item) {
         item.probe = 'fail';
         return;
     }
-    try {
-        const result = await tauriInvoke('probe_url', { url, timeoutSecs: SWITCH_SOURCE_PROBE_TIMEOUT_SECS });
-        item.probe = result && result.ok ? 'ok' : 'fail';
-        item.ms = result && result.ms ? result.ms : 0;
-    } catch (e) {
-        item.probe = 'fail';
-        item.ms = 0;
-    }
+    // 测速和分辨率探测可以并行
+    const [speed, resolution] = await Promise.all([
+        (async () => {
+            try {
+                const result = await tauriInvoke('probe_url', { url, timeoutSecs: SWITCH_SOURCE_PROBE_TIMEOUT_SECS });
+                return { ok: !!(result && result.ok), ms: result && result.ms ? result.ms : 0 };
+            } catch (e) {
+                return { ok: false, ms: 0 };
+            }
+        })(),
+        /\.m3u8/i.test(url) ? probeM3u8Resolution(url, SWITCH_SOURCE_PROBE_TIMEOUT_SECS) : Promise.resolve(null)
+    ]);
+    item.probe = speed.ok ? 'ok' : 'fail';
+    item.ms = speed.ms;
+    item.resolution = resolution;
 }
 
 // 播放页没有加载 details_modal.js，这里补一份精简版详情解析
@@ -187,7 +198,7 @@ function switchSourceParseLines(video) {
     return { lines, index: preferred >= 0 ? preferred : 0 };
 }
 
-// 详情接口能拿到各源的剧集列表，用来判断清晰度与集数
+// 详情接口能拿到各源的剧集列表，随后探测真实分辨率与速度
 async function resolveSwitchSourceItem(item) {
     try {
         const video = await switchSourceFetchDetail(item.vod_id, item.source_code);
@@ -202,8 +213,31 @@ async function resolveSwitchSourceItem(item) {
     } catch (e) {
         item.detailError = true;
     }
-    item.quality = detectQualityLabel(item);
     await probeSwitchSource(item);
+}
+
+// 播放页没有加载 app_globals.js，直接从 localStorage 读取用户勾选的源，
+// 不依赖脚本加载顺序，也不会因为变量未定义而搜不到任何源
+function readSelectedSourceCodes() {
+    if (typeof selectedAPIs !== 'undefined' && Array.isArray(selectedAPIs) && selectedAPIs.length) {
+        return selectedAPIs.slice();
+    }
+    try {
+        const stored = JSON.parse(localStorage.getItem('selectedAPIs') || '[]');
+        if (Array.isArray(stored) && stored.length) return stored;
+    } catch (e) { /* 落到下面的默认值 */ }
+    return ['tyyszy', 'xiaomaomi', 'dyttzy', 'bfzy', 'ruyi'];
+}
+
+function readCustomSourceList() {
+    if (typeof customAPIs !== 'undefined' && Array.isArray(customAPIs) && customAPIs.length) {
+        return customAPIs.slice();
+    }
+    try {
+        const stored = JSON.parse(localStorage.getItem('customAPIs') || '[]');
+        if (Array.isArray(stored)) return stored;
+    } catch (e) { /* ignore */ }
+    return [];
 }
 
 async function loadSwitchSources() {
@@ -219,14 +253,21 @@ async function loadSwitchSources() {
         return;
     }
 
-    const sources = typeof selectedAPIs !== 'undefined' && Array.isArray(selectedAPIs) ? selectedAPIs : [];
-    const customAPIsList = typeof customAPIs !== 'undefined' && Array.isArray(customAPIs) ? customAPIs : [];
+    const sources = readSelectedSourceCodes();
+    const customAPIsList = readCustomSourceList();
     const jobs = [];
     sources.forEach(code => jobs.push(handleSingleSourceSearch(context.title, code, null)));
     customAPIsList.forEach(custom => {
         const url = custom && (custom.url || custom.api);
         if (url) jobs.push(handleSingleSourceSearch(context.title, 'custom', url));
     });
+
+    if (!jobs.length) {
+        switchSourceState.loading = false;
+        switchSourceState.error = '没有可用的数据源，请先在设置里勾选';
+        renderSwitchSourceList();
+        return;
+    }
 
     const settled = await Promise.allSettled(jobs);
     if (token !== switchSourceState.token) return;
@@ -249,7 +290,7 @@ async function loadSwitchSources() {
         episodeCount: 0,
         probe: 'pending',
         ms: 0,
-        quality: detectQualityLabel(item)
+        resolution: null
     }));
 
     switchSourceState.items = matches;
@@ -260,7 +301,6 @@ async function loadSwitchSources() {
         if (token !== switchSourceState.token) return;
         await resolveSwitchSourceItem(item);
         if (token !== switchSourceState.token) return;
-        item.quality = detectQualityLabel(item);
         renderSwitchSourceList();
     }
 }

@@ -3,6 +3,7 @@ package com.libretv.app
 import android.annotation.SuppressLint
 import android.content.pm.ActivityInfo
 import android.graphics.Color
+import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
 import android.view.KeyEvent
@@ -122,6 +123,45 @@ class MainActivity : TauriActivity() {
           window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         } else {
           window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+      }
+    }
+
+    // 应用窗口亮度，不影响系统设置，退出应用后自动恢复
+    @JavascriptInterface
+    fun setBrightness(value: Double) {
+      val level = value.coerceIn(0.0, 1.0).toFloat()
+      runOnUiThread {
+        window.attributes = window.attributes.apply {
+          screenBrightness = level
+        }
+      }
+    }
+
+    @JavascriptInterface
+    fun getVolume(): Int {
+      return try {
+        val manager = getSystemService(AUDIO_SERVICE) as AudioManager
+        val current = manager.getStreamVolume(AudioManager.STREAM_MUSIC)
+        val max = manager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        if (max <= 0) 100 else Math.round(current * 100f / max)
+      } catch (e: Exception) {
+        100
+      }
+    }
+
+    // 系统媒体音量，0-100
+    @JavascriptInterface
+    fun setVolume(percent: Int) {
+      val clamped = percent.coerceIn(0, 100)
+      runOnUiThread {
+        try {
+          val manager = getSystemService(AUDIO_SERVICE) as AudioManager
+          val max = manager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+          val target = Math.round(max * clamped / 100f)
+          manager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
+        } catch (e: SecurityException) {
+          // 部分设备在勿扰模式等情况下受限，静默忽略
         }
       }
     }

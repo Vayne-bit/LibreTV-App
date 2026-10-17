@@ -61,12 +61,12 @@ function playM3u8(video, url, instance) {
     hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
         const levels = (data && data.levels) || [];
         const best = levels.reduce((acc, level) => (level && level.height > (acc ? acc.height : 0) ? level : acc), null);
-        if (best && best.height) updateResolutionBadge(formatResolutionLabel(best.width, best.height));
+        if (best && best.height) updateResolutionBadge(formatResolution(best.width, best.height));
     });
     hls.on(Hls.Events.LEVEL_SWITCHED, (event, data) => {
         const levels = (hls.levels || []);
         const level = levels[data && typeof data.level === 'number' ? data.level : hls.currentLevel];
-        if (level && level.height) updateResolutionBadge(formatResolutionLabel(level.width, level.height));
+        if (level && level.height) updateResolutionBadge(formatResolution(level.width, level.height));
     });
     hls.on(Hls.Events.ERROR, (event, data) => {
         if (data.details === 'bufferAppendError') {
@@ -206,7 +206,7 @@ function initPlayer(videoUrl) {
         }
         // mp4/flv 等单码率源拿不到 hls.levels，用视频元素的真实尺寸兜底
         if (!art.hls && art.video.videoHeight) {
-            updateResolutionBadge(formatResolutionLabel(art.video.videoWidth, art.video.videoHeight));
+            updateResolutionBadge(formatResolution(art.video.videoWidth, art.video.videoHeight));
         }
         setTimeout(saveToHistory, 3000);
         startProgressSaveInterval();
@@ -322,13 +322,15 @@ function updateNextEpisodeControl() {
 
 // 播放器角标显示当前真实分辨率，非 m3u8 源也能通过 video 元素拿到尺寸
 function updateResolutionBadge(label) {
-    const container = document.getElementById('player');
-    if (!container || !label) return;
+    if (!label) return;
     let badge = document.getElementById('playerResolutionBadge');
     if (!badge) {
+        const container = document.getElementById('player');
+        if (!container) return;
         badge = document.createElement('span');
         badge.id = 'playerResolutionBadge';
         badge.className = 'player-resolution-badge';
+        // 全屏时播放器会被移到 body 下，角标跟随当前播放器容器
         container.appendChild(badge);
     }
     badge.textContent = label;

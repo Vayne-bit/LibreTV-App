@@ -485,9 +485,56 @@ async fn probe_url(url: String, timeout_secs: Option<u64>) -> ProbeResult {
     }
 }
 
+#[derive(Serialize)]
+struct ResolutionResult {
+    ok: bool,
+    width: u32,
+    height: u32,
+}
+
+// 从 m3u8 的 master playlist 里解析 RESOLUTION=WxH，返回最高档的真实分辨率。
+// 单码率播放列表（没有 #EXT-X-STREAM-INF）解析不到，返回 0 由前端回退处理。
+#[tauri::command]
+async fn probe_m3u8_resolution(url: String, timeout_secs: Option<u64>) -> ResolutionResult {
+    let result = HTTP_CLIENT
+        .get(&url)
+        .header(USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        .timeout(Duration::from_secs(timeout_secs.unwrap_or(6)))
+        .send()
+        .await;
+
+    let body = match result {
+        Ok(response) if response.status().is_success() => match response.text().await {
+            Ok(text) => text,
+            Err(_) => return ResolutionResult { ok: false, width: 0, height: 0 },
+        },
+        _ => return ResolutionResult { ok: false, width: 0, height: 0 },
+    };
+
+    let mut width = 0u32;
+    let mut height = 0u32;
+    for line in body.lines() {
+        if !line.contains("#EXT-X-STREAM-INF") || !line.contains("RESOLUTION=") {
+            continue;
+        }
+        let Some(start) = line.find("RESOLUTION=") else { continue };
+        let rest = &line[start + "RESOLUTION=".len()..];
+        let spec: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == 'x' || *c == 'X').collect();
+        let mut parts = spec.split(|c| c == 'x' || c == 'X');
+        let w = parts.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+        let h = parts.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+        // 取高度最大的那一档
+        if w > 0 && h > height {
+            width = w;
+            height = h;
+        }
+    }
+
+    ResolutionResult { ok: height > 0, width, height }
+}
+
 // --- Image proxy (imgproxy://localhost/?u=<encoded url>) ---
 // Douban and many collection sites reject hotlinked covers, so images are fetched natively with a suitable Referer.
-
 static IMAGE_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -704,7 +751,8 @@ pub fn run() {
         make_http_request,
         search_videos,
         set_window_fullscreen,
-        probe_url
+        probe_url,
+        probe_m3u8_resolution
     ])
     .setup(|app| {
       if let Ok(cache_dir) = app.path().app_cache_dir() {
