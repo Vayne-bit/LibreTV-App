@@ -218,10 +218,12 @@ function setupPlayerPageEvents() {
     bind('orderBtn', toggleEpisodeOrder);
     bind('copyLinkBtn', copyLinks);
     bind('favoriteBtn', togglePlayerFavorite);
-    bind('switchSourceBtn', searchOtherSources);
-    bind('errorSwitchSourceBtn', searchOtherSources);
+    // 换源改为就地弹窗，不再退回搜索页
+    bind('switchSourceBtn', openSwitchSourceModal);
+    bind('errorSwitchSourceBtn', openSwitchSourceModal);
     bind('retryBtn', () => switchPlayerUrl(currentVideoUrl, getPlaybackState().position));
     bind('backBtn', goBack);
     bind('homeBtn', () => { saveCurrentProgress(); window.location.href = 'index.html'; });
     updateFavoriteButton();
+    if (typeof setupSwitchSourceModal === 'function') setupSwitchSourceModal();
 }

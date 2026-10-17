@@ -6,10 +6,9 @@ const PLAYER_ICONS = {
     fullscreenOff: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M7 4h2v5H4V7h3V4zm8 0h2v3h3v2h-5V4zM4 15h5v5H7v-3H4v-2zm11 0h5v2h-3v3h-2v-5z"/></svg>'
 };
 
-const HLS_CONFIG = {
+const HLS_BASE_CONFIG = {
     debug: false,
-    enableWorker: true, lowLatencyMode: false, backBufferLength: 90,
-    maxBufferLength: 30, maxMaxBufferLength: 60, maxBufferSize: 30 * 1000 * 1000,
+    enableWorker: true, lowLatencyMode: false,
     maxBufferHole: 0.5, fragLoadingMaxRetry: 6, fragLoadingMaxRetryTimeout: 64000,
     fragLoadingRetryDelay: 1000, manifestLoadingMaxRetry: 3, manifestLoadingRetryDelay: 1000,
     levelLoadingMaxRetry: 4, levelLoadingRetryDelay: 1000, startLevel: -1,
@@ -17,6 +16,15 @@ const HLS_CONFIG = {
     abrMaxWithRealBitrate: true, stretchShortVideoTrack: true, appendErrorMaxRetry: 5,
     liveSyncDurationCount: 3, liveDurationInfinity: false
 };
+
+function isMobileDevice() {
+    return !!getAndroidBridge() || /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+}
+
+// Phones switch cells and lose signal, so they get a deeper buffer; desktops keep the leaner setting.
+const HLS_CONFIG = isMobileDevice()
+    ? { ...HLS_BASE_CONFIG, backBufferLength: 30, maxBufferLength: 60, maxMaxBufferLength: 120, maxBufferSize: 60 * 1000 * 1000 }
+    : { ...HLS_BASE_CONFIG, backBufferLength: 90, maxBufferLength: 30, maxMaxBufferLength: 60, maxBufferSize: 30 * 1000 * 1000 };
 
 let playbackStarted = false;
 let pendingSeekPosition = 0;
@@ -49,6 +57,17 @@ function playM3u8(video, url, instance) {
     });
     let fatalRecoverCount = 0;
     let bufferAppendErrorCount = 0;
+    // 多码率源只有解析完 master playlist 才知道有哪些清晰度，这里同步给角标
+    hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
+        const levels = (data && data.levels) || [];
+        const best = levels.reduce((acc, level) => (level && level.height > (acc ? acc.height : 0) ? level : acc), null);
+        if (best && best.height) updateResolutionBadge(formatResolutionLabel(best.width, best.height));
+    });
+    hls.on(Hls.Events.LEVEL_SWITCHED, (event, data) => {
+        const levels = (hls.levels || []);
+        const level = levels[data && typeof data.level === 'number' ? data.level : hls.currentLevel];
+        if (level && level.height) updateResolutionBadge(formatResolutionLabel(level.width, level.height));
+    });
     hls.on(Hls.Events.ERROR, (event, data) => {
         if (data.details === 'bufferAppendError') {
             bufferAppendErrorCount++;
@@ -84,6 +103,7 @@ function playFlv(video, url, instance) {
 
 function buildPlayerSettings() {
     const savedFit = localStorage.getItem('playerObjectFit') || 'contain';
+    const gestureEnabled = isGestureEnabled();
     return [{
         html: '画面模式',
         width: 200,
@@ -98,7 +118,24 @@ function buildPlayerSettings() {
             localStorage.setItem('playerObjectFit', item.value);
             return item.html;
         }
+    }, {
+        html: '手势调节',
+        tooltip: gestureEnabled ? '开' : '关',
+        switch: gestureEnabled,
+        onSwitch(item) {
+            const enabled = !!item.switch;
+            setGestureEnabled(enabled);
+            return enabled ? '开' : '关';
+        }
     }];
+}
+
+// 画质菜单由官方 hls-control 插件提供，依赖 art.hls 实例，非 m3u8 源不注册
+function buildHlsControlPlugin() {
+    if (typeof artplayerPluginHlsControl !== 'function') return null;
+    return artplayerPluginHlsControl({
+        quality: { title: '清晰度', auto: '自动', control: true, setting: true }
+    });
 }
 
 function initPlayer(videoUrl) {
@@ -138,6 +175,7 @@ function initPlayer(videoUrl) {
         backdrop: true,
         airplay: false,
         settings: buildPlayerSettings(),
+        plugins: [buildHlsControlPlugin()].filter(Boolean),
         icons: androidBridge ? { fullscreenWebOn: PLAYER_ICONS.fullscreenOn, fullscreenWebOff: PLAYER_ICONS.fullscreenOff } : {},
         controls: [{
             name: 'next-episode',
@@ -153,6 +191,8 @@ function initPlayer(videoUrl) {
     art.on('ready', () => {
         art.video.style.objectFit = localStorage.getItem('playerObjectFit') || 'contain';
         updateNextEpisodeControl();
+        // ArtPlayer 会重建容器内容，遮罩和手势要在 ready 之后再挂
+        if (typeof setupPlayerGestures === 'function') setupPlayerGestures();
     });
 
     art.on('video:loadedmetadata', () => {
@@ -163,6 +203,10 @@ function initPlayer(videoUrl) {
         if (target > 10 && duration > 0 && target < duration - 5) {
             art.currentTime = target;
             art.notice.show = `已为你跳转到上次观看位置 ${formatTime(target)}`;
+        }
+        // mp4/flv 等单码率源拿不到 hls.levels，用视频元素的真实尺寸兜底
+        if (!art.hls && art.video.videoHeight) {
+            updateResolutionBadge(formatResolutionLabel(art.video.videoWidth, art.video.videoHeight));
         }
         setTimeout(saveToHistory, 3000);
         startProgressSaveInterval();
@@ -247,14 +291,47 @@ function switchPlayerUrl(url, startPosition = 0) {
 function armSlowLoadHint() {
     clearTimeout(slowLoadTimer);
     slowLoadTimer = setTimeout(() => {
-        if (!playbackStarted && art) art.notice.show = '加载较慢，可尝试切换线路或换源';
+        if (playbackStarted || !art) return;
+        // 起播过慢时给一个直接换源的出口，而不是只留一句提示
+        art.notice.show = '加载较慢，正在查找更快的线路…';
+        autoFindFasterSource();
     }, 12000);
+}
+
+// 后台探测其他源，找到更快的就提示用户切换，不打断当前播放
+async function autoFindFasterSource() {
+    if (typeof loadSwitchSources !== 'function') return;
+    const token = Date.now();
+    autoFindFasterSource.token = token;
+    try {
+        await loadSwitchSources();
+    } catch (e) {
+        return;
+    }
+    if (autoFindFasterSource.token !== token || playbackStarted || !art) return;
+    const better = (switchSourceState.items || []).find(item => item.probe === 'ok' && item.source_code !== switchSourceContext().sourceCode);
+    if (!better) return;
+    art.notice.show = `已找到更快的线路：${better.source_name || better.source_code}，点「换源」可切换`;
 }
 
 function updateNextEpisodeControl() {
     if (!art || !art.template || !art.template.$player) return;
     const control = art.template.$player.querySelector('.art-control-next-episode');
     if (control) control.style.display = currentEpisodeIndex < currentEpisodes.length - 1 ? '' : 'none';
+}
+
+// 播放器角标显示当前真实分辨率，非 m3u8 源也能通过 video 元素拿到尺寸
+function updateResolutionBadge(label) {
+    const container = document.getElementById('player');
+    if (!container || !label) return;
+    let badge = document.getElementById('playerResolutionBadge');
+    if (!badge) {
+        badge = document.createElement('span');
+        badge.id = 'playerResolutionBadge';
+        badge.className = 'player-resolution-badge';
+        container.appendChild(badge);
+    }
+    badge.textContent = label;
 }
 
 async function requestScreenAwake(on) {

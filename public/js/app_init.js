@@ -27,6 +27,7 @@ function initializeApp() {
     setTimeout(checkAdultAPIsSelected, 100);
 
     initAppShell();
+    if (typeof scheduleSourceHealthCheck === 'function') scheduleSourceHealthCheck();
 }
 
 // Wait for Tauri API to be ready before initializing the app

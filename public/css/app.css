@@ -1496,3 +1496,29 @@ button {
 .dialog-content { display: flex; flex-direction: column; gap: 10px; font-size: 14px; line-height: 1.7; color: var(--text-muted); }
 .dialog-content strong { color: var(--accent); }
 .dialog-actions { display: flex; justify-content: center; margin-top: 18px; }
+
+/* --- 数据源健康度 --- */
+
+.source-health-note {
+    margin-top: 8px;
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+.source-health-note.hidden {
+    display: none;
+}
+
+.source-unavailable {
+    opacity: 0.45;
+}
+
+.source-unavailable label {
+    text-decoration: line-through;
+}
+
+.source-health-bad {
+    color: var(--text-faint);
+    font-size: 10px;
+    font-style: normal;
+}

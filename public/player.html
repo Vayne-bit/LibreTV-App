@@ -99,6 +99,18 @@
         </aside>
     </main>
 
+    <div id="switchSourceModal" class="switch-source-modal hidden">
+        <div class="switch-source-box">
+            <div class="switch-source-head">
+                <h2>切换播放源</h2>
+                <button id="switchSourceCloseBtn" type="button" class="icon-btn" aria-label="关闭">
+                    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+                </button>
+            </div>
+            <div id="switchSourceList" class="switch-source-list"></div>
+        </div>
+    </div>
+
     <div id="passwordModal" class="password-modal" style="display:none">
         <div class="password-box">
             <h2>访问验证</h2>
@@ -113,14 +125,22 @@
     <script src="libs/hls.min.js"></script>
     <script src="libs/mpegts.js"></script>
     <script src="libs/artplayer.js"></script>
+    <script src="libs/artplayer-plugin-hls-control.min.js"></script>
     <script src="js/config.js"></script>
     <script src="js/password.js"></script>
     <script src="js/ui.js"></script>
     <script src="js/common.js"></script>
+    <script src="js/quality.js"></script>
     <script src="js/favorites.js"></script>
+    <script src="js/apiUtils.js"></script>
+    <script src="js/apiRequestCore.js"></script>
+    <script src="js/apiSearchHandlers.js"></script>
+    <script src="js/apiDetailHandlers.js"></script>
     <script src="js/player_vars.js"></script>
     <script src="js/player_utils.js"></script>
     <script src="js/player_ui_helpers.js"></script>
+    <script src="js/player_gestures.js"></script>
+    <script src="js/player_switch_source.js"></script>
     <script src="js/player_artplayer_handler.js"></script>
     <script src="js/player_core_logic.js"></script>
 </body>
