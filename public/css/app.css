@@ -1522,3 +1522,41 @@ button {
     font-size: 10px;
     font-style: normal;
 }
+
+/* --- 播放源分辨率标签 --- */
+
+.source-chip-quality {
+    display: inline-block;
+    margin-left: 4px;
+    padding: 0 4px;
+    border-radius: 3px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 11px;
+    font-style: normal;
+    font-weight: 600;
+    vertical-align: 1px;
+}
+
+/* 备注推测值用暗色，和实测值区分开 */
+.source-chip-quality.from-keyword {
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text-muted);
+    font-weight: 500;
+}
+
+.detail-resolution {
+    margin-top: 2px;
+    color: var(--accent);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.detail-resolution.from-keyword {
+    color: var(--text-muted);
+    font-weight: 500;
+}
+
+.detail-resolution.hidden {
+    display: none;
+}

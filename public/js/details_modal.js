@@ -2,6 +2,7 @@
 
 const DETAIL_EPISODES_PER_GROUP = 50;
 const DETAIL_PROBE_WAIT_MS = 5000;
+const DETAIL_RESOLUTION_TIMEOUT_SECS = 6;
 
 const detailState = {
     token: 0,
@@ -148,7 +149,9 @@ function showDetailSources(items, title) {
             video: null,
             lines: [],
             probe: 'pending',
-            ms: 0
+            ms: 0,
+            remarks: item.remarks || '',
+            resolution: null
         })),
         sourceIndex: -1,
         sourcePicked: false,
@@ -165,7 +168,7 @@ async function loadDetailSource(token, source) {
     try {
         const video = await fetchVodDetail(source.id, source.sourceCode);
         if (token !== detailState.token) return;
-        Object.assign(source, { status: 'ok', video, lines: parsePlayLines(video) });
+        Object.assign(source, { status: 'ok', video, lines: parsePlayLines(video), remarks: video.vod_remarks || source.remarks || '' });
         if (isFavorite(source.sourceCode, source.id)) {
             markFavoriteSeen(source.sourceCode, source.id, preferredEpisodeCount(source.lines), video.vod_remarks || '');
             renderFavoritesPage();
@@ -194,6 +197,7 @@ function applyDetailSource(index) {
     });
     if (source.status !== 'ok') {
         renderDetailPending(source);
+        renderDetailResolution();
         return;
     }
 
@@ -204,6 +208,7 @@ function applyDetailSource(index) {
     detailState.group = detailState.watchedIndex >= 0 && detailState.watchedIndex < total
         ? Math.floor(detailState.watchedIndex / DETAIL_EPISODES_PER_GROUP) : 0;
     renderDetailContent();
+    renderDetailResolution();
 }
 
 function selectDetailSource(index) {
@@ -220,16 +225,42 @@ function selectDetailSource(index) {
 async function probeDetailSource(token, source) {
     const line = source.lines[preferredLineIndex(source.lines)];
     const url = line && line.episodes[0] ? line.episodes[0].url : '';
-    let result = null;
-    if (url) {
+    // 测速和分辨率探测并行，两者互不依赖
+    const speedTask = (async () => {
+        if (!url) return null;
         try {
-            result = await tauriInvoke('probe_url', { url, timeoutSecs: 5 });
-        } catch (e) { /* counted as unavailable */ }
-    }
+            return await tauriInvoke('probe_url', { url, timeoutSecs: 5 });
+        } catch (e) {
+            return null;
+        }
+    })();
+    const resolutionTask = /\.m3u8/i.test(url)
+        ? probeM3u8Resolution(url, DETAIL_RESOLUTION_TIMEOUT_SECS)
+        : Promise.resolve(null);
+
+    const [result, resolution] = await Promise.all([speedTask, resolutionTask]);
     if (token !== detailState.token) return;
-    Object.assign(source, result && result.ok ? { probe: 'ok', ms: result.ms } : { probe: 'fail', ms: 0 });
+    Object.assign(source, result && result.ok ? { probe: 'ok', ms: result.ms } : { probe: 'fail', ms: 0, resolution: null });
+    if (result && result.ok) source.resolution = resolution;
     renderDetailSources();
+    renderDetailResolution();
     finishProbeIfDone(token);
+}
+
+// 当前选中源的分辨率显示在详情标题下方，实测值优先，否则用备注关键词
+function renderDetailResolution() {
+    const el = document.getElementById('detailResolution');
+    if (!el) return;
+    const source = detailState.sources[detailState.sourceIndex];
+    const display = resolutionDisplayOf(source);
+    if (!display.text) {
+        el.textContent = '';
+        el.classList.add('hidden');
+        return;
+    }
+    el.textContent = display.fromKeyword ? `${display.text}（备注）` : display.text;
+    el.classList.toggle('from-keyword', display.fromKeyword);
+    el.classList.remove('hidden');
 }
 
 function finishProbeIfDone(token) {
@@ -270,7 +301,11 @@ function detailSourceChipsHtml() {
             const classes = ['chip', 'source-chip'];
             if (index === detailState.sourceIndex) classes.push('active');
             if (source.probe === 'fail') classes.push('unavailable');
-            return `<button type="button" class="${classes.join(' ')}" data-source-index="${index}">${escapeHtml(source.sourceName || source.sourceCode)} · ${detailSourceStatus(source)}${index === fastest ? '<em>最快</em>' : ''}</button>`;
+            const display = resolutionDisplayOf(source);
+            const quality = display.text
+                ? `<em class="source-chip-quality${display.fromKeyword ? ' from-keyword' : ''}">${escapeHtml(display.text)}</em>`
+                : '';
+            return `<button type="button" class="${classes.join(' ')}" data-source-index="${index}">${escapeHtml(source.sourceName || source.sourceCode)}${quality} · ${detailSourceStatus(source)}${index === fastest ? '<em>最快</em>' : ''}</button>`;
         }).join('');
 }
 
@@ -314,6 +349,7 @@ function renderDetailContent() {
             <div class="detail-poster">${posterImgHtml(video.vod_pic, detailState.title)}</div>
             <div class="detail-meta">
                 <div class="detail-title">${escapeHtml(detailState.title)}</div>
+                <p id="detailResolution" class="detail-resolution hidden"></p>
                 ${tags.length ? `<div class="detail-tags">${tags.map(t => `<span>${escapeHtml(t)}</span>`).join('')}</div>` : ''}
                 ${rows.map(([k, v]) => `<p class="detail-row"><span>${k}</span>${escapeHtml(v)}</p>`).join('')}
                 <div class="detail-actions">
