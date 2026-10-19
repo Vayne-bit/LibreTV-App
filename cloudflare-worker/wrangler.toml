@@ -1,0 +1,9 @@
+name = "libretv-sync"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+# 部署前先执行 wrangler kv namespace create SYNC_KV，
+# 把输出的 id 填到下面。这一步只需要做一次。
+[[kv_namespaces]]
+binding = "SYNC_KV"
+id = "8a836f6f50c3451b82583e30560ed771"

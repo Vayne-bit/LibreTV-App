@@ -1560,3 +1560,72 @@ button {
 .detail-resolution.hidden {
     display: none;
 }
+
+/* --- 跨设备同步 --- */
+
+.settings-hint {
+    margin-top: 8px;
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.sync-field {
+    margin-top: 10px;
+}
+
+.sync-field label {
+    display: block;
+    margin-bottom: 4px;
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+.sync-code {
+    margin: 8px 0;
+    padding: 10px;
+    border-radius: var(--radius);
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    text-align: center;
+}
+
+.sync-cred {
+    width: 100%;
+    margin-top: 6px;
+    font-family: ui-monospace, monospace;
+    font-size: 12px;
+    resize: none;
+}
+
+.sync-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 70;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    background: rgba(0, 0, 0, 0.65);
+}
+
+.sync-overlay.hidden {
+    display: none;
+}
+
+.sync-dialog-box {
+    width: 100%;
+    max-width: 420px;
+    padding: 18px;
+    border-radius: 12px;
+    background: var(--surface);
+    color: var(--text);
+}
+
+.sync-dialog p {
+    margin: 6px 0;
+    font-size: 13px;
+}

@@ -28,6 +28,10 @@ function initializeApp() {
 
     initAppShell();
     if (typeof scheduleSourceHealthCheck === 'function') scheduleSourceHealthCheck();
+    // 补全历史的作品标识，并尝试与云端同步一次
+    if (typeof bootstrapSync === 'function') {
+        bootstrapSync().catch(() => { /* 同步失败不影响本地使用 */ });
+    }
 }
 
 // Wait for Tauri API to be ready before initializing the app
