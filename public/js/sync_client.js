@@ -7,7 +7,6 @@
 const SYNC_WEBDAV_KEY = 'syncWebdav';
 const SYNC_AUTO_INTERVAL_MS = 60000;
 const SYNC_DAV_ROOT = 'https://dav.jianguoyun.com/dav';
-const SYNC_APP_DIR = 'LibreTV';
 
 const syncState = {
     busy: false,
@@ -45,8 +44,10 @@ function readSyncConfig() {
     return creds ? { code: creds.code } : null;
 }
 
+// 坚果云的 /dav/ 根目录下不允许直接建文件夹（MKCOL 返回 409），
+// 所以同步文件直接放在根目录，用 sync- 前缀区分，不依赖子目录
 function syncFilePath(code) {
-    return `${SYNC_DAV_ROOT}/${SYNC_APP_DIR}/sync-${code}.json`;
+    return `${SYNC_DAV_ROOT}/libretv-sync-${code}.json`;
 }
 
 function basicAuthHeader(username, password) {
@@ -81,20 +82,8 @@ function generateSyncCode() {
     return [...bytes].map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
 }
 
-// 确保应用目录存在。坚果云 WebDAV 的 MKCOL 在目录已存在时返回 405，两种情况都算成功
-async function ensureAppDir() {
-    const dirUrl = `${SYNC_DAV_ROOT}/${SYNC_APP_DIR}`;
-    let response;
-    try {
-        response = await davRequest('MKCOL', dirUrl, { contentType: null });
-    } catch (e) {
-        // 部分环境不允许 MKCOL，交给后续 PUT 自行暴露问题
-        return;
-    }
-    if (response.status === 201 || response.status === 405) return;
-    if (response.status === 401) throw new Error('坚果云账号或应用密码不正确');
-    // 其它状态（如 409 表示父目录不存在）直接忽略，PUT 会给出更明确的结果
-}
+// 同步文件直接放在 /dav/ 根目录，不需要建子目录
+// 早期版本尝试 MKCOL 建 LibreTV 文件夹，坚果云返回 409，已去掉这一步
 
 // --- 读写 ---
 
@@ -144,7 +133,6 @@ async function pushSync() {
     const creds = readSyncCredentials();
     if (!creds) return { ok: false, reason: '未配置同步' };
     try {
-        await ensureAppDir();
         const payload = buildSyncPayload();
         const response = await davRequest('PUT', syncFilePath(creds.code), {
             contentType: 'application/json',
@@ -152,6 +140,7 @@ async function pushSync() {
             timeoutSecs: 30
         });
         if (response.status === 401) return { ok: false, reason: '坚果云账号或应用密码不正确' };
+        if (response.status === 409) return { ok: false, reason: '坚果云拒绝写入，请检查账号是否有上传权限' };
         if (response.status !== 201 && response.status !== 204 && response.status !== 200) {
             return { ok: false, reason: `上传失败（${response.status}）` };
         }
