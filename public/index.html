@@ -227,23 +227,40 @@
 
                     <div class="settings-card">
                         <div class="settings-card-title">跨设备同步</div>
-                        <p class="settings-hint">在电脑、手机、平板之间共享观看进度和收藏。使用坚果云网盘存放同步文件，三台设备填写同一份账号即可。</p>
-                        <div class="sync-field">
-                            <label for="syncUserInput">坚果云账号（邮箱）</label>
-                            <input id="syncUserInput" type="text" class="input" placeholder="you@example.com" autocomplete="username">
+                        <p class="settings-hint">在电脑、手机、平板之间共享观看进度和收藏。三台设备填写同一份坚果云账号即可。</p>
+
+                        <!-- 未开启：填账号 + 创建或加入 -->
+                        <div id="syncSetupPanel">
+                            <div class="sync-field">
+                                <label for="syncUserInput">坚果云账号（邮箱）</label>
+                                <input id="syncUserInput" type="text" class="input" placeholder="you@example.com" autocomplete="username">
+                            </div>
+                            <div class="sync-field">
+                                <label for="syncPassInput">应用密码</label>
+                                <input id="syncPassInput" type="password" class="input" placeholder="在坚果云「安全选项 → 第三方应用管理」生成" autocomplete="current-password">
+                            </div>
+                            <p class="settings-tip">这里要填<strong>应用密码</strong>，不是登录密码。生成方式：坚果云网页版 → 账户信息 → 安全选项 → 添加应用。</p>
+                            <div class="sync-actions">
+                                <button type="button" id="syncJoinBtn" class="btn-primary">输入同步码加入</button>
+                                <button type="button" id="syncCreateBtn" class="btn-secondary">新建同步（第一台设备）</button>
+                            </div>
                         </div>
-                        <div class="sync-field">
-                            <label for="syncPassInput">应用密码</label>
-                            <input id="syncPassInput" type="password" class="input" placeholder="在坚果云「安全选项 → 第三方应用管理」生成" autocomplete="current-password">
+
+                        <!-- 已开启：展示同步码和使用状态 -->
+                        <div id="syncActivePanel" class="hidden">
+                            <div class="sync-code-box">
+                                <span class="sync-code-label">当前同步码</span>
+                                <span id="syncCodeValue" class="sync-code-text">—</span>
+                                <button type="button" id="syncCopyCodeBtn" class="btn-secondary sync-copy-btn">复制</button>
+                            </div>
+                            <p id="syncDeviceInfo" class="settings-tip"></p>
+                            <div class="sync-actions">
+                                <button type="button" id="syncNowBtn" class="btn-primary">立即同步</button>
+                                <button type="button" id="syncDisconnectBtn" class="btn-danger btn-secondary">清除同步码</button>
+                            </div>
                         </div>
-                        <p class="settings-hint">这里要填的是<strong>应用密码</strong>，不是坚果云登录密码。生成方式：坚果云网页版 → 账户信息 → 安全选项 → 添加应用。</p>
-                        <div class="settings-buttons">
-                            <button type="button" id="syncCreateBtn" class="btn-secondary">创建同步码</button>
-                            <button type="button" id="syncJoinBtn" class="btn-secondary">加入已有同步</button>
-                            <button type="button" id="syncNowBtn" class="btn-secondary">立即同步</button>
-                            <button type="button" id="syncDisconnectBtn" class="btn-danger btn-secondary">断开同步</button>
-                        </div>
-                        <p id="syncStatusText" class="settings-hint">未开启同步</p>
+
+                        <p id="syncStatusText" class="settings-tip sync-status-line">未开启同步</p>
                     </div>
 
                     <div class="settings-card">

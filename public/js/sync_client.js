@@ -241,23 +241,60 @@ function formatSyncTime(ts) {
     return `${Math.floor(diff / 86400000)} 天前同步`;
 }
 
+// 同步状态：未开启显示账号表单，已开启显示同步码和使用状态
 function renderSyncStatus() {
-    const el = document.getElementById('syncStatusText');
-    if (!el) return;
     const creds = readSyncCredentials();
-    if (!creds) {
-        el.textContent = '未开启同步';
+    const setupPanel = document.getElementById('syncSetupPanel');
+    const activePanel = document.getElementById('syncActivePanel');
+    const statusEl = document.getElementById('syncStatusText');
+    const codeEl = document.getElementById('syncCodeValue');
+    const deviceEl = document.getElementById('syncDeviceInfo');
+
+    const active = !!creds;
+    if (setupPanel) setupPanel.classList.toggle('hidden', active);
+    if (activePanel) activePanel.classList.toggle('hidden', !active);
+
+    if (codeEl) codeEl.textContent = active ? creds.code : '—';
+
+    if (deviceEl) {
+        if (!active) {
+            deviceEl.textContent = '';
+        } else {
+            const name = syncDeviceName();
+            deviceEl.textContent = `本机：${name} · 其它设备填入同一同步码即可共享进度`;
+        }
+    }
+
+    if (!statusEl) return;
+    if (!active) {
+        statusEl.textContent = '未开启同步';
         return;
     }
     if (syncState.busy) {
-        el.textContent = '同步中…';
+        statusEl.textContent = '同步中…';
         return;
     }
     if (syncState.lastError) {
-        el.textContent = `同步失败：${syncState.lastError}`;
+        statusEl.textContent = `同步失败：${syncState.lastError}`;
         return;
     }
-    el.textContent = `同步码 ${creds.code} · ${formatSyncTime(lastSyncAt())}`;
+    statusEl.textContent = `已开启 · ${formatSyncTime(lastSyncAt())}`;
+}
+
+// 给本机起一个便于辨认的名字，同步到云端后可看到有哪些设备
+function syncDeviceName() {
+    const saved = localStorage.getItem('syncDeviceName');
+    if (saved) return saved;
+    const bridge = typeof getAndroidBridge === 'function' ? getAndroidBridge() : null;
+    const ua = navigator.userAgent || '';
+    let base = '设备';
+    if (bridge || /Android/i.test(ua)) base = '安卓';
+    else if (/Windows/i.test(ua)) base = 'Windows';
+    else if (/Mac/i.test(ua)) base = 'Mac';
+    else if (/Linux/i.test(ua)) base = 'Linux';
+    const name = `${base}-${Math.floor(Math.random() * 900 + 100)}`;
+    localStorage.setItem('syncDeviceName', name);
+    return name;
 }
 
 // --- 设置页同步交互 ---
@@ -281,18 +318,15 @@ async function handleSyncCreate() {
         const group = await createSyncGroup(form.username, form.password);
         renderSyncStatus();
         startSyncTimer();
-        showSyncCodeDialog(group.code, form.username);
+        showSyncCodeDialog(group.code);
     } catch (e) {
         showToast(e.message || '创建失败', 'error');
     }
 }
 
+// 加入：先让用户输同步码，再校验账号
+// 早期版本要求先填账号才弹输入框，用户容易以为没有入口
 function handleSyncJoin() {
-    const form = readSyncForm();
-    if (!form.username || !form.password) {
-        showToast('请先填写坚果云账号和应用密码', 'error');
-        return;
-    }
     showSyncJoinDialog();
 }
 
@@ -313,8 +347,13 @@ async function handleSyncNow() {
 async function handleSyncDisconnect() {
     writeSyncCredentials(null);
     stopSyncTimer();
+    // 清空表单，回到未开启状态
+    const userInput = document.getElementById('syncUserInput');
+    const passInput = document.getElementById('syncPassInput');
+    if (userInput) userInput.value = '';
+    if (passInput) passInput.value = '';
     renderSyncStatus();
-    showToast('已断开同步', 'success');
+    showToast('已清除同步码，本机数据保留', 'success');
 }
 
 function refreshAfterSync() {
@@ -324,12 +363,12 @@ function refreshAfterSync() {
 }
 
 // 创建成功后展示同步码，其它设备要输入这个码加入
-function showSyncCodeDialog(code, username) {
+function showSyncCodeDialog(code) {
     const html = `
         <div class="sync-dialog">
-            <p class="settings-hint">在其它设备上填同样的坚果云账号和应用密码，再加入这个同步码：</p>
+            <p class="sync-dialog-title">同步码已生成</p>
             <div class="sync-code">${escapeHtml(code)}</div>
-            <p class="settings-hint">同步码只是云端文件夹名，不需要保密，但三台设备必须完全一致。</p>
+            <p class="settings-tip">在其它设备上点「输入同步码加入」，填入这个码和同样的坚果云账号即可。</p>
             <div class="settings-buttons">
                 <button type="button" class="btn-primary" onclick="copySyncCode('${escapeHtml(code)}')">复制同步码</button>
                 <button type="button" class="btn-secondary" onclick="closeSyncDialog()">知道了</button>
@@ -338,12 +377,19 @@ function showSyncCodeDialog(code, username) {
     openSyncDialog(html);
 }
 
+// 加入弹窗：同步码和账号密码都在这填，避免用户找不到入口
 function showSyncJoinDialog() {
+    const form = readSyncForm();
     const html = `
         <div class="sync-dialog">
-            <p>输入另一台设备上显示的同步码</p>
-            <input id="syncJoinCode" type="text" class="input" placeholder="12 位字母数字" maxlength="16">
-            <p class="settings-hint">坚果云账号和应用密码已在上一页填好，这里只需要同步码。</p>
+            <p class="sync-dialog-title">加入已有同步</p>
+            <label class="sync-dialog-label">同步码</label>
+            <input id="syncJoinCode" type="text" class="input" placeholder="例如 CD5B35FD3A42" maxlength="16">
+            <label class="sync-dialog-label">坚果云账号（邮箱）</label>
+            <input id="syncJoinUser" type="text" class="input" value="${escapeHtml(form.username)}" placeholder="you@example.com">
+            <label class="sync-dialog-label">应用密码</label>
+            <input id="syncJoinPass" type="password" class="input" value="${escapeHtml(form.password)}" placeholder="应用密码">
+            <p class="settings-tip">同步码在另一台设备的「设置 → 跨设备同步」里查看。</p>
             <div class="settings-buttons">
                 <button type="button" class="btn-primary" onclick="submitSyncJoin()">加入</button>
                 <button type="button" class="btn-secondary" onclick="closeSyncDialog()">取消</button>
@@ -354,18 +400,21 @@ function showSyncJoinDialog() {
 
 async function submitSyncJoin() {
     const codeEl = document.getElementById('syncJoinCode');
-    const code = codeEl ? codeEl.value.trim() : '';
+    const userEl = document.getElementById('syncJoinUser');
+    const passEl = document.getElementById('syncJoinPass');
+    const code = codeEl ? codeEl.value.trim().toUpperCase() : '';
+    const username = userEl ? userEl.value.trim() : '';
+    const password = passEl ? passEl.value.trim() : '';
     if (!code) {
         showToast('请填写同步码', 'error');
         return;
     }
-    const form = readSyncForm();
-    if (!form.username || !form.password) {
-        showToast('请先填写坚果云账号和应用密码', 'error');
+    if (!username || !password) {
+        showToast('请填写坚果云账号和应用密码', 'error');
         return;
     }
     try {
-        await joinSyncGroup(form.username, form.password, code);
+        await joinSyncGroup(username, password, code);
         closeSyncDialog();
         renderSyncStatus();
         startSyncTimer();
@@ -406,22 +455,9 @@ function setupSyncSettings() {
     const userInput = document.getElementById('syncUserInput');
     const passInput = document.getElementById('syncPassInput');
     const creds = readSyncCredentials();
-    if (userInput) {
-        userInput.value = creds ? creds.username : '';
-        userInput.addEventListener('change', () => {
-            const current = readSyncCredentials();
-            if (!current) return;
-            writeSyncCredentials({ ...current, username: userInput.value.trim() });
-        });
-    }
-    if (passInput) {
-        passInput.value = creds ? creds.password : '';
-        passInput.addEventListener('change', () => {
-            const current = readSyncCredentials();
-            if (!current) return;
-            writeSyncCredentials({ ...current, password: passInput.value.trim() });
-        });
-    }
+    if (userInput && !userInput.value) userInput.value = creds ? creds.username : '';
+    if (passInput && !passInput.value) passInput.value = creds ? creds.password : '';
+
     const bind = (id, handler) => {
         const el = document.getElementById(id);
         if (el) el.addEventListener('click', handler);
@@ -430,6 +466,10 @@ function setupSyncSettings() {
     bind('syncJoinBtn', handleSyncJoin);
     bind('syncNowBtn', handleSyncNow);
     bind('syncDisconnectBtn', handleSyncDisconnect);
+    bind('syncCopyCodeBtn', () => {
+        const current = readSyncCredentials();
+        if (current) copySyncCode(current.code);
+    });
     renderSyncStatus();
 }
 
