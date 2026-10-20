@@ -44,6 +44,21 @@ function destroyStreamEngines(instance) {
     if (instance.flv) { try { instance.flv.destroy(); } catch (e) { /* ignore */ } instance.flv = null; }
 }
 
+// 片源加载失败：先尝试自动换源，找不到再显示错误页
+function handleSourceFailure() {
+    if (typeof autoRelinkAndPlay === 'function') {
+        autoRelinkAndPlay().then(result => {
+            if (!result || !result.ok) {
+                showPlayerError('视频加载失败，可能是线路失效或格式不兼容');
+            }
+        }).catch(() => {
+            showPlayerError('视频加载失败，可能是线路失效或格式不兼容');
+        });
+        return;
+    }
+    showPlayerError('视频加载失败，可能是线路失效或格式不兼容');
+}
+
 function playM3u8(video, url, instance) {
     destroyStreamEngines(instance);
     if (!window.Hls || !Hls.isSupported()) {
@@ -77,12 +92,12 @@ function playM3u8(video, url, instance) {
         if (!data.fatal) return;
         fatalRecoverCount++;
         if (fatalRecoverCount > 3) {
-            if (!playbackStarted) showPlayerError('视频加载失败，可能是线路失效或格式不兼容');
+            if (!playbackStarted) handleSourceFailure();
             return;
         }
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
         else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
-        else if (!playbackStarted) showPlayerError('视频加载失败，可能是线路失效或格式不兼容');
+        else if (!playbackStarted) handleSourceFailure();
     });
     hls.loadSource(url);
     hls.attachMedia(video);
@@ -226,7 +241,7 @@ function initPlayer(videoUrl) {
 
     art.on('video:error', () => {
         if (!playbackStarted && getVideoType(currentVideoUrl) !== 'm3u8') {
-            showPlayerError('视频加载失败，可能是线路失效或格式不兼容');
+            handleSourceFailure();
         }
     });
 

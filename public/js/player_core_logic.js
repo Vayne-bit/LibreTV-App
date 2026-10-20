@@ -78,6 +78,8 @@ function initializePageContent() {
     if (currentVideoUrl) {
         pendingSeekPosition = startPosition > 10 ? startPosition : getSavedProgress();
         initPlayer(currentVideoUrl);
+        // 同步来的条目片源多半已失效，提前自动找源，避免先黑屏再报错
+        if (typeof precheckRelinkIfNeeded === 'function') precheckRelinkIfNeeded();
     } else {
         showPlayerError('无效的视频链接');
     }
