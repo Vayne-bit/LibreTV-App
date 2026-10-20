@@ -16,6 +16,22 @@ const syncState = {
 
 // --- 凭证 ---
 
+// 同步过程日志，排查问题时可在控制台看到每一步
+function syncLog(step, detail) {
+    try {
+        console.log('[Sync]', step, detail === undefined ? '' : detail);
+    } catch (e) { /* 忽略 */ }
+}
+
+function readHistoryCount() {
+    try {
+        const list = JSON.parse(localStorage.getItem('viewingHistory') || '[]');
+        return Array.isArray(list) ? list.length : 0;
+    } catch (e) {
+        return 0;
+    }
+}
+
 // 保存 { username, password, code }
 function readSyncCredentials() {
     try {
@@ -118,18 +134,36 @@ async function pullSync() {
         if (response.status === 401) return { ok: false, reason: '坚果云账号或应用密码不正确' };
         if (response.status === 404) {
             // 文件还不存在，说明是第一次同步
+            syncLog('拉取：云端文件不存在', { status: 404 });
             return { ok: true, applied: null, empty: true };
         }
         if (response.status !== 200) return { ok: false, reason: `读取失败（${response.status}）` };
         let payload;
         try {
             payload = JSON.parse(response.body);
+            // 兼容旧版本写入格式：云端内容被多包了一层字符串
+            // 旧数据长这样 "{\"version\":1,...}"，parse 一次得到字符串，要再 parse 一次
+            if (typeof payload === 'string') {
+                syncLog('云端内容是字符串，再解析一次');
+                payload = JSON.parse(payload);
+            }
         } catch (e) {
+            syncLog('拉取：JSON 解析失败', { bodyHead: String(response.body || '').slice(0, 120) });
             return { ok: false, reason: '云端文件格式损坏' };
         }
+        if (!payload || !Array.isArray(payload.history)) {
+            syncLog('拉取：数据格式无效', { keys: payload && typeof payload === 'object' ? Object.keys(payload) : typeof payload });
+            return { ok: false, reason: '云端文件格式损坏' };
+        }
+        syncLog('拉取成功', {
+            云端条数: Array.isArray(payload.history) ? payload.history.length : 0,
+            标题: Array.isArray(payload.history) ? payload.history.map(h => h.title) : []
+        });
         const applied = applySyncPayload(payload);
+        syncLog('合并结果', applied);
         return { ok: true, applied };
     } catch (e) {
+        syncLog('拉取异常', e && e.message);
         return { ok: false, reason: e.message || '网络错误' };
     }
 }
@@ -142,20 +176,25 @@ async function pushSync(options) {
     if (!creds) return { ok: false, reason: '未配置同步' };
     try {
         if (!opts.skipPreMerge) {
+            const before = readHistoryCount();
             const prePull = await pullSync();
-            if (prePull.ok || prePull.empty) {
-                // 合并完成，本地已包含双方数据
-            } else if (prePull.reason && prePull.reason.includes('密码')) {
-                return { ok: false, reason: prePull.reason };
+            syncLog('push 前置拉取', { ok: prePull.ok, empty: prePull.empty, reason: prePull.reason, before, after: readHistoryCount() });
+            // 拉取失败就中止上传：宁可本次同步失败，也不用本机数据覆盖掉别的设备的记录
+            if (!prePull.ok && !prePull.empty) {
+                return { ok: false, reason: prePull.reason || '上传前读取云端失败，已取消上传' };
             }
-            // 其它拉取失败（如网络抖动）继续尝试上传，避免完全无法保存
         }
         const payload = buildSyncPayload();
+        syncLog('准备上传', { 条数: payload.history.length, 标题: payload.history.map(h => h.title) });
         const response = await davRequest('PUT', syncFilePath(creds.code), {
             contentType: 'application/json',
-            body: JSON.stringify(payload),
+            // 这里必须传对象而不是 JSON.stringify 后的字符串：
+            // Rust 侧对 application/json 会再序列化一次，传字符串会导致云端存成 "{\"version\":...}"，
+            // 下次读回来 JSON.parse 得到的是字符串，history 取不到，合并永远不生效
+            body: payload,
             timeoutSecs: 30
         });
+        syncLog('上传响应', { status: response.status });
         if (response.status === 401) return { ok: false, reason: '坚果云账号或应用密码不正确' };
         if (response.status === 409) return { ok: false, reason: '坚果云拒绝写入，请检查账号是否有上传权限' };
         if (response.status !== 201 && response.status !== 204 && response.status !== 200) {
