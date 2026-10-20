@@ -226,8 +226,12 @@
                     </div>
 
                     <div class="settings-card">
-                        <div class="settings-card-title">跨设备同步</div>
+                        <div class="settings-card-title">
+                            <span>跨设备同步</span>
+                            <span id="syncStateBadge" class="sync-badge hidden">已同步</span>
+                        </div>
                         <p class="settings-hint">在电脑、手机、平板之间共享观看进度和收藏。三台设备填写同一份坚果云账号即可。</p>
+                        <button type="button" id="syncHelpBtn" class="text-btn sync-help-btn">如何获取坚果云应用密码？</button>
 
                         <!-- 未开启：填账号 + 创建或加入 -->
                         <div id="syncSetupPanel">
@@ -237,26 +241,36 @@
                             </div>
                             <div class="sync-field">
                                 <label for="syncPassInput">应用密码</label>
-                                <input id="syncPassInput" type="password" class="input" placeholder="在坚果云「安全选项 → 第三方应用管理」生成" autocomplete="current-password">
+                                <input id="syncPassInput" type="password" class="input" placeholder="在坚果云客户端生成的应用专用密码" autocomplete="current-password">
                             </div>
-                            <p class="settings-tip">这里要填<strong>应用密码</strong>，不是登录密码。生成方式：坚果云网页版 → 账户信息 → 安全选项 → 添加应用。</p>
+                            <p class="settings-tip">这里要填<strong>应用密码</strong>，不是坚果云登录密码。在<strong>坚果云客户端</strong>的「设置 → 第三方应用管理」里生成。</p>
                             <div class="sync-actions">
                                 <button type="button" id="syncJoinBtn" class="btn-primary">输入同步码加入</button>
                                 <button type="button" id="syncCreateBtn" class="btn-secondary">新建同步（第一台设备）</button>
                             </div>
                         </div>
 
-                        <!-- 已开启：展示同步码和使用状态 -->
+                        <!-- 已开启：展示同步码、设备列表、同步记录 -->
                         <div id="syncActivePanel" class="hidden">
                             <div class="sync-code-box">
-                                <span class="sync-code-label">当前同步码</span>
+                                <span class="sync-code-label">同步码</span>
                                 <span id="syncCodeValue" class="sync-code-text">—</span>
                                 <button type="button" id="syncCopyCodeBtn" class="btn-secondary sync-copy-btn">复制</button>
                             </div>
-                            <p id="syncDeviceInfo" class="settings-tip"></p>
+
+                            <div class="sync-section">
+                                <h4 class="sync-section-title">同步的设备</h4>
+                                <ul id="syncDeviceList" class="sync-device-list"></ul>
+                            </div>
+
+                            <div class="sync-section">
+                                <h4 class="sync-section-title">已同步的记录</h4>
+                                <ul id="syncHistoryList" class="sync-history-list"></ul>
+                            </div>
+
                             <div class="sync-actions">
                                 <button type="button" id="syncNowBtn" class="btn-primary">立即同步</button>
-                                <button type="button" id="syncDisconnectBtn" class="btn-danger btn-secondary">清除同步码</button>
+                                <button type="button" id="syncDisconnectBtn" class="btn-danger btn-secondary">断开同步</button>
                             </div>
                         </div>
 

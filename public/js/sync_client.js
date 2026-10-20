@@ -150,6 +150,8 @@ async function pushSync() {
             return { ok: false, reason: `上传失败（${response.status}）` };
         }
         localStorage.setItem(SYNC_LAST_AT_KEY, String(Date.now()));
+        // 上传后把设备列表写回本地，首次创建时也能看到本机
+        if (Array.isArray(payload.devices)) writeDeviceList(payload.devices);
         return { ok: true };
     } catch (e) {
         return { ok: false, reason: e.message || '网络错误' };
@@ -241,28 +243,27 @@ function formatSyncTime(ts) {
     return `${Math.floor(diff / 86400000)} 天前同步`;
 }
 
-// 同步状态：未开启显示账号表单，已开启显示同步码和使用状态
+// 同步状态：未开启显示账号表单，已开启显示同步码、设备列表和同步记录
 function renderSyncStatus() {
     const creds = readSyncCredentials();
     const setupPanel = document.getElementById('syncSetupPanel');
     const activePanel = document.getElementById('syncActivePanel');
     const statusEl = document.getElementById('syncStatusText');
     const codeEl = document.getElementById('syncCodeValue');
-    const deviceEl = document.getElementById('syncDeviceInfo');
+    const badge = document.getElementById('syncStateBadge');
 
     const active = !!creds;
     if (setupPanel) setupPanel.classList.toggle('hidden', active);
     if (activePanel) activePanel.classList.toggle('hidden', !active);
-
     if (codeEl) codeEl.textContent = active ? creds.code : '—';
 
-    if (deviceEl) {
-        if (!active) {
-            deviceEl.textContent = '';
-        } else {
-            const name = syncDeviceName();
-            deviceEl.textContent = `本机：${name} · 其它设备填入同一同步码即可共享进度`;
-        }
+    // 已开启且没报错才算「已同步」
+    const synced = active && !syncState.lastError && !syncState.busy;
+    if (badge) badge.classList.toggle('hidden', !synced);
+
+    if (active) {
+        renderSyncDeviceList();
+        renderSyncHistoryList();
     }
 
     if (!statusEl) return;
@@ -278,7 +279,91 @@ function renderSyncStatus() {
         statusEl.textContent = `同步失败：${syncState.lastError}`;
         return;
     }
-    statusEl.textContent = `已开启 · ${formatSyncTime(lastSyncAt())}`;
+    statusEl.textContent = formatSyncTime(lastSyncAt());
+}
+
+// 参与同步的设备，本机高亮显示
+function renderSyncDeviceList() {
+    const list = document.getElementById('syncDeviceList');
+    if (!list) return;
+    const devices = typeof readDeviceList === 'function' ? readDeviceList() : [];
+    const self = syncDeviceName();
+    if (!devices.length) {
+        list.innerHTML = `<li class="sync-empty">还没有其它设备加入</li>`;
+        return;
+    }
+    list.innerHTML = devices.map(device => {
+        const isSelf = device.name === self;
+        const platform = device.platform ? `<span class="sync-device-platform">${escapeHtml(device.platform)}</span>` : '';
+        const selfTag = isSelf ? '<em class="sync-device-self">本机</em>' : '';
+        return `<li class="sync-device-item${isSelf ? ' is-self' : ''}">
+            <span class="sync-device-name">${escapeHtml(device.name || '设备')}</span>
+            ${platform}${selfTag}
+            <span class="sync-device-time">${escapeHtml(formatSyncTime(device.lastSeen))}</span>
+        </li>`;
+    }).join('');
+}
+
+// 已同步到本机的历史记录，只展示最近几条
+function renderSyncHistoryList() {
+    const list = document.getElementById('syncHistoryList');
+    if (!list) return;
+    let history = [];
+    try {
+        history = JSON.parse(localStorage.getItem('viewingHistory') || '[]');
+    } catch (e) {
+        history = [];
+    }
+    if (!Array.isArray(history) || !history.length) {
+        list.innerHTML = `<li class="sync-empty">还没有观看记录</li>`;
+        return;
+    }
+    const recent = history.slice(0, 5);
+    list.innerHTML = recent.map(item => {
+        const episode = typeof item.episodeIndex === 'number' ? item.episodeIndex + 1 : 1;
+        const position = formatSyncDuration(item.playbackPosition);
+        const relink = item.needsRelink ? '<em class="sync-relink">需重新找源</em>' : '';
+        return `<li class="sync-history-item">
+            <span class="sync-history-title">${escapeHtml(item.title || '未知')}</span>
+            <span class="sync-history-meta">第 ${episode} 集 · ${escapeHtml(position)}</span>
+            ${relink}
+        </li>`;
+    }).join('');
+}
+
+function formatSyncDuration(seconds) {
+    const total = Math.floor(Number(seconds) || 0);
+    if (total <= 0) return '00:00';
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    const mm = String(m).padStart(2, '0');
+    const ss = String(s).padStart(2, '0');
+    return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+// 坚果云应用密码获取说明
+function showSyncHelpDialog() {
+    const html = `
+        <div class="sync-dialog">
+            <p class="sync-dialog-title">如何获取坚果云应用密码</p>
+            <p class="settings-tip">坚果云网页版已经不支持生成应用密码，必须使用<strong>坚果云客户端</strong>。</p>
+            <ol class="sync-help-steps">
+                <li>下载并登录坚果云客户端</li>
+                <li>打开<strong>设置</strong></li>
+                <li>进入<strong>第三方应用管理</strong></li>
+                <li>添加应用，名称随意（如 LibreTV）</li>
+                <li>复制生成的应用密码，填到本页</li>
+            </ol>
+            <p class="settings-tip">坚果云官网：
+                <a href="https://www.jianguoyun.com" target="_blank" rel="noopener" class="sync-help-link">www.jianguoyun.com</a>
+            </p>
+            <p class="settings-tip">注意：要填的是应用密码，不是坚果云登录密码。</p>
+            <div class="settings-buttons">
+                <button type="button" class="btn-primary" onclick="closeSyncDialog()">知道了</button>
+            </div>
+        </div>`;
+    openSyncDialog(html);
 }
 
 // 给本机起一个便于辨认的名字，同步到云端后可看到有哪些设备
@@ -466,6 +551,7 @@ function setupSyncSettings() {
     bind('syncJoinBtn', handleSyncJoin);
     bind('syncNowBtn', handleSyncNow);
     bind('syncDisconnectBtn', handleSyncDisconnect);
+    bind('syncHelpBtn', showSyncHelpDialog);
     bind('syncCopyCodeBtn', () => {
         const current = readSyncCredentials();
         if (current) copySyncCode(current.code);

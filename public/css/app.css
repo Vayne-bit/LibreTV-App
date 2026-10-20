@@ -1716,3 +1716,119 @@ button {
     margin: 6px 0;
     font-size: 13px;
 }
+
+/* --- 同步状态徽标、设备列表、同步记录 --- */
+
+.sync-badge {
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.sync-help-btn {
+    margin-top: 8px;
+    color: var(--accent);
+    font-size: 12px;
+}
+
+.sync-help-steps {
+    margin: 10px 0;
+    padding-left: 20px;
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 1.9;
+}
+
+.sync-help-steps strong {
+    color: var(--text);
+}
+
+.sync-help-link {
+    color: var(--accent);
+    text-decoration: underline;
+}
+
+.sync-section {
+    margin-top: 16px;
+}
+
+.sync-section-title {
+    margin: 0 0 8px;
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.sync-device-list,
+.sync-history-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+}
+
+.sync-device-item,
+.sync-history-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 12px;
+    font-size: 13px;
+    border-bottom: 1px solid var(--border);
+}
+
+.sync-device-item:last-child,
+.sync-history-item:last-child {
+    border-bottom: none;
+}
+
+.sync-device-item.is-self {
+    background: var(--accent-soft);
+}
+
+.sync-device-name,
+.sync-history-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+.sync-device-platform,
+.sync-device-time,
+.sync-history-meta {
+    flex: 0 0 auto;
+    color: var(--text-faint);
+    font-size: 11px;
+}
+
+.sync-device-self {
+    flex: 0 0 auto;
+    padding: 1px 5px;
+    border-radius: 3px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 10px;
+    font-style: normal;
+    font-weight: 600;
+}
+
+.sync-relink {
+    flex: 0 0 auto;
+    color: var(--rating);
+    font-size: 11px;
+    font-style: normal;
+}
+
+.sync-empty {
+    padding: 12px;
+    color: var(--text-faint);
+    font-size: 12px;
+    text-align: center;
+}

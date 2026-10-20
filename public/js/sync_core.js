@@ -75,15 +75,56 @@ function slimFavoriteEntry(item) {
 }
 
 // 打包本机需要同步的数据
+// devices 记录参与同步的设备，合并时按设备名去重，用于在设置页展示
 function buildSyncPayload() {
     const history = readJsonArray(LOCAL_KEYS.history);
     const favorites = readJsonArray(LOCAL_KEYS.favorites);
+    const devices = mergeDeviceList(readDeviceList(), [currentDeviceInfo()]);
     return {
         version: 1,
         updatedAt: Date.now(),
         history: history.map(slimHistoryEntry).filter(Boolean),
-        favorites: favorites.map(slimFavoriteEntry).filter(Boolean)
+        favorites: favorites.map(slimFavoriteEntry).filter(Boolean),
+        devices
     };
+}
+
+// 本机信息，用于设备列表展示
+function currentDeviceInfo() {
+    const name = typeof syncDeviceName === 'function' ? syncDeviceName() : '设备';
+    const ua = navigator.userAgent || '';
+    let platform = '未知';
+    if (/Android/i.test(ua)) platform = 'Android';
+    else if (/Windows/i.test(ua)) platform = 'Windows';
+    else if (/Mac/i.test(ua)) platform = 'macOS';
+    else if (/Linux/i.test(ua)) platform = 'Linux';
+    return { name, platform, lastSeen: Date.now() };
+}
+
+function readDeviceList() {
+    try {
+        const list = JSON.parse(localStorage.getItem('syncDevices') || '[]');
+        return Array.isArray(list) ? list : [];
+    } catch (e) {
+        return [];
+    }
+}
+
+function writeDeviceList(list) {
+    localStorage.setItem('syncDevices', JSON.stringify(list || []));
+}
+
+// 按设备名去重，保留较新的 lastSeen
+function mergeDeviceList(local, remote) {
+    const byName = new Map();
+    [...(local || []), ...(remote || [])].forEach(item => {
+        if (!item || !item.name) return;
+        const existing = byName.get(item.name);
+        if (!existing || (item.lastSeen || 0) > (existing.lastSeen || 0)) {
+            byName.set(item.name, item);
+        }
+    });
+    return [...byName.values()].sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
 }
 
 const LOCAL_KEYS = {
@@ -223,6 +264,13 @@ function applySyncPayload(payload) {
     localStorage.setItem(LOCAL_KEYS.history, JSON.stringify(mergedHistory));
     localStorage.setItem(LOCAL_KEYS.favorites, JSON.stringify(mergedFavorites));
     localStorage.setItem(SYNC_LAST_AT_KEY, String(Date.now()));
+
+    // 记下参与同步的设备，供设置页展示
+    const devices = mergeDeviceList(readDeviceList(), [
+        ...(Array.isArray(payload.devices) ? payload.devices : []),
+        currentDeviceInfo()
+    ]);
+    writeDeviceList(devices);
 
     return {
         ok: true,
