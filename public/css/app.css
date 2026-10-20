@@ -1309,6 +1309,36 @@ button {
     .sheet-handle { display: none; }
 }
 
+/* 车机、超宽屏等场景：宽度大但高度有限，或 WebView 视口与实际可见区域不一致
+   弹层改为居中并限制高度，确保「立即播放」按钮始终在可视范围内 */
+@media (min-width: 760px) and (max-height: 559px) {
+    .sheet-mask { align-items: center; padding: 12px; }
+
+    .sheet {
+        max-width: 880px;
+        max-height: calc(100vh - 24px);
+        max-height: calc(100dvh - 24px);
+        border-radius: 12px;
+        animation: fade-in .2s ease;
+    }
+
+    .sheet-handle { display: none; }
+
+    /* 矮屏下压缩头部，把空间让给内容区 */
+    .sheet-header { padding: 4px 8px 4px 14px; }
+    .sheet-header h2 { font-size: 15px; }
+    .sheet-body { padding: 0 14px 14px; }
+}
+
+/* 超宽屏（如带鱼屏车机）：内容过宽时行高会被拉得很长，限制内容最大宽度 */
+@media (min-width: 1200px) {
+    .detail-head,
+    .detail-episodes,
+    .detail-desc {
+        max-width: 100%;
+    }
+}
+
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes sheet-up { from { transform: translateY(40px); opacity: .5; } to { transform: none; opacity: 1; } }
 

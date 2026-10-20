@@ -91,7 +91,28 @@ function openDetailSheet() {
     if (!modal) return;
     modal.classList.remove('hidden');
     document.body.style.overflow = 'hidden';
+    applySheetViewportHeight(modal);
     if (!(history.state && history.state.sheet)) history.pushState({ sheet: true }, '');
+}
+
+// 车机上 vh 常与真实可见高度不一致，导致弹层溢出屏幕、底部按钮看不见
+// 这里按 window.innerHeight 兜底设定高度，矮屏时同时调整对齐方式
+function applySheetViewportHeight(modal) {
+    const sheet = modal.querySelector('.sheet');
+    if (!sheet) return;
+    const height = window.innerHeight || 0;
+    if (!height) return;
+    // 留出一点上下边距，避免贴边
+    const limit = Math.max(240, height - 24);
+    sheet.style.maxHeight = `${limit}px`;
+    // 屏幕较矮时改用居中，防止底部内容被裁掉
+    if (height < 560) {
+        modal.style.alignItems = 'center';
+        modal.style.padding = '12px';
+    } else {
+        modal.style.alignItems = '';
+        modal.style.padding = '';
+    }
 }
 
 function closeDetailSheet(fromPopState = false) {
@@ -543,5 +564,12 @@ function setupDetailSheet() {
 
     window.addEventListener('popstate', () => {
         if (isDetailSheetOpen()) closeDetailSheet(true);
+    });
+
+    // 车机旋转屏幕、软键盘弹出都会改变可见高度，重新校准弹层高度
+    window.addEventListener('resize', () => {
+        if (!isDetailSheetOpen()) return;
+        const modal = document.getElementById('modal');
+        if (modal) applySheetViewportHeight(modal);
     });
 }
