@@ -44,10 +44,11 @@ function readSyncConfig() {
     return creds ? { code: creds.code } : null;
 }
 
-// 坚果云的 /dav/ 根目录下不允许直接建文件夹（MKCOL 返回 409），
-// 所以同步文件直接放在根目录，用 sync- 前缀区分，不依赖子目录
+// 坚果云的 /dav/ 根目录不可写（PUT 返回 404，MKCOL 返回 409），
+// 必须放在自带的「我的坚果云」目录下，这里用 URL 编码后的路径
+const SYNC_ROOT_FOLDER = '%e6%88%91%e7%9a%84%e5%9d%9a%e6%9e%9c%e4%ba%91'; // 我的坚果云
 function syncFilePath(code) {
-    return `${SYNC_DAV_ROOT}/libretv-sync-${code}.json`;
+    return `${SYNC_DAV_ROOT}/${SYNC_ROOT_FOLDER}/libretv-sync-${code}.json`;
 }
 
 function basicAuthHeader(username, password) {
@@ -87,17 +88,21 @@ function generateSyncCode() {
 
 // --- 读写 ---
 
-// 前置校验：先访问根目录，确认账号密码有效
-// 否则文件不存在（404）会和认证失败混在一起，用户看不到真正原因
+// 前置校验：访问「我的坚果云」目录，确认账号密码有效
+// 目录是集合，GET 会返回 403/200，401 才是密码错误
+// 这样能把「密码错」和「文件不存在」区分开
 async function verifyCredentials() {
     const creds = readSyncCredentials();
     if (!creds) return { ok: false, reason: '未配置同步' };
     try {
-        const response = await davRequest('GET', `${SYNC_DAV_ROOT}/`, { timeoutSecs: 15 });
+        const response = await davRequest('GET', `${SYNC_DAV_ROOT}/${SYNC_ROOT_FOLDER}/`, { timeoutSecs: 15 });
         if (response.status === 401) return { ok: false, reason: '坚果云账号或应用密码不正确' };
-        // 根目录是集合，GET 返回 403/200 都说明认证已通过
         if (response.status === 403 || response.status === 200 || response.status === 301) {
             return { ok: true };
+        }
+        // 404 说明账号下找不到「我的坚果云」目录，通常仍是认证问题
+        if (response.status === 404) {
+            return { ok: false, reason: '坚果云账号或应用密码不正确' };
         }
         return { ok: false, reason: `认证检查失败（${response.status}）` };
     } catch (e) {
