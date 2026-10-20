@@ -57,7 +57,10 @@ function initializePageContent() {
         const found = currentEpisodes.indexOf(videoUrl);
         if (found !== -1) index = found;
     }
-    if (index < 0 || index >= currentEpisodes.length) index = 0;
+    // 同步来的记录没有本地剧集列表，此时不能把集号归零，否则自动换源会跳到第 1 集
+    const isRelinkEntry = urlParams.get('relink') === '1' || currentEpisodes.length === 0;
+    if (!isRelinkEntry && (index < 0 || index >= currentEpisodes.length)) index = 0;
+    if (index < 0) index = 0;
     currentEpisodeIndex = index;
     currentEpisodeGroup = Math.floor(index / EPISODES_PER_GROUP);
     currentVideoUrl = videoUrl || currentEpisodes[index] || '';
@@ -80,6 +83,16 @@ function initializePageContent() {
         initPlayer(currentVideoUrl);
         // 同步来的条目片源多半已失效，提前自动找源，避免先黑屏再报错
         if (typeof precheckRelinkIfNeeded === 'function') precheckRelinkIfNeeded();
+    } else if (urlParams.get('relink') === '1' && typeof autoRelinkAndPlay === 'function') {
+        // 同步来的记录本机没有直链，直接开始找源，不走报错分支
+        pendingSeekPosition = startPosition > 10 ? startPosition : getSavedProgress();
+        autoRelinkAndPlay({ precheck: true }).then(result => {
+            if (!result || !result.ok) {
+                showPlayerError('没找到可播放的片源，请返回重新搜索');
+            }
+        }).catch(() => {
+            showPlayerError('没找到可播放的片源，请返回重新搜索');
+        });
     } else {
         showPlayerError('无效的视频链接');
     }

@@ -390,7 +390,13 @@ function playFromHistory(url, title, episodeIndex, playbackPosition = 0) {
         linkParams = new URLSearchParams(url.split('?')[1]);
     }
     const videoUrl = item.directVideoUrl || episodes[index] || linkParams.get('url') || (url && !url.includes('player.html') ? url : '');
+
+    // 同步来的条目只有片名和集号，本地没有可播地址：交给播放页自动找源
     if (!videoUrl) {
+        if (item.needsRelink || episodes.length) {
+            openPlayerForRelink(item, title, index, playbackPosition);
+            return;
+        }
         showToast('历史记录链接无效，请重新搜索', 'error');
         return;
     }
@@ -408,6 +414,38 @@ function playFromHistory(url, title, episodeIndex, playbackPosition = 0) {
         index: String(index),
         source: item.sourceName || linkParams.get('source') || '',
         source_code: linkParams.get('source_code') || item.sourceCode || ''
+    });
+    if (playbackPosition > 10) params.set('position', String(Math.floor(playbackPosition)));
+    showVideoPlayer(`player.html?${params.toString()}`);
+}
+
+// 同步来的条目没有可用直链，直接进播放页并标记需要找源
+// 播放页会按 needsRelink 自动搜索其它源，定位到同一集并续播
+function openPlayerForRelink(item, title, index, playbackPosition) {
+    const info = item.info || {
+        title,
+        cover: item.cover || '',
+        sourceName: item.sourceName || '',
+        sourceCode: item.sourceCode || '',
+        vodId: item.vodId || '',
+        needsRelink: true
+    };
+    // 确保播放页知道这条记录需要重新找源
+    info.needsRelink = true;
+
+    localStorage.setItem('currentVideoTitle', title);
+    localStorage.setItem('currentEpisodeIndex', String(index));
+    localStorage.setItem('currentEpisodes', JSON.stringify([]));
+    localStorage.setItem('currentEpisodeNames', JSON.stringify([]));
+    localStorage.setItem('currentVideoCover', item.cover || '');
+    localStorage.setItem('currentVideoInfo', JSON.stringify(info));
+
+    const params = new URLSearchParams({
+        title,
+        index: String(index),
+        relink: '1',
+        source: item.sourceName || '',
+        source_code: item.sourceCode || ''
     });
     if (playbackPosition > 10) params.set('position', String(Math.floor(playbackPosition)));
     showVideoPlayer(`player.html?${params.toString()}`);
