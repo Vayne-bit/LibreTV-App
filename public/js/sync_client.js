@@ -134,10 +134,22 @@ async function pullSync() {
     }
 }
 
-async function pushSync() {
+// 上传前先读一次云端并合并到本地，保证不会用本机数据覆盖掉别的设备的记录
+// 这样即使调用方忘了先拉取，也不会丢数据
+async function pushSync(options) {
+    const opts = options || {};
     const creds = readSyncCredentials();
     if (!creds) return { ok: false, reason: '未配置同步' };
     try {
+        if (!opts.skipPreMerge) {
+            const prePull = await pullSync();
+            if (prePull.ok || prePull.empty) {
+                // 合并完成，本地已包含双方数据
+            } else if (prePull.reason && prePull.reason.includes('密码')) {
+                return { ok: false, reason: prePull.reason };
+            }
+            // 其它拉取失败（如网络抖动）继续尝试上传，避免完全无法保存
+        }
         const payload = buildSyncPayload();
         const response = await davRequest('PUT', syncFilePath(creds.code), {
             contentType: 'application/json',
@@ -207,14 +219,33 @@ async function syncNow() {
     syncState.busy = true;
     syncState.lastError = '';
     try {
+        // 先拉云端并合并到本地，这一步会把别的设备的记录并进来
         const pulled = await pullSync();
         if (!pulled.ok) {
             syncState.lastError = pulled.reason;
             return pulled;
         }
+        // 合并完成后再上传，此时本地已包含双方数据，不会覆盖对方
         const pushed = await pushSync();
         if (!pushed.ok) syncState.lastError = pushed.reason;
         return pushed.ok ? { ok: true, applied: pulled.applied } : pushed;
+    } finally {
+        syncState.busy = false;
+        renderSyncStatus();
+    }
+}
+
+// 只拉取不推送：用于手动刷新，看到别的设备的新记录
+async function refreshFromCloud() {
+    if (syncState.busy) return { ok: false, reason: '正在同步中' };
+    if (!syncConfigured()) return { ok: false, reason: '未配置同步' };
+    syncState.busy = true;
+    syncState.lastError = '';
+    renderSyncStatus();
+    try {
+        const pulled = await pullSync();
+        if (!pulled.ok) syncState.lastError = pulled.reason;
+        return pulled;
     } finally {
         syncState.busy = false;
         renderSyncStatus();
@@ -263,7 +294,6 @@ function renderSyncStatus() {
 
     if (active) {
         renderSyncDeviceList();
-        renderSyncHistoryList();
     }
 
     if (!statusEl) return;
@@ -304,31 +334,56 @@ function renderSyncDeviceList() {
     }).join('');
 }
 
-// 已同步到本机的历史记录，只展示最近几条
-function renderSyncHistoryList() {
-    const list = document.getElementById('syncHistoryList');
-    if (!list) return;
+// 已同步的记录改在弹窗里展示，避免设置页过长
+function showSyncHistoryDialog() {
     let history = [];
     try {
         history = JSON.parse(localStorage.getItem('viewingHistory') || '[]');
     } catch (e) {
         history = [];
     }
-    if (!Array.isArray(history) || !history.length) {
-        list.innerHTML = `<li class="sync-empty">还没有观看记录</li>`;
+    const items = Array.isArray(history) ? history : [];
+    const rows = items.length
+        ? items.map(item => {
+            const episode = typeof item.episodeIndex === 'number' ? item.episodeIndex + 1 : 1;
+            const position = formatSyncDuration(item.playbackPosition);
+            const relink = item.needsRelink ? '<em class="sync-relink">需重新找源</em>' : '';
+            return `<li class="sync-history-item">
+                <span class="sync-history-title">${escapeHtml(item.title || '未知')}</span>
+                <span class="sync-history-meta">第 ${episode} 集 · ${escapeHtml(position)}</span>
+                ${relink}
+            </li>`;
+        }).join('')
+        : '<li class="sync-empty">还没有观看记录</li>';
+
+    const html = `
+        <div class="sync-dialog">
+            <p class="sync-dialog-title">已同步的记录</p>
+            <p class="settings-tip">共 ${items.length} 条，包含本机观看和从其它设备同步来的记录。</p>
+            <ul class="sync-history-list sync-history-dialog">${rows}</ul>
+            <div class="settings-buttons">
+                <button type="button" class="btn-primary" onclick="closeSyncDialog()">关闭</button>
+            </div>
+        </div>`;
+    openSyncDialog(html);
+}
+
+// 手动刷新：只拉取云端，不覆盖任何数据
+async function handleSyncRefresh() {
+    if (!syncConfigured()) {
+        showToast('请先创建或加入同步', 'error');
         return;
     }
-    const recent = history.slice(0, 5);
-    list.innerHTML = recent.map(item => {
-        const episode = typeof item.episodeIndex === 'number' ? item.episodeIndex + 1 : 1;
-        const position = formatSyncDuration(item.playbackPosition);
-        const relink = item.needsRelink ? '<em class="sync-relink">需重新找源</em>' : '';
-        return `<li class="sync-history-item">
-            <span class="sync-history-title">${escapeHtml(item.title || '未知')}</span>
-            <span class="sync-history-meta">第 ${episode} 集 · ${escapeHtml(position)}</span>
-            ${relink}
-        </li>`;
-    }).join('');
+    const result = await refreshFromCloud();
+    if (!result.ok) {
+        showToast(`刷新失败：${result.reason || '未知错误'}`, 'error');
+        return;
+    }
+    const applied = result.applied;
+    const added = applied && applied.historyAfter > applied.historyBefore
+        ? applied.historyAfter - applied.historyBefore : 0;
+    refreshAfterSync();
+    showToast(added > 0 ? `已获取 ${added} 条新记录` : '已是最新', 'success');
 }
 
 function formatSyncDuration(seconds) {
@@ -552,6 +607,8 @@ function setupSyncSettings() {
     bind('syncNowBtn', handleSyncNow);
     bind('syncDisconnectBtn', handleSyncDisconnect);
     bind('syncHelpBtn', showSyncHelpDialog);
+    bind('syncRefreshBtn', handleSyncRefresh);
+    bind('syncHistoryBtn', showSyncHistoryDialog);
     bind('syncCopyCodeBtn', () => {
         const current = readSyncCredentials();
         if (current) copySyncCode(current.code);

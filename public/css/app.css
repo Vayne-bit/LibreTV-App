@@ -1862,3 +1862,10 @@ button {
     font-size: 12px;
     text-align: center;
 }
+
+/* 已同步记录弹窗内的列表，限制高度避免过长 */
+.sync-history-dialog {
+    max-height: 50vh;
+    overflow-y: auto;
+    margin-top: 4px;
+}
