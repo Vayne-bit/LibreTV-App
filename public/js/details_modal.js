@@ -86,33 +86,93 @@ function currentDetailLine() {
     return detailState.lines[detailState.lineIndex] || { name: '', episodes: [] };
 }
 
+// 车机上 layout viewport 常比真实可见区域高（状态栏、底部手势区、软键盘、旋转未同步），
+// visualViewport 才是用户真正看得见的那块区域；不支持时退回 window.innerHeight
+function sheetViewport() {
+    const vv = window.visualViewport;
+    const fallback = window.innerHeight || document.documentElement.clientHeight || 0;
+    if (!vv || !vv.height) return { top: 0, height: fallback };
+    return { top: Math.max(0, vv.offsetTop || 0), height: vv.height };
+}
+
+// 入场动画 sheet-up 用 translateY 上移，直接量会把动画起始帧当成溢出屏幕、误触发兜底。
+// 这里把 transform 的位移扣掉，拿到的是「布局稳定后」的位置
+function sheetLayoutRect(sheet) {
+    const rect = sheet.getBoundingClientRect();
+    let offsetY = 0;
+    try {
+        const transform = getComputedStyle(sheet).transform;
+        const match = transform && transform !== 'none' ? transform.match(/^matrix(3d)?\(([^)]+)\)$/) : null;
+        if (match) {
+            const parts = match[2].split(',').map(Number);
+            offsetY = match[1] ? (parts[13] || 0) : (parts[5] || 0);
+        }
+    } catch (e) {
+        offsetY = 0;
+    }
+    return {
+        top: rect.top - offsetY,
+        bottom: rect.bottom - offsetY,
+        width: rect.width,
+        height: rect.height
+    };
+}
+
+// 弹层和可视区有任何交集就算「用户看得见」
+function sheetInView(sheet, view) {
+    if (!sheet || !view || !view.height) return false;
+    const rect = sheetLayoutRect(sheet);
+    if (rect.width < 1 || rect.height < 1) return false;
+    return rect.bottom > view.top + 1 && rect.top < view.top + view.height - 1;
+}
+
+// 整块都在可视区内：底部被切 = 「立即播放」点不到，顶部被切 = 关闭键点不到
+function sheetFullyInView(sheet, view) {
+    if (!sheet || !view || !view.height) return false;
+    const rect = sheetLayoutRect(sheet);
+    if (rect.width < 1 || rect.height < 1) return false;
+    return rect.top >= view.top - 1 && rect.bottom <= view.top + view.height + 1;
+}
+
 function openDetailSheet() {
     const modal = document.getElementById('modal');
     if (!modal) return;
     modal.classList.remove('hidden');
-    document.body.style.overflow = 'hidden';
     applySheetViewportHeight(modal);
     if (!(history.state && history.state.sheet)) history.pushState({ sheet: true }, '');
 }
 
 // 车机上 vh 常与真实可见高度不一致，导致弹层溢出屏幕、底部按钮看不见
-// 这里按 window.innerHeight 兜底设定高度，矮屏时同时调整对齐方式
+// 这里把遮罩对齐到真实可见区，再按可见高度限制弹层高度，矮屏时同时调整对齐方式
 function applySheetViewportHeight(modal) {
+    if (!modal) return;
     const sheet = modal.querySelector('.sheet');
     if (!sheet) return;
-    const height = window.innerHeight || 0;
-    if (!height) return;
+    const view = sheetViewport();
+    if (!view.height) return;
+    // 遮罩原本是 inset:0，会跟着 layout viewport 走；改成贴着可视区，避免底部对齐的弹层被推到屏幕外
+    modal.style.top = `${view.top}px`;
+    modal.style.height = `${view.height}px`;
+    modal.style.bottom = 'auto';
     // 留出一点上下边距，避免贴边
-    const limit = Math.max(240, height - 24);
+    const limit = Math.max(240, view.height - 24);
     sheet.style.maxHeight = `${limit}px`;
     // 屏幕较矮时改用居中，防止底部内容被裁掉
-    if (height < 560) {
+    if (view.height < 560) {
         modal.style.alignItems = 'center';
         modal.style.padding = '12px';
     } else {
         modal.style.alignItems = '';
         modal.style.padding = '';
     }
+    // 兜底：还有一部分被切在屏外时退化成顶部对齐的满高面板，保证关闭键和「立即播放」都在屏幕内
+    if (!sheetFullyInView(sheet, view)) {
+        modal.style.alignItems = 'flex-start';
+        modal.style.padding = '0';
+        sheet.style.maxHeight = `${Math.max(240, view.height - 8)}px`;
+    }
+    // 只有弹层真的落在可视区里才锁页面滚动：锁了却看不见，用户既操作不了弹层也滑不动列表，只能杀进程
+    document.body.style.overflow = sheetInView(sheet, view) ? 'hidden' : '';
 }
 
 function closeDetailSheet(fromPopState = false) {
@@ -566,10 +626,22 @@ function setupDetailSheet() {
         if (isDetailSheetOpen()) closeDetailSheet(true);
     });
 
-    // 车机旋转屏幕、软键盘弹出都会改变可见高度，重新校准弹层高度
-    window.addEventListener('resize', () => {
-        if (!isDetailSheetOpen()) return;
-        const modal = document.getElementById('modal');
-        if (modal) applySheetViewportHeight(modal);
-    });
+    // 车机旋转屏幕、软键盘弹出都会改变可见高度，重新校准弹层高度。
+    // visualViewport 能捕捉到 window.resize 拿不到的变化（键盘、缩放、地址栏收起），rAF 合并连续事件
+    let sheetResizeFrame = 0;
+    const scheduleSheetResize = () => {
+        if (sheetResizeFrame) return;
+        sheetResizeFrame = requestAnimationFrame(() => {
+            sheetResizeFrame = 0;
+            if (!isDetailSheetOpen()) return;
+            const modal = document.getElementById('modal');
+            if (modal) applySheetViewportHeight(modal);
+        });
+    };
+    window.addEventListener('resize', scheduleSheetResize);
+    window.addEventListener('orientationchange', scheduleSheetResize);
+    if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', scheduleSheetResize);
+        window.visualViewport.addEventListener('scroll', scheduleSheetResize);
+    }
 }

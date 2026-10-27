@@ -42,6 +42,21 @@ function setupEventListeners() {
         });
     }
 
+    // 分片缓存开关事件绑定
+    const segmentCacheToggle = document.getElementById('segmentCacheToggle');
+    if (segmentCacheToggle) {
+        segmentCacheToggle.addEventListener('change', function(e) {
+            localStorage.setItem('segmentCacheEnabled', e.target.checked);
+            // 页面里若已加载缓存模块，同步内存开关；关掉时顺手把已占的空间腾出来
+            if (typeof setSegmentCacheEnabled === 'function') setSegmentCacheEnabled(e.target.checked);
+            if (!e.target.checked && typeof segmentCacheClear === 'function') {
+                segmentCacheClear().then(() => {
+                    if (typeof refreshDiagnostics === 'function') refreshDiagnostics();
+                }).catch(() => {});
+            }
+        });
+    }
+
     // 豆瓣热门推荐开关
     const doubanToggle = document.getElementById('doubanToggle');
     if (doubanToggle) {

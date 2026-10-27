@@ -621,7 +621,12 @@ function clearLocalStorage() {
     document.getElementById('confirmBoxModal').addEventListener('click', function () {
         // 清除所有localStorage数据
         localStorage.clear();
-        
+
+        // 分片缓存存在 IndexedDB 里，localStorage.clear() 清不到，得单独清
+        if (typeof segmentCacheClear === 'function') {
+            segmentCacheClear().catch(() => { /* 清不掉也不该挡住后面的刷新 */ });
+        }
+
         // 清除所有cookie
         const cookies = document.cookie.split(";");
         for (let i = 0; i < cookies.length; i++) {

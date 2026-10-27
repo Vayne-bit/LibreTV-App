@@ -20,6 +20,9 @@ function initializeApp() {
     const adFilterToggle = document.getElementById('adFilterToggle');
     if (adFilterToggle) adFilterToggle.checked = localStorage.getItem(PLAYER_CONFIG.adFilteringStorage) !== 'false';
 
+    const segmentCacheToggle = document.getElementById('segmentCacheToggle');
+    if (segmentCacheToggle) segmentCacheToggle.checked = localStorage.getItem('segmentCacheEnabled') !== 'false';
+
     const doubanToggle = document.getElementById('doubanToggle');
     if (doubanToggle) doubanToggle.checked = localStorage.getItem('doubanEnabled') !== 'false';
 

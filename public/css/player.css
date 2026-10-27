@@ -37,8 +37,9 @@
     z-index: 30;
     width: 100%;
     aspect-ratio: 16 / 9;
-    max-height: 100vh;
-    max-height: 100dvh;
+    /* 播放器排在 48px 顶栏下面，高度必须扣掉顶栏和安全区，否则横屏时底部控制条（含锁按钮）被切在屏幕外 */
+    max-height: calc(100vh - 48px - var(--safe-top));
+    max-height: calc(100dvh - 48px - var(--safe-top));
     background: #000;
 }
 
@@ -554,6 +555,114 @@ body.player-fullscreen {
     flex: 0 0 auto;
     color: var(--text-muted);
     font-size: 12px;
+}
+
+/* --- 拖动后等缓冲的提示条 --- */
+
+.player-buffer-pill {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    z-index: 46;
+    padding: 8px 14px;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, 0.72);
+    color: #fff;
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+    pointer-events: none;
+    opacity: 0;
+    transform: translate(-50%, -50%);
+    transition: opacity .15s linear;
+}
+
+.player-buffer-pill.show {
+    opacity: 1;
+}
+
+/* --- 全屏顶部信息条 ---
+   只在控制条显示时出现（跟 ArtPlayer 的 art-control-show 同一个节拍），
+   高度用 --art-control-height 对齐底部控制条，触控区交给 ArtPlayer。 */
+
+.player-fs-topbar {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 45;
+    display: none;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: calc(8px + var(--safe-top)) 14px 10px;
+    background: linear-gradient(180deg, rgba(0, 0, 0, 0.62), rgba(0, 0, 0, 0));
+    color: #fff;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity .2s ease;
+}
+
+/* ArtPlayer 全屏后播放器节点带 art-fullscreen 或 art-fullscreen-web */
+.art-video-player.art-fullscreen .player-fs-topbar,
+.art-video-player.art-fullscreen-web .player-fs-topbar {
+    display: flex;
+}
+
+.art-video-player.art-fullscreen.art-control-show .player-fs-topbar,
+.art-video-player.art-fullscreen-web.art-control-show .player-fs-topbar {
+    opacity: 1;
+}
+
+.player-fs-topbar-main {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+
+.player-fs-topbar-title {
+    font-size: 15px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.player-fs-topbar-meta {
+    color: rgba(255, 255, 255, 0.72);
+    font-size: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.player-fs-topbar-side {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 0 0 auto;
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+}
+
+.player-fs-topbar-battery::before {
+    content: '';
+    display: inline-block;
+    width: 16px;
+    height: 8px;
+    margin-right: 4px;
+    border: 1px solid currentColor;
+    border-radius: 2px;
+    vertical-align: middle;
+}
+
+.player-fs-topbar-battery.charging::before {
+    background: #7ed321;
+}
+
+.player-fs-topbar-meta.hidden,
+.player-fs-topbar-battery.hidden {
+    display: none;
 }
 
 @media (min-width: 900px) {

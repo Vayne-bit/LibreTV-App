@@ -9,10 +9,14 @@ const PLAYER_ICONS = {
 const HLS_BASE_CONFIG = {
     debug: false,
     enableWorker: true, lowLatencyMode: false,
-    maxBufferHole: 0.5, fragLoadingMaxRetry: 6, fragLoadingMaxRetryTimeout: 64000,
+    // maxBufferHole 是「小于这个值的空洞当作不存在」的阈值。hls.js 1.6.2 默认 0.1，
+    // 之前设成 0.5 会让 0.1~0.5s 的真实空洞被忽略，既不去补也不触发 nudge，播到那里就停住。
+    maxBufferHole: 0.1, fragLoadingMaxRetry: 6, fragLoadingMaxRetryTimeout: 64000,
     fragLoadingRetryDelay: 1000, manifestLoadingMaxRetry: 3, manifestLoadingRetryDelay: 1000,
     levelLoadingMaxRetry: 4, levelLoadingRetryDelay: 1000, startLevel: -1,
-    abrEwmaDefaultEstimate: 500000, abrBandWidthFactor: 0.95, abrBandWidthUpFactor: 0.7,
+    abrEwmaDefaultEstimate: 500000, abrBandWidthFactor: 0.95, abrBandWidthUpFactor: 0.6,
+    // 手机/平板屏上 1080P 和 720P 肉眼几乎没差别，码率却差一倍多，按播放器尺寸封顶最划算
+    capLevelToPlayerSize: true, capLevelOnFPSDrop: true,
     abrMaxWithRealBitrate: true, stretchShortVideoTrack: true, appendErrorMaxRetry: 5,
     liveSyncDurationCount: 3, liveDurationInfinity: false
 };
@@ -22,8 +26,10 @@ function isMobileDevice() {
 }
 
 // Phones switch cells and lose signal, so they get a deeper buffer; desktops keep the leaner setting.
+// 缓冲目标不能设太大：hls.js 的 ABR 用「距离下次卡顿还有多久」判断能不能升档，
+// 目标缓冲越长它越敢选高档，结果选到刚好撑不住的码率，播放中反复被抽干。
 const HLS_CONFIG = isMobileDevice()
-    ? { ...HLS_BASE_CONFIG, backBufferLength: 30, maxBufferLength: 60, maxMaxBufferLength: 120, maxBufferSize: 60 * 1000 * 1000 }
+    ? { ...HLS_BASE_CONFIG, backBufferLength: 30, maxBufferLength: 30, maxMaxBufferLength: 60, maxBufferSize: 60 * 1000 * 1000 }
     : { ...HLS_BASE_CONFIG, backBufferLength: 90, maxBufferLength: 30, maxMaxBufferLength: 60, maxBufferSize: 30 * 1000 * 1000 };
 
 let playbackStarted = false;
@@ -42,6 +48,8 @@ function destroyStreamEngines(instance) {
     if (!instance) return;
     if (instance.hls) { try { instance.hls.destroy(); } catch (e) { /* ignore */ } instance.hls = null; }
     if (instance.flv) { try { instance.flv.destroy(); } catch (e) { /* ignore */ } instance.flv = null; }
+    // 旧的 hls 实例已经销毁，缓存层不能再从它身上读带宽估计
+    if (typeof bindSegmentCacheHls === 'function') bindSegmentCacheHls(null);
 }
 
 // 片源加载失败：先尝试自动换源，找不到再显示错误页
@@ -68,8 +76,11 @@ function playM3u8(video, url, instance) {
     }
     const hls = new Hls({
         ...HLS_CONFIG,
-        loader: adFilteringEnabled ? CustomHlsJsLoader : Hls.DefaultConfig.loader
+        // 始终用自定义 loader：分片缓存要靠它接管分片请求，关掉广告过滤只是跳过 playlist 处理
+        loader: CustomHlsJsLoader
     });
+    // 缓存命中时要按当前带宽估算「这些字节真下要多久」，否则 hls.js 会以为网速暴涨而乱升码率
+    if (typeof bindSegmentCacheHls === 'function') bindSegmentCacheHls(hls);
     let fatalRecoverCount = 0;
     let bufferAppendErrorCount = 0;
     // 多码率源只有解析完 master playlist 才知道有哪些清晰度，这里同步给角标
@@ -208,6 +219,8 @@ function initPlayer(videoUrl) {
         updateNextEpisodeControl();
         // ArtPlayer 会重建容器内容，遮罩和手势要在 ready 之后再挂
         if (typeof setupPlayerGestures === 'function') setupPlayerGestures();
+        if (typeof setupPlayerBuffer === 'function') setupPlayerBuffer(art);
+        if (typeof setupFullscreenOverlay === 'function') setupFullscreenOverlay(art);
     });
 
     art.on('video:loadedmetadata', () => {
@@ -349,6 +362,8 @@ function updateResolutionBadge(label) {
         container.appendChild(badge);
     }
     badge.textContent = label;
+    // 全屏顶部条读的就是这个角标，切档后立刻同步，不等下一次时钟刷新
+    if (typeof updateFsOverlay === 'function') updateFsOverlay();
 }
 
 async function requestScreenAwake(on) {
@@ -368,26 +383,91 @@ async function requestScreenAwake(on) {
     } catch (e) { /* not supported */ }
 }
 
+// 统一走这个 loader：播放列表要过滤广告，分片要落磁盘缓存，两件事都得经过这里。
+// 广告过滤关掉时只是跳过 manifest 处理，分片缓存照旧生效。
 class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
     constructor(config) {
         super(config);
         const load = this.load.bind(this);
+        const loaderStats = this.stats;
+        // hls.js 的 abort 只在已经发出 XHR 时才把 stats.aborted 置位（xhr.readyState !== 4）。
+        // 我们在查 IndexedDB 时还没发请求，loader 是 null，那个标志永远不会置上，
+        // 所以自己拦 abort/destroy 记一个标记，否则 abort 之后还会白发起一次网络请求。
+        this.cacheAborted = false;
+        const abort = this.abort;
+        const destroy = this.destroy;
+        this.abort = function () {
+            this.cacheAborted = true;
+            return abort.apply(this, arguments);
+        };
+        this.destroy = function () {
+            this.cacheAborted = true;
+            return destroy.apply(this, arguments);
+        };
         this.load = function (context, loadConfig, callbacks) {
             if (context.type === 'manifest' || context.type === 'level') {
                 const onSuccess = callbacks.onSuccess;
                 callbacks.onSuccess = function (response, stats, ctx, networkDetails) {
-                    if (response.data && typeof response.data === 'string') {
+                    if (adFilteringEnabled && response.data && typeof response.data === 'string') {
                         response.data = filterAdsFromM3U8(response.data);
                     }
                     return onSuccess(response, stats, ctx, networkDetails);
                 };
             }
-            load(context, loadConfig, callbacks);
+            if (typeof isSegmentCacheCandidate !== 'function' || !isSegmentCacheCandidate(context)) {
+                load(context, loadConfig, callbacks);
+                return;
+            }
+            const self = this;
+            // 网络路径：拿到分片时顺手存一份，再交给 hls.js
+            const goNetwork = () => {
+                const netOnSuccess = callbacks.onSuccess;
+                callbacks.onSuccess = function (response, stats, ctx, networkDetails) {
+                    if (typeof storeSegmentFromResponse === 'function') storeSegmentFromResponse(context, response);
+                    return netOnSuccess(response, stats, ctx, networkDetails);
+                };
+                load(context, loadConfig, callbacks);
+            };
+            // IndexedDB 是异步的，查表期间 hls.js 可能已经 abort 掉这次请求（用户又拖了进度条）
+            let settled = false;
+            const startNetwork = () => {
+                if (settled) return;
+                settled = true;
+                if (self.cacheAborted || (loaderStats && loaderStats.aborted)) return;
+                goNetwork();
+            };
+            segmentCacheGet(segmentCacheKey(context)).then(buffer => {
+                if (settled) return;
+                if (self.cacheAborted) {
+                    settled = true;
+                    return;
+                }
+                if (buffer && buffer.byteLength) {
+                    settled = true;
+                    segmentCacheNoteHit(buffer.byteLength);
+                    try {
+                        callbacks.onSuccess(
+                            { url: context.url, data: buffer, code: 200 },
+                            prepareSegmentCacheStats(loaderStats, buffer.byteLength),
+                            context,
+                            null
+                        );
+                        return;
+                    } catch (e) {
+                        // 喂给 hls.js 失败就退回网络，不要让一次异常把播放打断
+                        settled = false;
+                    }
+                }
+                segmentCacheNoteMiss();
+                startNetwork();
+            }).catch(startNetwork);
         };
     }
 }
 
+// 原实现会把 #EXT-X-DISCONTINUITY 整行删掉。这个标签是告诉 hls.js「下一片的时间戳会跳变，
+// 需要重新对齐」的，删掉后 remuxer 会按连续时间戳算分段时长，缓冲区里因此出现空洞或重叠，
+// 表现为播到某个位置就卡住。真正的广告过滤要按分片内容判断，做不到之前保持原样返回。
 function filterAdsFromM3U8(m3u8Content) {
-    if (!m3u8Content) return '';
-    return m3u8Content.split('\n').filter(line => !line.includes('#EXT-X-DISCONTINUITY')).join('\n');
+    return m3u8Content || '';
 }

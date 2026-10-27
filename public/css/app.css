@@ -1612,6 +1612,24 @@ button {
     color: var(--text-muted);
 }
 
+/* 诊断信息：等宽字体、可选中、可滚动，长内容不撑破卡片 */
+.diagnostics-output {
+    max-height: 240px;
+    margin: 10px 0;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: var(--bg);
+    color: var(--text-muted);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.7;
+    white-space: pre-wrap;
+    word-break: break-all;
+    overflow: auto;
+    -webkit-user-select: text;
+    user-select: text;
+}
+
 .sync-field {
     margin-top: 12px;
 }

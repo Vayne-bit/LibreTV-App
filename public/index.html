@@ -214,6 +214,17 @@
                         </div>
                         <div class="setting-row">
                             <div class="setting-text">
+                                <label for="segmentCacheToggle">分片缓存</label>
+                                <p>已下载的片段存到本地，回看和重看时不用重新拉，最多占 400MB</p>
+                            </div>
+                            <div class="toggle">
+                                <input type="checkbox" id="segmentCacheToggle">
+                                <span class="toggle-bg"></span>
+                                <span class="toggle-dot"></span>
+                            </div>
+                        </div>
+                        <div class="setting-row">
+                            <div class="setting-text">
                                 <label for="doubanToggle">豆瓣热门推荐</label>
                                 <p>首页展示豆瓣热门影视和分类片库</p>
                             </div>
@@ -283,6 +294,18 @@
                             <button type="button" onclick="importConfig()" class="btn-secondary">导入配置</button>
                             <button type="button" onclick="exportConfig()" class="btn-secondary">导出配置</button>
                             <button type="button" onclick="clearLocalStorage()" class="btn-danger btn-secondary">清除本地数据</button>
+                        </div>
+                    </div>
+
+                    <div class="settings-card">
+                        <div class="settings-card-title flex items-center justify-between">
+                            <span>诊断信息</span>
+                            <button type="button" id="diagnosticsRefreshBtn" class="btn-secondary" style="min-height:32px;padding:0 12px;font-size:13px">刷新</button>
+                        </div>
+                        <p class="settings-hint">反馈播放、弹层、界面溢出等问题时，把下面的内容一起发出来，能直接看出是不是屏幕尺寸和可见区不一致导致的。</p>
+                        <pre id="diagnosticsOutput" class="diagnostics-output">正在采集…</pre>
+                        <div class="settings-buttons">
+                            <button type="button" id="diagnosticsCopyBtn" class="btn-secondary">复制诊断信息</button>
                         </div>
                     </div>
 
@@ -407,6 +430,8 @@
     <script src="js/sync_core.js"></script>
     <script src="js/sync_client.js"></script>
     <script src="js/version-check.js"></script>
+    <script src="js/player_cache.js"></script>
+    <script src="js/diagnostics.js"></script>
     <script>
         document.addEventListener('DOMContentLoaded', function () {
             if (localStorage.getItem('hasSeenDisclaimer')) return;
