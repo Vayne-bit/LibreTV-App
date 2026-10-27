@@ -171,10 +171,11 @@ jobs:
           set -euo pipefail
           NOTES="docs/RELEASE-${GITHUB_REF_NAME}.md"
           if [ -f "$NOTES" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
             echo "path=$NOTES" >> "$GITHUB_OUTPUT"
             echo "Using $NOTES"
           else
-            echo "path=" >> "$GITHUB_OUTPUT"
+            echo "found=false" >> "$GITHUB_OUTPUT"
             echo "::warning::$NOTES not found, falling back to generated release notes"
           fi
 
@@ -184,13 +185,13 @@ jobs:
           merge-multiple: true
 
       - uses: softprops/action-gh-release@v2
-        if: steps.notes.outputs.path != ''
+        if: steps.notes.outputs.found == 'true'
         with:
           files: dist/*
           body_path: ${{ steps.notes.outputs.path }}
 
       - uses: softprops/action-gh-release@v2
-        if: steps.notes.outputs.path == ''
+        if: steps.notes.outputs.found != 'true'
         with:
           files: dist/*
           generate_release_notes: true
