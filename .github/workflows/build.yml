@@ -161,12 +161,36 @@ jobs:
     needs: [android, windows]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
+      # 版本说明写在 docs/RELEASE-<tag>.md 里，直接当 release 正文用；
+      # 只有缺这份文档时才退回按 commit 自动生成
+      - name: Locate release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          NOTES="docs/RELEASE-${GITHUB_REF_NAME}.md"
+          if [ -f "$NOTES" ]; then
+            echo "path=$NOTES" >> "$GITHUB_OUTPUT"
+            echo "Using $NOTES"
+          else
+            echo "path=" >> "$GITHUB_OUTPUT"
+            echo "::warning::$NOTES not found, falling back to generated release notes"
+          fi
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
       - uses: softprops/action-gh-release@v2
+        if: steps.notes.outputs.path != ''
+        with:
+          files: dist/*
+          body_path: ${{ steps.notes.outputs.path }}
+
+      - uses: softprops/action-gh-release@v2
+        if: steps.notes.outputs.path == ''
         with:
           files: dist/*
           generate_release_notes: true
