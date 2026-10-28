@@ -408,8 +408,10 @@ class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
             if (context.type === 'manifest' || context.type === 'level') {
                 const onSuccess = callbacks.onSuccess;
                 callbacks.onSuccess = function (response, stats, ctx, networkDetails) {
-                    if (adFilteringEnabled && response.data && typeof response.data === 'string') {
-                        response.data = filterAdsFromM3U8(response.data);
+                    if (response.data && typeof response.data === 'string') {
+                        // 广告过滤关掉时也走一遍：只统计标记，不改内容，诊断信息才有数据可看
+                        const filtering = typeof adFilteringEnabled === 'undefined' ? true : adFilteringEnabled;
+                        response.data = filterAdsFromM3U8(response.data, filtering);
                     }
                     return onSuccess(response, stats, ctx, networkDetails);
                 };
@@ -465,9 +467,106 @@ class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
     }
 }
 
-// 原实现会把 #EXT-X-DISCONTINUITY 整行删掉。这个标签是告诉 hls.js「下一片的时间戳会跳变，
-// 需要重新对齐」的，删掉后 remuxer 会按连续时间戳算分段时长，缓冲区里因此出现空洞或重叠，
-// 表现为播到某个位置就卡住。真正的广告过滤要按分片内容判断，做不到之前保持原样返回。
-function filterAdsFromM3U8(m3u8Content) {
-    return m3u8Content || '';
+// 播放列表里的广告标记统计，落到 localStorage 给设置页的诊断信息读。
+// 各采集站用的标记不一样（有的只给 CUE-OUT，有的只给 DISCONTINUITY，有的用 DATERANGE），
+// 没有这份数据就没法判断该按哪种规则去广告，只能靠猜。
+const PLAYLIST_MARKER_STATS_KEY = 'playlistMarkerStats';
+
+function recordPlaylistMarkers(raw, removedSegments, aborted) {
+    if (typeof raw !== 'string' || !raw) return;
+    const count = pattern => (raw.match(pattern) || []).length;
+    const payload = {
+        at: Date.now(),
+        bytes: raw.length,
+        segments: count(/#EXTINF/g),
+        discontinuity: count(/#EXT-X-DISCONTINUITY(?!-SEQUENCE)/g),
+        cueOut: count(/#EXT-X-CUE-OUT/g),
+        cueIn: count(/#EXT-X-CUE-IN/g),
+        daterange: count(/#EXT-X-DATERANGE/g),
+        scte35: count(/#(?:EXT-X-SCTE35|EXT-OATCLS-SCTE35)/g),
+        removed: removedSegments || 0,
+        aborted: !!aborted
+    };
+    try { localStorage.setItem(PLAYLIST_MARKER_STATS_KEY, JSON.stringify(payload)); } catch (e) { /* 存不下就算了 */ }
+}
+
+// 按 SCTE-35 广告标记把标记区间内的分片整段删掉（#EXT-X-CUE-OUT … #EXT-X-CUE-IN）。
+// 早先的实现只删 #EXT-X-DISCONTINUITY 这一行标签、一个分片都不删，所以从来没真正去掉过广告；
+// 反过来删标签还会让 remuxer 按连续时间戳算分段，导致缓冲出现空洞。现在标签一律保留，只删分片。
+function filterAdsFromM3U8(m3u8Content, applyFilter) {
+    if (!m3u8Content) return '';
+    const lines = m3u8Content.split('\n');
+    // 没有广告标记就原样返回，避免误伤正常播放列表
+    const hasCueOut = lines.some(line => line.trim().indexOf('#EXT-X-CUE-OUT') === 0);
+    if (!hasCueOut || !applyFilter) {
+        recordPlaylistMarkers(m3u8Content, 0);
+        return m3u8Content;
+    }
+    const kept = [];
+    let inAd = false;
+    let removed = 0;
+    let sawCueIn = false;
+    let pendingBreak = false;
+    let insertBreak = false;
+    // 已经保留的最后一行是不是 DISCONTINUITY：决定广告断点处要不要补标记
+    const lastKeptIsDiscontinuity = () => {
+        for (let i = kept.length - 1; i >= 0; i--) {
+            const t = kept[i].trim();
+            if (!t) continue;
+            return t.indexOf('#EXT-X-DISCONTINUITY') === 0;
+        }
+        return true;
+    };
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const trimmed = line.trim();
+        // CUE-OUT-CONT 也是以 CUE-OUT 开头，一并算作广告区间内
+        if (trimmed.indexOf('#EXT-X-CUE-OUT') === 0) {
+            inAd = true;
+            continue;
+        }
+        if (trimmed.indexOf('#EXT-X-CUE-IN') === 0) {
+            inAd = false;
+            sawCueIn = true;
+            pendingBreak = true;
+            continue;
+        }
+        if (inAd) {
+            if (trimmed.indexOf('#EXTINF') === 0) removed += 1;
+            continue;
+        }
+        if (pendingBreak) {
+            if (!trimmed) continue;
+            pendingBreak = false;
+            if (trimmed.indexOf('#EXT-X-DISCONTINUITY') === 0) {
+                // 广告段后紧跟的 DISCONTINUITY：前面已经有了就合并成一个，没有就留着这个
+                if (lastKeptIsDiscontinuity()) continue;
+                kept.push(line);
+                continue;
+            }
+            // 广告前后都没打断点标记，下一个分片前补一个：广告分片与正片的时间戳不连续，
+            // 不标出来的话 remuxer 会按连续时间戳算分段时长，缓冲区里出现空洞
+            insertBreak = !lastKeptIsDiscontinuity();
+        }
+        // 断点标记要落在分片前面，且后面没有分片时不必补（否则 ENDLIST 前会多一行空断点）
+        if (insertBreak && trimmed.indexOf('#EXTINF') === 0) {
+            kept.push('#EXT-X-DISCONTINUITY');
+            insertBreak = false;
+        }
+        kept.push(line);
+    }
+    // 标记不成对（没有 CUE-IN）说明结构不符合预期，宁可不动，别把正片删了
+    if (!sawCueIn) {
+        recordPlaylistMarkers(m3u8Content, 0);
+        return m3u8Content;
+    }
+    // 兜底：标记打错位置时会一口气删掉大半正片，超过三成就当标记不可信，原样放行。
+    // 宁可让用户看广告，也不能把正片删没。
+    const totalSegments = lines.reduce((n, l) => (l.trim().indexOf('#EXTINF') === 0 ? n + 1 : n), 0);
+    if (removed > 5 && removed > totalSegments * 0.3) {
+        recordPlaylistMarkers(m3u8Content, 0, true);
+        return m3u8Content;
+    }
+    recordPlaylistMarkers(m3u8Content, removed);
+    return kept.join('\n');
 }

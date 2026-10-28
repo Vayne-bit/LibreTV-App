@@ -8,12 +8,22 @@ const BUFFER_HOLD_MAX_MS = 15000;
 // hls.js 修缓冲空洞时会小幅 nudging（0.1s），那种不算用户拖动，不能触发等待
 const BUFFER_HOLD_MIN_JUMP = 10;
 const BUFFER_POLL_MS = 250;
-// 正常播放时 timeupdate 约 4 次/秒，超过这个间隔说明画面真的停住了。
-// 用「间隔」而不是 waiting 事件：播一秒卡一下的那种短卡顿，waiting 很快就被 playing 清掉，抓不住。
-const BUFFER_STALL_GAP_MS = 1500;
+// 正常播放时 timeupdate 约 4 次/秒（间隔 250ms）。原来的 1500ms 阈值只能抓到「卡死两秒以上」，
+// 而采集站最常见的「播一秒卡一下」每次只停半秒到一秒，全都漏掉了，诊断里因此永远是 0 次。
+// 现在两条路都算：waiting 事件（缓冲真的被抽干的直接信号）和间隔超过 800ms。
+const BUFFER_STALL_GAP_MS = 800;
+// waiting 会紧跟着 timeupdate 的间隔一起出现，同一次卡顿不能记两次
+const BUFFER_STALL_COOLDOWN_MS = 1000;
+// 拖动后 hls.js 要重新拉分片，这段时间的 waiting / 间隔都不算卡顿
+const BUFFER_STALL_SEEK_GUARD_MS = 2000;
 const BUFFER_STALL_WINDOW_MS = 60000;
 const BUFFER_STALL_SUGGEST_COUNT = 3;
 const BUFFER_STALL_MAX_DOWNGRADE = 2;
+// 单档片源没法降档，卡到最低档还追不上码率时只能换源。换源会丢掉用户选的线路，
+// 所以门槛比提示高得多：一分钟内卡 6 次才动手，两次换源至少隔 3 分钟，一次播放最多换 2 次。
+const BUFFER_STALL_SWITCH_COUNT = 6;
+const BUFFER_STALL_SWITCH_COOLDOWN_MS = 180000;
+const BUFFER_STALL_SWITCH_MAX = 2;
 // 降档封顶保持多久：太短会来回抖，太长会让本来能播的清晰度一直上不去
 const BUFFER_CAP_RESET_MS = 120000;
 // 与 diagnostics.js 里的 DIAGNOSTICS_PLAYER_STATS_KEY 保持一致
@@ -35,9 +45,13 @@ const bufferState = {
     capResetTimer: null,
     lastTime: 0,
     lastTickAt: 0,
+    lastStallAt: 0,
+    seekAt: 0,
     stalls: [],
     downgrades: 0,
     suggested: false,
+    switches: 0,
+    lastSwitchAt: 0,
     statsTimer: null
 };
 
@@ -176,8 +190,45 @@ function resetAutoLevelCapping() {
     }
 }
 
+// 换源是最后手段：先把能降的档降完，确实卡在最低档还追不上码率才换。
+// 单档片源（采集站很常见）没有档可降，只能换，否则用户只能一直看着一秒一卡。
+function shouldSwitchForStall() {
+    if (typeof autoRelinkAndPlay !== 'function') return false;
+    const hls = art && art.hls;
+    if (!hls || !Array.isArray(hls.levels) || !hls.levels.length) return false;
+    const playing = currentPlayLevel(hls);
+    // 还能往下降档就先降档，换源会丢掉用户自己选的线路
+    if (hls.levels.length > 1 && playing > 0) return false;
+    const bitrate = currentLevelBitrate(hls);
+    const estimate = hls.bandwidthEstimate || 0;
+    if (!bitrate || !estimate) return false;
+    // 带宽只比码率低一点点时降档就够了，差得明显才说明这条线路根本喂不动
+    return estimate < bitrate * 1.05;
+}
+
+function switchSourceForStall() {
+    const now = Date.now();
+    if (bufferState.switches >= BUFFER_STALL_SWITCH_MAX) return false;
+    if (now - bufferState.lastSwitchAt < BUFFER_STALL_SWITCH_COOLDOWN_MS) return false;
+    if (!shouldSwitchForStall()) return false;
+    bufferState.lastSwitchAt = now;
+    bufferState.switches += 1;
+    // 换源后是新的片源，卡顿计数从头算，否则换过去立刻又触发一次
+    bufferState.stalls = [];
+    bufferState.suggested = false;
+    try {
+        autoRelinkAndPlay({ reason: 'stall' });
+    } catch (e) {
+        return false;
+    }
+    return true;
+}
+
 function recordStall() {
     const now = Date.now();
+    // waiting 和 timeupdate 间隔往往同一次卡顿各报一次，冷却期内只算一次
+    if (now - bufferState.lastStallAt < BUFFER_STALL_COOLDOWN_MS) return;
+    bufferState.lastStallAt = now;
     bufferState.stalls.push(now);
     bufferState.stalls = bufferState.stalls.filter(t => now - t <= BUFFER_STALL_WINDOW_MS);
     if (bufferState.stalls.length >= BUFFER_STALL_SUGGEST_COUNT && !bufferState.suggested) {
@@ -189,6 +240,8 @@ function recordStall() {
         }
         if (art && art.notice) art.notice.show = text;
     }
+    // 提示之后还在继续卡，说明降档也救不回来（或本来就没有档可降），换源
+    if (bufferState.stalls.length >= BUFFER_STALL_SWITCH_COUNT) switchSourceForStall();
     writePlayerStats();
 }
 
@@ -230,6 +283,7 @@ function writePlayerStats() {
         currentBitrate: currentLevelBitrate(hls),
         stalls: bufferState.stalls.length,
         downgrades: bufferState.downgrades,
+        switches: bufferState.switches,
         config: config ? {
             maxBufferLength: config.maxBufferLength,
             maxMaxBufferLength: config.maxMaxBufferLength,
@@ -256,7 +310,19 @@ function setupPlayerBuffer(instance) {
         bufferState.lastTime = video.currentTime || 0;
         // 后台标签页的 timeupdate 会被浏览器节流，那种间隔不算卡顿
         const visible = (document.visibilityState || 'visible') === 'visible';
-        if (gap > BUFFER_STALL_GAP_MS && !video.paused && visible) recordStall();
+        const settled = now - bufferState.seekAt > BUFFER_STALL_SEEK_GUARD_MS;
+        if (gap > BUFFER_STALL_GAP_MS && !video.paused && visible && settled) recordStall();
+    });
+
+    // 缓冲被抽干时 video 会发 waiting，这是比「间隔」更直接的信号，
+    // 「播一秒卡一下」那种短卡顿靠它才抓得到
+    instance.on('video:waiting', () => {
+        const video = instance.video;
+        if (!video || video.paused) return;
+        if (bufferState.holding) return;
+        if ((document.visibilityState || 'visible') !== 'visible') return;
+        if (Date.now() - bufferState.seekAt <= BUFFER_STALL_SEEK_GUARD_MS) return;
+        recordStall();
     });
 
     instance.on('video:play', () => {
@@ -277,6 +343,9 @@ function setupPlayerBuffer(instance) {
     instance.on('video:seeking', () => {
         const video = instance.video;
         if (!video) return;
+        // 拖动之后要重新拉分片，期间的 waiting 和空档都不该记成卡顿
+        bufferState.seekAt = Date.now();
+        bufferState.lastTickAt = bufferState.seekAt;
         // 起播前的那次「恢复到上次位置」也是大跳转，但那时还没开播，
         // 按暂停等缓冲反而会跟自动播放抢，直接跳过
         if (typeof playbackStarted !== 'undefined' && !playbackStarted) return;
@@ -302,6 +371,8 @@ function setupPlayerBuffer(instance) {
         bufferState.downgrades = 0;
         bufferState.suggested = false;
         bufferState.lastTickAt = 0;
+        bufferState.lastStallAt = 0;
+        bufferState.seekAt = 0;
         writePlayerStats();
     });
 

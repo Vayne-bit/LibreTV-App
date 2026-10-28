@@ -97,7 +97,10 @@ async function autoRelinkAndPlay(options) {
 
     const targetIndex = typeof currentEpisodeIndex === 'number' ? currentEpisodeIndex : 0;
     const position = typeof getPlaybackState === 'function' ? getPlaybackState().position : 0;
-    showRelinkHint(opts.precheck ? '片源已失效，正在自动寻找可用源…' : '当前线路失效，正在自动换源…');
+    let hint = '当前线路失效，正在自动换源…';
+    if (opts.precheck) hint = '片源已失效，正在自动寻找可用源…';
+    else if (opts.reason === 'stall') hint = '网络持续跟不上，正在自动换源…';
+    showRelinkHint(hint);
 
     try {
         if (typeof loadSwitchSources !== 'function') {

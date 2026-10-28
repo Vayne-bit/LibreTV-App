@@ -613,11 +613,36 @@ body.player-fullscreen {
     opacity: 1;
 }
 
+/* 返回箭头：顶部条整体 pointer-events: none，只有这个按钮能接事件，
+   否则点它会顺带把 ArtPlayer 的控制条一起显示/隐藏。 */
+.player-fs-topbar-back {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    margin-left: -8px;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    pointer-events: auto;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.player-fs-topbar-back:active {
+    background: rgba(255, 255, 255, 0.16);
+}
+
 .player-fs-topbar-main {
     display: flex;
     flex-direction: column;
     gap: 2px;
     min-width: 0;
+    flex: 1 1 auto;
 }
 
 .player-fs-topbar-title {

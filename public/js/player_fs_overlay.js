@@ -4,9 +4,15 @@
 
 const FS_OVERLAY_CLOCK_MS = 10000;
 
+// 返回箭头：全屏时顶部条是唯一稳定的返回入口（车机没有系统返回栏，网页全屏也没有）
+const FS_BACK_ICON = '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">'
+    + '<path d="M15.5 4.5 8 12l7.5 7.5" fill="none" stroke="currentColor" '
+    + 'stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
 const fsOverlayState = {
     bound: false,
     root: null,
+    backEl: null,
     titleEl: null,
     metaEl: null,
     batteryEl: null,
@@ -33,6 +39,26 @@ function fsClockText() {
     const hh = String(now.getHours()).padStart(2, '0');
     const mm = String(now.getMinutes()).padStart(2, '0');
     return `${hh}:${mm}`;
+}
+
+// 点返回箭头退出全屏。原生全屏和网页全屏都要处理，两者在车机上可能同时存在。
+function exitFullscreenFromOverlay(event) {
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+    if (typeof document !== 'undefined' && document.fullscreenElement && document.exitFullscreen) {
+        try {
+            document.exitFullscreen();
+            return;
+        } catch (e) { /* 落到下面按 ArtPlayer 的状态退 */ }
+    }
+    if (typeof art === 'undefined' || !art) return;
+    if (art.fullscreenWeb) {
+        art.fullscreenWeb = false;
+        return;
+    }
+    if (art.fullscreen) art.fullscreen = false;
 }
 
 function updateFsOverlay() {
@@ -83,6 +109,7 @@ function ensureFsOverlay() {
     const root = document.createElement('div');
     root.className = 'player-fs-topbar';
     root.innerHTML = `
+        <button type="button" class="player-fs-topbar-back" aria-label="退出全屏">${FS_BACK_ICON}</button>
         <div class="player-fs-topbar-main">
             <span class="player-fs-topbar-title"></span>
             <span class="player-fs-topbar-meta hidden"></span>
@@ -93,10 +120,16 @@ function ensureFsOverlay() {
         </div>`;
     host.appendChild(root);
     fsOverlayState.root = root;
+    fsOverlayState.backEl = root.querySelector('.player-fs-topbar-back');
     fsOverlayState.titleEl = root.querySelector('.player-fs-topbar-title');
     fsOverlayState.metaEl = root.querySelector('.player-fs-topbar-meta');
     fsOverlayState.batteryEl = root.querySelector('.player-fs-topbar-battery');
     fsOverlayState.clockEl = root.querySelector('.player-fs-topbar-clock');
+    if (fsOverlayState.backEl) {
+        fsOverlayState.backEl.addEventListener('click', exitFullscreenFromOverlay);
+        // 车机上 touchstart 比 click 可靠，preventDefault 之后浏览器不会再补发 click
+        fsOverlayState.backEl.addEventListener('touchstart', exitFullscreenFromOverlay, { passive: false });
+    }
     return root;
 }
 

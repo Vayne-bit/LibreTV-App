@@ -8,6 +8,17 @@ const GESTURE_TRIGGER_PX = 16;
 const GESTURE_AXIS_RATIO = 1.2;
 // 屏幕顶部这个范围内开始的触摸交给系统状态栏
 const GESTURE_TOP_IGNORE_PX = 48;
+// 这些是 ArtPlayer 自己的交互控件：设置面板、下拉选择项、右键菜单、控制条按钮、音量条、提示条。
+// 手势监听挂在 document 上（全屏会重建播放器节点，只能挂 document），如果不排除这些区域，
+// 在设置面板里上下滑着选倍速会被当成调音量——既误改了音量，下拉列表也滚不动。
+const GESTURE_IGNORE_SELECTOR = [
+    '.art-settings',
+    '.art-selector',
+    '.art-contextmenus',
+    '.art-controls',
+    '.art-volume',
+    '.art-notice'
+].join(',');
 
 const gestureState = {
     active: false,
@@ -158,8 +169,19 @@ function gestureSurface() {
     return document.getElementById('player');
 }
 
+// 触摸起点落在播放器自己的控件上时，手势完全让路
+function gestureTargetIgnored(target) {
+    if (!target || typeof target.closest !== 'function') return false;
+    try {
+        return !!target.closest(GESTURE_IGNORE_SELECTOR);
+    } catch (e) {
+        return false;
+    }
+}
+
 function onGestureStart(event) {
     if (!isGestureEnabled()) return;
+    if (gestureTargetIgnored(event.target)) return;
     if (event.touches && event.touches.length !== 1) return;
     const touch = event.touches ? event.touches[0] : event;
     // 从屏幕最顶部下拉是系统状态栏，不能当作亮度/音量手势

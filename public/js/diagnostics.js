@@ -26,6 +26,35 @@ function readPlayerStats() {
     }
 }
 
+// 播放列表里的广告标记统计，由 player_artplayer_handler.js 的 filterAdsFromM3U8 写入。
+// 各采集站的标记不统一，这份数据用来判断该按哪种规则去广告。
+const DIAGNOSTICS_MARKER_STATS_KEY = 'playlistMarkerStats';
+
+function readMarkerStats() {
+    try {
+        const stats = JSON.parse(localStorage.getItem(DIAGNOSTICS_MARKER_STATS_KEY) || 'null');
+        return stats && typeof stats === 'object' ? stats : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+function playlistMarkerRows(stats) {
+    if (!stats) return ['  还没有解析过播放列表'];
+    const rows = [];
+    const add = (label, value) => rows.push(`  ${label}：${value}`);
+    add('分片数', `${stats.segments || 0} 个`);
+    add('DISCONTINUITY', `${stats.discontinuity || 0} 个`);
+    add('CUE-OUT / CUE-IN', `${stats.cueOut || 0} / ${stats.cueIn || 0}`);
+    add('DATERANGE', `${stats.daterange || 0} 个`);
+    add('SCTE35', `${stats.scte35 || 0} 个`);
+    add('已剔除广告分片', stats.aborted
+        ? '标记覆盖范围过大，已放弃过滤（怀疑标记位置不对）'
+        : `${stats.removed || 0} 个`);
+    add('解析时间', formatClockTime(stats.at));
+    return rows;
+}
+
 function formatBitrateKbps(bits) {
     const value = Number(bits) || 0;
     if (!value) return '未知';
@@ -52,7 +81,7 @@ function playerStatsRows(stats) {
         : `共 ${stats.levels || 1} 档`);
     add('当前码率', formatBitrateKbps(stats.currentBitrate));
     add('带宽估计', formatBitrateKbps(stats.bandwidthEstimate));
-    add('近 1 分钟卡顿', `${stats.stalls || 0} 次，自动降档 ${stats.downgrades || 0} 次`);
+    add('近 1 分钟卡顿', `${stats.stalls || 0} 次，自动降档 ${stats.downgrades || 0} 次，自动换源 ${stats.switches || 0} 次`);
     if (stats.config) {
         const c = stats.config;
         add('缓冲参数', `maxBufferLength ${c.maxBufferLength}，maxMaxBufferLength ${c.maxMaxBufferLength}，maxBufferHole ${c.maxBufferHole}，maxBufferSize ${Math.round((c.maxBufferSize || 0) / 1000000)}MB`);
@@ -113,6 +142,9 @@ async function collectDiagnostics() {
     rows.push('');
     rows.push('【上次播放】');
     rows.push(...playerStatsRows(readPlayerStats()));
+    rows.push('');
+    rows.push('【播放列表】');
+    rows.push(...playlistMarkerRows(readMarkerStats()));
     const cacheRows = await segmentCacheRows();
     if (cacheRows.length) {
         rows.push('');

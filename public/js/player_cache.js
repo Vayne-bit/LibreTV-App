@@ -105,11 +105,15 @@ function openSegmentCacheDb() {
     return segmentCacheDbPromise;
 }
 
-// 只缓存媒体分片：manifest/level 是播放列表（体积小，hls.js 自己有内存缓存），
-// 密钥请求没有 type 字段，缓存下来既没意义也有风险
+// 只缓存媒体分片。
+// 不能用 context.type 判断：hls.js 的 LoaderContext 工厂（Zt）只给播放列表请求赋 type
+// （manifest/level/audioTrack/subtitleTrack），分片请求的 context 上没有 type 字段，
+// 早先按 type === 'main' 判断会让所有分片都被判成「不缓存」，缓存一次都没生效过。
+// 可靠的特征是 context.frag：分片和 initSegment 都带，播放列表不带；
+// 密钥请求虽然也带 frag，但额外带 keyInfo，要排除掉。
 function isSegmentCacheCandidate(context) {
     if (!segmentCacheEnabled || !context) return false;
-    if (context.type !== 'main' && context.type !== 'audio' && context.type !== 'subtitle') return false;
+    if (!context.frag || context.keyInfo) return false;
     if (context.responseType && context.responseType !== 'arraybuffer') return false;
     const url = String(context.url || '');
     if (!url || url.indexOf('blob:') === 0 || url.indexOf('data:') === 0) return false;
