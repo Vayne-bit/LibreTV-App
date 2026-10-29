@@ -1068,8 +1068,50 @@ button {
 .download-danger { color: #f87171; }
 .download-danger[disabled] { color: var(--text-faint); opacity: .5; }
 
-.download-row { align-items: center; }
+.download-row { align-items: center; cursor: pointer; }
 .download-row.selected { background: var(--accent-soft); }
+
+.download-progress {
+    height: 4px;
+    margin: 6px 0 4px;
+    border-radius: 2px;
+    overflow: hidden;
+    background: rgba(255, 255, 255, 0.12);
+}
+
+.download-progress i {
+    display: block;
+    height: 100%;
+    border-radius: 2px;
+    background: var(--accent);
+    transition: width .2s linear;
+}
+
+.download-progress-text { font-variant-numeric: tabular-nums; }
+
+.download-error { color: #f87171; }
+
+.download-delete {
+    position: absolute;
+    right: 4px;
+    top: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    font-size: 13px;
+    line-height: 1;
+    color: var(--text-faint);
+    transition: background-color .15s, color .15s;
+}
+
+.download-delete:hover,
+.download-delete:active {
+    background: rgba(255, 255, 255, 0.1);
+    color: #f87171;
+}
 
 .download-check {
     flex: 0 0 22px;
@@ -1202,6 +1244,40 @@ button {
 }
 
 .settings-buttons button { width: 100%; }
+
+/* 设置页「存储」卡片：一行一项，数值右对齐，补充说明换行显示在下面 */
+.storage-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.storage-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: baseline;
+    gap: 4px 12px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: var(--surface-0);
+}
+
+.storage-label { font-size: 13px; color: var(--text); }
+
+.storage-value {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--accent);
+    font-variant-numeric: tabular-nums;
+}
+
+.storage-hint {
+    grid-column: 1 / -1;
+    font-size: 12px;
+    color: var(--text-faint);
+    line-height: 1.5;
+}
 
 .footer p { font-size: 12px; color: var(--text-faint); line-height: 1.7; }
 

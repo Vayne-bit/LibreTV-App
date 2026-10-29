@@ -218,7 +218,7 @@
                         <div class="setting-row">
                             <div class="setting-text">
                                 <label for="segmentCacheToggle">分片缓存</label>
-                                <p>已下载的片段存到本地，回看和重看时不用重新拉，最多占 400MB</p>
+                                <p>看过的片段存到本地，往回拖和重看时不用重新拉，最多占 2GB</p>
                             </div>
                             <div class="toggle">
                                 <input type="checkbox" id="segmentCacheToggle">
@@ -289,6 +289,17 @@
                         </div>
 
                         <p id="syncStatusText" class="settings-tip sync-status-line">未开启同步</p>
+                    </div>
+
+                    <div class="settings-card">
+                        <div class="settings-card-title">存储</div>
+                        <div id="storageRows" class="storage-rows">
+                            <div class="storage-row"><span>正在统计…</span></div>
+                        </div>
+                        <div class="settings-buttons">
+                            <button type="button" onclick="clearSegmentCacheFromSettings()" class="btn-secondary">清理分片缓存</button>
+                            <button type="button" onclick="clearDownloadsFromSettings()" class="btn-secondary">清空离线下载</button>
+                        </div>
                     </div>
 
                     <div class="settings-card">

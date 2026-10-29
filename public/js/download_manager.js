@@ -28,6 +28,23 @@ function downloadTimeText(timestamp) {
     return `${date.getMonth() + 1}月${date.getDate()}日 ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+function downloadSpeedText(record) {
+    const speed = Number(record && record.speed) || 0;
+    if (speed <= 0) return '';
+    return `${downloadSizeText(speed)}/s`;
+}
+
+function downloadEtaText(seconds) {
+    const value = Number(seconds) || 0;
+    if (value <= 0) return '';
+    if (value < 60) return '还剩不到 1 分钟';
+    const minutes = Math.round(value / 60);
+    if (minutes < 60) return `还剩 ${minutes} 分钟`;
+    const hours = Math.floor(minutes / 60);
+    const rest = minutes % 60;
+    return rest ? `还剩 ${hours} 小时 ${rest} 分` : `还剩 ${hours} 小时`;
+}
+
 function downloadEpisodeLabel(record) {
     const names = Array.isArray(record.episodeNames) ? record.episodeNames : [];
     const index = Number(record.index) || 0;
@@ -50,24 +67,44 @@ function downloadRowHtml(record) {
     const key = String(record.key || '');
     const selected = downloadPageState.selected.has(key);
     const done = record.status === 'done';
+    const running = record.status === 'downloading';
+    const total = Number(record.total) || 0;
+    const finished = Number(record.done) || 0;
+    const percent = total > 0 ? Math.min(100, Math.round((finished / total) * 100)) : 0;
     const line = done
         ? [downloadEpisodeLabel(record), downloadSizeText(record.bytes)].filter(Boolean).join(' · ')
         : [downloadEpisodeLabel(record), downloadStatusText(record), downloadSizeText(record.bytes)].filter(Boolean).join(' · ');
-    const sub = done
-        ? [record.sourceName, downloadTimeText(record.updatedAt)].filter(Boolean).join(' · ')
-        : (record.error || record.sourceName || '');
+    const sub = [record.sourceName, downloadTimeText(record.updatedAt)].filter(Boolean).join(' · ');
+    // 进度条只在真正在下的行显示；排队中和失败的行没进度可看
+    const progressText = running
+        ? [`${finished}/${total || '?'} 个分片 · ${percent}%`, downloadSpeedText(record), downloadEtaText(downloadEtaSeconds(record))].filter(Boolean).join(' · ')
+        : `${finished}/${total || '?'} 个分片 · ${percent}%`;
+    const progress = running || (record.status === 'queued' && total > 0)
+        ? `<div class="download-progress"><i style="width:${percent}%"></i></div>
+           <div class="history-line faint download-progress-text">${escapeHtml(progressText)}</div>`
+        : '';
+    const error = !done && record.error
+        ? `<div class="history-line download-error">${escapeHtml(record.error)}</div>`
+        : '';
     const check = downloadPageState.managing
         ? `<span class="download-check${selected ? ' checked' : ''}" aria-hidden="true">${selected ? DOWNLOAD_CHECK_ICON : ''}</span>`
         : '';
-    return `<button type="button" class="history-card download-row${selected ? ' selected' : ''}" data-download-key="${escapeHtml(key)}">
+    const remove = downloadPageState.managing
+        ? ''
+        : `<button type="button" class="download-delete" data-download-remove="${escapeHtml(key)}" aria-label="删除这一集" title="删除">✕</button>`;
+    // 行本身改成 div：里面还要放删除按钮，button 套 button 是非法结构
+    return `<div class="history-card download-row${selected ? ' selected' : ''}" data-download-key="${escapeHtml(key)}" role="button" tabindex="0">
         <div class="history-cover">${posterImgHtml(record.cover || '', record.title || '')}</div>
         <div class="history-body">
             <div class="history-name">${escapeHtml(record.title || '未知视频')}</div>
             <div class="history-line">${escapeHtml(line)}</div>
+            ${progress}
+            ${error}
             <div class="history-line faint">${escapeHtml(sub)}</div>
         </div>
+        ${remove}
         ${check}
-    </button>`;
+    </div>`;
 }
 
 function downloadEmptyHtml(text, hint) {
@@ -79,6 +116,15 @@ function downloadManageBarHtml(count) {
     return `<div class="download-manage-bar">
         <span>已选 ${count} 项</span>
         <button type="button" class="text-btn download-danger" data-download-delete${count ? '' : ' disabled'}>删除</button>
+    </div>`;
+}
+
+// 「下载中」分栏没有多选，只给一个清空入口
+function downloadClearBarHtml(count) {
+    if (!count) return '';
+    return `<div class="download-manage-bar">
+        <span>共 ${count} 项未完成</span>
+        <button type="button" class="text-btn download-danger" data-download-clear>全部清空</button>
     </div>`;
 }
 
@@ -98,8 +144,11 @@ function renderDownloadPage() {
     const done = downloadPageState.rows.filter(record => record.status === 'done');
     const unfinished = downloadPageState.rows.filter(record => record.status !== 'done');
     const liveKeys = new Set(downloadPageState.live.map(task => task.key));
-    const activeRows = downloadPageState.live.slice()
-        .concat(unfinished.filter(record => !liveKeys.has(record.key)));
+    // 内存里的任务只带进度，封面/集名/来源要从库里的记录补齐，否则下载中的行会缺图
+    const activeRows = downloadPageState.live.map(task => {
+        const stored = downloadPageState.rows.find(record => record.key === task.key);
+        return stored ? Object.assign({}, stored, task) : task;
+    }).concat(unfinished.filter(record => !liveKeys.has(record.key)));
 
     const count = downloadPageState.selected.size;
     const tabs = `<div class="chip-row download-tabs">
@@ -121,12 +170,15 @@ function renderDownloadPage() {
     if (!rows.length) {
         const empty = downloadPageState.tab === 'done'
             ? downloadEmptyHtml('还没有下载任何集数', '在剧集列表里点每集右侧的下载图标，或播放器里的下载按钮')
-            : downloadEmptyHtml('没有正在进行的下载', '下载会在你停留在播放页时进行，切走页面会中断');
+            : downloadEmptyHtml('没有正在进行的下载', '在剧集列表或播放器里点下载，回到这个页面会自动接着下');
         container.innerHTML = `${tabs}${downloadPageState.tab === 'done' ? downloadManageBarHtml(count) : ''}${empty}`;
         return;
     }
 
-    container.innerHTML = `${tabs}${downloadPageState.tab === 'done' ? downloadManageBarHtml(count) : ''}
+    const bar = downloadPageState.tab === 'done'
+        ? downloadManageBarHtml(count)
+        : downloadClearBarHtml(activeRows.length);
+    container.innerHTML = `${tabs}${bar}
         <div class="history-grid">${rows.map(downloadRowHtml).join('')}</div>`;
 }
 
@@ -137,7 +189,7 @@ function refreshDownloadPage() {
         renderDownloadPage();
         return Promise.resolve();
     }
-    return markStaleDownloads()
+    return resumePendingDownloads()
         .then(() => listDownloadedEpisodes())
         .then(rows => {
             downloadPageState.rows = Array.isArray(rows) ? rows : [];
@@ -213,6 +265,25 @@ function setupDownloadPage() {
             deleteSelectedDownloads();
             return;
         }
+        const removeBtn = e.target.closest('[data-download-remove]');
+        if (removeBtn) {
+            // 单条删除：正在下的会先停掉再删，不然它跑完会把记录写回来
+            e.preventDefault();
+            e.stopPropagation();
+            const key = removeBtn.dataset.downloadRemove;
+            downloadDeleteOne(key).then(removed => {
+                showToast(removed ? '已删除' : '删除失败', removed ? 'success' : 'error');
+                return refreshDownloadPage();
+            });
+            return;
+        }
+        if (e.target.closest('[data-download-clear]')) {
+            downloadCancelAll().then(removed => {
+                showToast(removed ? `已清空 ${removed} 项` : '没有可清空的项', removed ? 'success' : 'info');
+                return refreshDownloadPage();
+            });
+            return;
+        }
         const row = e.target.closest('[data-download-key]');
         if (!row) return;
         const key = row.dataset.downloadKey;
@@ -224,10 +295,19 @@ function setupDownloadPage() {
         }
         const record = downloadPageState.rows.find(item => item.key === key);
         if (record && record.status !== 'done') {
-            showToast('这一集还没下完，可以删除后重新下载', 'error');
+            showToast('这一集还没下完，可以先删除再重新下载', 'error');
             return;
         }
         playDownloadedEpisode(key);
+    });
+
+    // 行改成 div 之后要自己处理回车键
+    container.addEventListener('keydown', e => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        const row = e.target.closest('[data-download-key]');
+        if (!row) return;
+        e.preventDefault();
+        row.click();
     });
 
     onDownloadChange(snapshot => {

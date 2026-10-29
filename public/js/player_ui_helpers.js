@@ -74,6 +74,9 @@ function renderEpisodes() {
     const episodesList = document.getElementById('episodesList');
     if (!episodesList) return;
     renderEpisodeGroups();
+    // 单集片源没有「整季」可言，按钮藏掉
+    const seasonBtn = document.getElementById('downloadSeasonBtn');
+    if (seasonBtn) seasonBtn.classList.toggle('hidden', !(currentEpisodes && currentEpisodes.length > 1));
 
     if (!currentEpisodes || currentEpisodes.length === 0) {
         episodesList.innerHTML = '<div class="empty-tip">没有可用的集数</div>';
@@ -271,6 +274,21 @@ function setupPlayerPageEvents() {
     bind('prevButton', playPreviousEpisode);
     bind('nextButton', playNextEpisode);
     bind('orderBtn', toggleEpisodeOrder);
+    bind('downloadSeasonBtn', () => {
+        if (typeof downloadAllEpisodes !== 'function') return;
+        const result = downloadAllEpisodes();
+        if (!result || !result.ok) {
+            if (art && art.notice) art.notice.show = (result && result.reason) || '加入下载失败';
+            return;
+        }
+        // 一集动辄几百 MB，先把话说在前面，别让用户以为点一下就好
+        const message = result.count
+            ? `已加入 ${result.count} 集，去「我的 → 下载」看进度`
+            : '整季都已在下载或已下载';
+        if (art && art.notice) art.notice.show = message;
+        if (typeof showToast === 'function') showToast(message, result.count ? 'success' : 'info');
+        updateEpisodeDownloadBadges();
+    });
     bind('copyLinkBtn', copyLinks);
     bind('favoriteBtn', togglePlayerFavorite);
     // 换源改为就地弹窗，不再退回搜索页

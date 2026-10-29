@@ -159,6 +159,105 @@ async function downloadRows() {
     return rows;
 }
 
+// 设置页「存储」卡片。分片缓存和离线下载是两套独立的 IndexedDB，
+// 「清除本地数据」会把它们连同配置一起清掉，所以这里单独给两个清理入口。
+function formatStorageSize(bytes) {
+    const value = Number(bytes) || 0;
+    if (value <= 0) return '0 MB';
+    if (value < 1000 * 1000) return `${Math.max(1, Math.round(value / 1000))} KB`;
+    if (value < 1000 * 1000 * 1000) return `${(value / 1000 / 1000).toFixed(1)} MB`;
+    return `${(value / 1000 / 1000 / 1000).toFixed(2)} GB`;
+}
+
+function storageRowHtml(label, value, hint) {
+    return `<div class="storage-row">
+        <span class="storage-label">${escapeHtml(label)}</span>
+        <span class="storage-value">${escapeHtml(value)}</span>
+        ${hint ? `<span class="storage-hint">${escapeHtml(hint)}</span>` : ''}
+    </div>`;
+}
+
+async function renderStorageCard() {
+    const container = document.getElementById('storageRows');
+    if (!container) return;
+    const rows = [];
+
+    if (typeof segmentCacheSummary === 'function') {
+        const cache = await Promise.resolve().then(() => segmentCacheSummary()).catch(() => null);
+        if (cache) {
+            if (!cache.supported) rows.push(storageRowHtml('分片缓存', '不可用', '当前环境不支持 IndexedDB'));
+            else if (!cache.enabled) rows.push(storageRowHtml('分片缓存', '已关闭', '在「功能开关」里打开后才会写入'));
+            else rows.push(storageRowHtml('分片缓存', formatStorageSize(cache.bytes), `${cache.entries} 个分片 / 上限 ${formatStorageSize(cache.limitBytes)}`));
+        }
+    }
+
+    if (typeof downloadSummary === 'function') {
+        const summary = await Promise.resolve().then(() => downloadSummary()).catch(() => null);
+        if (summary) {
+            if (!summary.supported) {
+                rows.push(storageRowHtml('离线下载', '不可用', '当前环境不支持 IndexedDB'));
+            } else {
+                const extra = summary.active || summary.queued
+                    ? `，进行中 ${summary.active} 集，排队 ${summary.queued} 集`
+                    : '';
+                rows.push(storageRowHtml('离线下载', formatStorageSize(summary.bytes), `${summary.count} 集 / 上限 ${formatStorageSize(summary.limit)}${extra}`));
+            }
+        }
+    }
+
+    if (navigator.storage && typeof navigator.storage.estimate === 'function') {
+        const quota = await navigator.storage.estimate().catch(() => null);
+        if (quota && quota.quota) {
+            const free = Math.max(0, quota.quota - (quota.usage || 0));
+            rows.push(storageRowHtml('剩余空间', formatStorageSize(free), `总配额 ${formatStorageSize(quota.quota)}`));
+        }
+    }
+
+    container.innerHTML = rows.length ? rows.join('') : '<div class="storage-row"><span class="storage-label">暂时读不到存储占用</span></div>';
+}
+
+// 清空下载不可恢复，用「再点一次」二次确认，避免误触（车机上是手指点，很容易碰错）
+let storageConfirmTarget = '';
+let storageConfirmTimer = null;
+
+function storageConfirmOnce(action, label) {
+    if (storageConfirmTarget === action) {
+        storageConfirmTarget = '';
+        if (storageConfirmTimer) clearTimeout(storageConfirmTimer);
+        storageConfirmTimer = null;
+        return true;
+    }
+    storageConfirmTarget = action;
+    if (storageConfirmTimer) clearTimeout(storageConfirmTimer);
+    storageConfirmTimer = setTimeout(() => { storageConfirmTarget = ''; storageConfirmTimer = null; }, 4000);
+    showToast(`再点一次确认${label}`, 'warning');
+    return false;
+}
+
+function clearSegmentCacheFromSettings() {
+    if (typeof segmentCacheClear !== 'function') {
+        showToast('分片缓存模块没加载', 'error');
+        return;
+    }
+    if (!storageConfirmOnce('cache', '清理分片缓存')) return;
+    segmentCacheClear().then(() => {
+        showToast('分片缓存已清理', 'success');
+        return renderStorageCard();
+    }).catch(() => showToast('清理失败', 'error'));
+}
+
+function clearDownloadsFromSettings() {
+    if (typeof downloadClear !== 'function') {
+        showToast('下载模块没加载', 'error');
+        return;
+    }
+    if (!storageConfirmOnce('downloads', '清空离线下载')) return;
+    downloadClear().then(() => {
+        showToast('离线下载已清空', 'success');
+        return renderStorageCard();
+    }).catch(() => showToast('清空失败', 'error'));
+}
+
 async function collectDiagnostics() {
     const vv = window.visualViewport;
     const rows = [];
@@ -259,15 +358,20 @@ function setupDiagnostics() {
     const page = document.getElementById('page-settings');
     const visible = () => !!page && !page.classList.contains('hidden');
 
+    const refreshAll = () => {
+        refreshDiagnostics();
+        renderStorageCard();
+    };
+
     // 设置页由 app_shell 统一切换 hidden，用 MutationObserver 盯住它，比监听 hashchange 稳：
     // 从搜索页进设置走的是 location.replace，不一定触发 hashchange
     if (page && typeof MutationObserver === 'function') {
-        new MutationObserver(() => { if (visible()) refreshDiagnostics(); })
+        new MutationObserver(() => { if (visible()) refreshAll(); })
             .observe(page, { attributes: true, attributeFilter: ['class'] });
     }
 
     // 旋转、键盘弹出会改变可见区，设置页开着时跟着刷新，避免显示过期数据
-    const refreshIfVisible = () => { if (visible()) refreshDiagnostics(); };
+    const refreshIfVisible = () => { if (visible()) refreshAll(); };
     window.addEventListener('resize', refreshIfVisible);
     window.addEventListener('orientationchange', refreshIfVisible);
     if (window.visualViewport) window.visualViewport.addEventListener('resize', refreshIfVisible);

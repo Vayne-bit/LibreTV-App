@@ -11,6 +11,9 @@ const DOWNLOAD_EPISODE_CONCURRENCY = 2;
 const DOWNLOAD_SEGMENT_CONCURRENCY = 4;
 const DOWNLOAD_SEGMENT_MAX_BYTES = 64 * 1000 * 1000;
 const DOWNLOAD_NOTIFY_MS = 150;
+// 下载任务只活在当前页面的内存里，翻页就会断。回到有下载管理界面的页面时自动接着下，
+// 但连续几次都一个分片没拿到就放弃，避免对着坏源无限重试
+const DOWNLOAD_MAX_RESUME = 3;
 
 let downloadDb = null;
 let downloadDbPromise = null;
@@ -199,6 +202,11 @@ function deleteEpisodeDownload(key) {
 function deleteDownloadedEpisodes(keys) {
     const list = Array.isArray(keys) ? keys.slice() : [];
     if (!list.length) return Promise.resolve(0);
+    // 正在下的要先停掉，否则它跑完会把记录又写回去
+    list.forEach(key => {
+        const task = downloadTasks.get(key);
+        if (task && (task.status === 'downloading' || task.status === 'queued')) cancelEpisodeDownload(key);
+    });
     return list.reduce((chain, key) => chain.then(removed => {
         downloadTasks.delete(key);
         return deleteEpisodeDownload(key).then(ok => removed + (ok ? 1 : 0));
@@ -210,20 +218,60 @@ function deleteDownloadedEpisodes(keys) {
     }).catch(() => 0);
 }
 
-// 下载只在进行中的页面里跑，切走页面任务就没了。
-// 库里残留的 downloading / queued 记录已经不可能继续，标成中断，避免管理页一直显示「下载中」
-function markStaleDownloads() {
+// 下载任务只活在当前页面的内存里，翻页就没了。库里残留的 downloading / queued 记录
+// 不是「中断了」，而是「这一页没在跑」——回到有下载管理界面的页面时自动接着下。
+// 已经下过的分片会被跳过，所以续传不会重复下载。
+function resumePendingDownloads() {
+    if (!isDownloadSupported()) return Promise.resolve(0);
     return listDownloadedEpisodes().then(rows => {
-        const stale = rows.filter(record =>
+        const pending = rows.filter(record =>
             (record.status === 'downloading' || record.status === 'queued') && !downloadTasks.has(record.key));
-        if (!stale.length) return 0;
-        return stale.reduce((chain, record) => chain.then(() => {
-            record.status = 'failed';
-            record.error = '下载已中断';
-            record.updatedAt = Date.now();
-            return downloadEpisodePut(record);
-        }), Promise.resolve()).then(() => stale.length);
+        if (!pending.length) return 0;
+        let resumed = 0;
+        pending.forEach(record => {
+            // 上次已经下到一些分片说明源是好的，重新计数；一个都没拿到才累加失败次数
+            const progressed = (Number(record.done) || 0) > 0;
+            const attempts = (progressed ? 0 : (Number(record.attempts) || 0)) + 1;
+            if (attempts > DOWNLOAD_MAX_RESUME) {
+                record.status = 'failed';
+                record.error = record.error || '多次中断，已停止下载';
+                record.updatedAt = Date.now();
+                downloadEpisodePut(record).then(() => notifyDownloadListeners()).catch(() => {});
+                return;
+            }
+            const task = downloadTaskFromRecord(record);
+            task.attempts = attempts;
+            downloadTasks.set(task.key, task);
+            downloadQueue.push(task);
+            resumed += 1;
+        });
+        if (resumed) {
+            notifyDownloadListeners();
+            pumpDownloadQueue();
+        }
+        return resumed;
     }).catch(() => 0);
+}
+
+// 把库里的记录还原成可执行的任务（续传时用）
+function downloadTaskFromRecord(record) {
+    return {
+        key: record.key,
+        title: record.title,
+        index: Number(record.index) || 0,
+        label: record.label || '',
+        url: record.url,
+        episodes: Array.isArray(record.episodes) && record.episodes.length ? record.episodes.slice() : [record.url],
+        episodeNames: Array.isArray(record.episodeNames) ? record.episodeNames.slice() : [],
+        cover: record.cover || '',
+        sourceName: record.sourceName || '',
+        sourceCode: record.sourceCode || '',
+        info: record.info || null,
+        status: 'queued', done: 0, total: Number(record.total) || 0, bytes: 0,
+        error: '', cancelled: false, controller: null,
+        attempts: Number(record.attempts) || 0,
+        createdAt: Number(record.createdAt) || Date.now()
+    };
 }
 
 function notifyDownloadListeners() {
@@ -405,11 +453,39 @@ function applyDownloadPlaylistFilter(text, url) {
     }
 }
 
+// 分片大小从几 KB 到 1 MB 不等，瞬时速度会乱跳，用 1 秒窗口 + EMA 平滑一下
+function downloadNoteSegmentBytes(task, bytes) {
+    if (!task) return;
+    task.speedBytes = (task.speedBytes || 0) + (Number(bytes) || 0);
+    const now = Date.now();
+    const span = now - (task.speedAt || now);
+    if (span < 1000) return;
+    const instant = (task.speedBytes * 1000) / span;
+    task.speed = task.speed ? task.speed * 0.6 + instant * 0.4 : instant;
+    task.speedBytes = 0;
+    task.speedAt = now;
+}
+
+// 剩余字节 = 剩余分片数 × 已下分片的平均体积，再除以当前速度
+function downloadEtaSeconds(task) {
+    if (!task) return 0;
+    const total = Number(task.total) || 0;
+    const done = Number(task.done) || 0;
+    const speed = Number(task.speed) || 0;
+    if (!total || !speed || done <= 0 || done >= total) return 0;
+    const average = (Number(task.bytes) || 0) / done;
+    if (!average) return 0;
+    return Math.max(1, Math.round(((total - done) * average) / speed));
+}
+
 async function runDownloadTask(task) {
     const controller = typeof AbortController === 'function' ? new AbortController() : null;
     task.controller = controller;
     task.status = 'downloading';
     task.error = '';
+    task.speed = 0;
+    task.speedBytes = 0;
+    task.speedAt = Date.now();
     notifyDownloadListeners();
     try {
         const media = await resolveMediaPlaylist(task.url);
@@ -430,7 +506,8 @@ async function runDownloadTask(task) {
             info: task.info || null,
             segmentKeys: parsed.segments.map(segment => segment.key),
             total: parsed.segments.length, done: 0, bytes: 0,
-            createdAt: Date.now(), updatedAt: Date.now()
+            createdAt: task.createdAt || Date.now(), updatedAt: Date.now(),
+            attempts: task.attempts || 0, error: ''
         };
         task.total = parsed.segments.length;
         await downloadEpisodePut(record);
@@ -465,6 +542,8 @@ async function runDownloadTask(task) {
                     await downloadSegmentPut(segment.key, buffer, segment.url);
                     task.done += 1;
                     task.bytes += buffer.byteLength;
+                    // 只有真的走了网络的分片才计入速度，续传命中的分片是读磁盘
+                    downloadNoteSegmentBytes(task, buffer.byteLength);
                     notifyDownloadListeners();
                     return;
                 } catch (error) {
@@ -484,13 +563,17 @@ async function runDownloadTask(task) {
         task.status = 'done';
         await enforceDownloadLimit();
     } catch (error) {
-        task.error = (error && error.message) || '下载失败';
+        // 用户主动取消时不要把底层报错（HTTP 404 / AbortError）当原因显示
+        task.error = task.cancelled ? '已取消' : ((error && error.message) || '下载失败');
         task.status = task.cancelled ? 'cancelled' : 'failed';
         await downloadEpisodeGet(task.key).then(record => {
             if (!record) return null;
             record.status = task.status;
             record.done = task.done;
             record.bytes = task.bytes;
+            // 之前这里没写 error，管理页只能显示「已中断」，看不出到底为什么失败
+            record.error = task.error;
+            record.attempts = task.attempts || 0;
             record.updatedAt = Date.now();
             return downloadEpisodePut(record);
         });
@@ -564,8 +647,18 @@ function cancelEpisodeDownload(key) {
     }
     if (task.status === 'queued') {
         task.status = 'cancelled';
+        task.error = '已取消';
         const position = downloadQueue.indexOf(task);
         if (position >= 0) downloadQueue.splice(position, 1);
+        // 排队中被取消的任务不会走到 runDownloadTask，必须自己把状态落盘，
+        // 否则下次进页面还会被当成「未完成」自动续传
+        downloadEpisodeGet(key).then(record => {
+            if (!record) return null;
+            record.status = 'cancelled';
+            record.error = '已取消';
+            record.updatedAt = Date.now();
+            return downloadEpisodePut(record);
+        }).catch(() => {});
     }
     notifyDownloadListeners();
     return true;
@@ -623,6 +716,33 @@ function downloadCurrentEpisode() {
     return downloadEpisodeByIndex(currentEpisodeIndex);
 }
 
+// 一次把整季加进队列。队列本身只并发 2 集，不会一次全开。
+function downloadAllEpisodes() {
+    if (!currentEpisodes || !currentEpisodes.length) return { ok: false, reason: '没有可下载的剧集' };
+    if (typeof isDownloadSupported === 'function' && !isDownloadSupported()) {
+        return { ok: false, reason: '当前环境不支持离线下载' };
+    }
+    let queued = 0;
+    let skipped = 0;
+    for (let index = 0; index < currentEpisodes.length; index++) {
+        if (!currentEpisodes[index]) continue;
+        const key = downloadEpisodeKey(currentVideoTitle, index);
+        const running = downloadTasks.get(key);
+        if (running && (running.status === 'downloading' || running.status === 'queued')) {
+            skipped += 1;
+            continue;
+        }
+        if (isEpisodeDownloaded(currentVideoTitle, index)) {
+            skipped += 1;
+            continue;
+        }
+        const result = downloadEpisodeByIndex(index);
+        if (result && result.ok) queued += 1;
+        else skipped += 1;
+    }
+    return { ok: true, count: queued, skipped };
+}
+
 // 剧集列表上那个小图标的三态切换：没下过 → 加入队列，下载中 → 取消，已下好 → 删除
 function toggleEpisodeDownload(index) {
     if (!currentEpisodes || !currentEpisodes[index]) return { ok: false, reason: '这一集没有可下载的地址' };
@@ -657,11 +777,50 @@ async function downloadSummary() {
     };
 }
 
-async function downloadClear() {
-    const rows = await listDownloadedEpisodes();
-    downloadTasks.clear();
+// 停掉所有正在跑和排队的任务（不动库里的记录）
+function stopAllDownloadTasks() {
     downloadQueue.length = 0;
+    Array.from(downloadTasks.values()).forEach(task => {
+        task.cancelled = true;
+        if (task.controller) {
+            try { task.controller.abort(); } catch (e) { /* 已中断 */ }
+        }
+    });
+    downloadTasks.clear();
+}
+
+// 清空「下载中」列表：停掉任务 + 删掉所有没下完的记录，已下好的不动
+async function downloadCancelAll() {
+    stopAllDownloadTasks();
+    const rows = await listDownloadedEpisodes();
+    const unfinished = rows.filter(record => record.status !== 'done');
+    await unfinished.reduce((chain, record) => chain.then(() => deleteEpisodeDownload(record.key)), Promise.resolve());
+    await refreshDownloadedKeys();
+    notifyDownloadListeners();
+    return unfinished.length;
+}
+
+// 删掉某一集（已下载或没下完都行），没下完的会先停掉
+function downloadDeleteOne(key) {
+    return deleteDownloadedEpisodes([key]);
+}
+
+async function downloadClear() {
+    stopAllDownloadTasks();
+    const rows = await listDownloadedEpisodes();
     await rows.reduce((chain, record) => chain.then(() => deleteEpisodeDownload(record.key)), Promise.resolve());
     await refreshDownloadedKeys();
     notifyDownloadListeners();
+}
+
+// 下载只在页面停留期间跑，翻页就断。任何页面加载时都自动接着下，
+// 已经下过的分片会跳过，不会重复下载。
+if (typeof document !== 'undefined' && document && typeof document.addEventListener === 'function') {
+    document.addEventListener('DOMContentLoaded', () => {
+        if (!isDownloadSupported()) return;
+        refreshDownloadedKeys()
+            .then(() => notifyDownloadListeners())
+            .then(() => resumePendingDownloads())
+            .catch(() => {});
+    });
 }
