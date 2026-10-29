@@ -65,7 +65,7 @@ function renderRoute() {
             showListPage(route.sub);
             break;
         case 'history':
-            showMineTab(route.sub === 'fav' ? 'fav' : 'history');
+            showMineTab(route.sub === 'fav' ? 'fav' : route.sub === 'dl' ? 'dl' : 'history');
             break;
     }
     restoreScrollPosition(route.key);

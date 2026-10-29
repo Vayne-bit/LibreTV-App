@@ -52,6 +52,14 @@ const bufferState = {
     suggested: false,
     switches: 0,
     lastSwitchAt: 0,
+    // 卡顿到底发生在哪一刻：诊断里只报「近 1 分钟几次」看不出规律，
+    // 记下缓冲最低点和卡顿最密集的那一分钟，才能判断是片源问题还是某个时间点的问题
+    minAhead: -1,
+    minAheadAt: 0,
+    minAheadPosition: 0,
+    peakStalls: 0,
+    peakStallsAt: 0,
+    peakStallsPosition: 0,
     statsTimer: null
 };
 
@@ -231,6 +239,13 @@ function recordStall() {
     bufferState.lastStallAt = now;
     bufferState.stalls.push(now);
     bufferState.stalls = bufferState.stalls.filter(t => now - t <= BUFFER_STALL_WINDOW_MS);
+    // 记下卡顿最密集的那一分钟（stalls 本身就是最近一分钟的窗口）
+    if (bufferState.stalls.length > bufferState.peakStalls) {
+        bufferState.peakStalls = bufferState.stalls.length;
+        bufferState.peakStallsAt = now;
+        const video = art && art.video;
+        bufferState.peakStallsPosition = video ? Math.round(video.currentTime || 0) : 0;
+    }
     if (bufferState.stalls.length >= BUFFER_STALL_SUGGEST_COUNT && !bufferState.suggested) {
         bufferState.suggested = true;
         let text = '网络跟不上，建议切换到更低清晰度或换源';
@@ -266,6 +281,30 @@ function writePlayerStats() {
     const video = art && art.video;
     const hls = art && art.hls;
     const config = hls && hls.config ? hls.config : null;
+    // 画面尺寸和解码状态：区分「盒子被压扁/滚出视野」和「视频轨根本没解码」这两种黑屏
+    const videoInfo = video ? {
+        width: video.videoWidth || 0,
+        height: video.videoHeight || 0,
+        readyState: typeof video.readyState === 'number' ? video.readyState : -1,
+        networkState: typeof video.networkState === 'number' ? video.networkState : -1,
+        errorCode: video.error && video.error.code ? video.error.code : 0,
+        boxWidth: Math.round(video.clientWidth || 0),
+        boxHeight: Math.round(video.clientHeight || 0)
+    } : null;
+    let playerBox = null;
+    try {
+        const boxEl = document.getElementById('player');
+        if (boxEl && boxEl.getBoundingClientRect) {
+            const rect = boxEl.getBoundingClientRect();
+            const mainEl = document.querySelector('.watch-main');
+            playerBox = {
+                width: Math.round(rect.width || 0),
+                height: Math.round(rect.height || 0),
+                top: Math.round(rect.top || 0),
+                scrollTop: mainEl && typeof mainEl.scrollTop === 'number' ? Math.round(mainEl.scrollTop) : 0
+            };
+        }
+    } catch (e) { /* 取不到布局信息不影响播放 */ }
     const payload = {
         at: Date.now(),
         engine: playerEngineLabel(),
@@ -284,6 +323,16 @@ function writePlayerStats() {
         stalls: bufferState.stalls.length,
         downgrades: bufferState.downgrades,
         switches: bufferState.switches,
+        video: videoInfo,
+        playerBox: playerBox,
+        worst: {
+            minAhead: bufferState.minAhead < 0 ? -1 : Number(bufferState.minAhead.toFixed(1)),
+            minAheadAt: bufferState.minAheadAt,
+            minAheadPosition: Math.round(bufferState.minAheadPosition),
+            peakStalls: bufferState.peakStalls,
+            peakStallsAt: bufferState.peakStallsAt,
+            peakStallsPosition: bufferState.peakStallsPosition
+        },
         config: config ? {
             maxBufferLength: config.maxBufferLength,
             maxMaxBufferLength: config.maxMaxBufferLength,
@@ -312,6 +361,15 @@ function setupPlayerBuffer(instance) {
         const visible = (document.visibilityState || 'visible') === 'visible';
         const settled = now - bufferState.seekAt > BUFFER_STALL_SEEK_GUARD_MS;
         if (gap > BUFFER_STALL_GAP_MS && !video.paused && visible && settled) recordStall();
+        // 缓冲最低点：拖动刚结束那一下本来就没缓冲，不算；主动等缓冲期间也不算
+        if (!video.paused && visible && settled && !bufferState.holding) {
+            const ahead = bufferAheadNow(video);
+            if (bufferState.minAhead < 0 || ahead < bufferState.minAhead) {
+                bufferState.minAhead = ahead;
+                bufferState.minAheadAt = now;
+                bufferState.minAheadPosition = video.currentTime || 0;
+            }
+        }
     });
 
     // 缓冲被抽干时 video 会发 waiting，这是比「间隔」更直接的信号，
@@ -373,6 +431,12 @@ function setupPlayerBuffer(instance) {
         bufferState.lastTickAt = 0;
         bufferState.lastStallAt = 0;
         bufferState.seekAt = 0;
+        bufferState.minAhead = -1;
+        bufferState.minAheadAt = 0;
+        bufferState.minAheadPosition = 0;
+        bufferState.peakStalls = 0;
+        bufferState.peakStallsAt = 0;
+        bufferState.peakStallsPosition = 0;
         writePlayerStats();
     });
 

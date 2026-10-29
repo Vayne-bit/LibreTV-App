@@ -122,22 +122,25 @@
             </div>
         </section>
 
-        <!-- 我的：历史 / 收藏 -->
+        <!-- 我的：历史 / 收藏 / 下载 -->
         <section id="page-history" class="page hidden">
             <header class="page-header">
                 <div class="page-header-bar">
                     <h2 class="page-title">我的</h2>
                     <button type="button" id="historyClearBtn" class="text-btn" onclick="clearViewingHistory()">清空</button>
                     <button type="button" id="favoritesManageBtn" class="text-btn hidden">管理</button>
+                    <button type="button" id="downloadManageBtn" class="text-btn hidden">管理</button>
                 </div>
                 <div id="mineTabs" class="channel-tabs" role="tablist">
                     <button type="button" role="tab" data-mine-tab="history" class="active" aria-selected="true">历史</button>
                     <button type="button" role="tab" data-mine-tab="fav" aria-selected="false">收藏<i class="tab-dot hidden"></i></button>
+                    <button type="button" role="tab" data-mine-tab="dl" aria-selected="false">下载</button>
                 </div>
             </header>
             <div class="page-body">
                 <div id="historyList"></div>
                 <div id="favoritesList" class="hidden"></div>
+                <div id="downloadsList" class="hidden"></div>
             </div>
         </section>
 
@@ -431,6 +434,8 @@
     <script src="js/sync_client.js"></script>
     <script src="js/version-check.js"></script>
     <script src="js/player_cache.js"></script>
+    <script src="js/player_download.js"></script>
+    <script src="js/download_manager.js"></script>
     <script src="js/diagnostics.js"></script>
     <script>
         document.addEventListener('DOMContentLoaded', function () {

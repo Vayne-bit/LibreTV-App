@@ -169,20 +169,27 @@ function renderFavoritesPage() {
 
 function showMineTab(tab) {
     const fav = tab === 'fav';
+    const dl = tab === 'dl';
     document.querySelectorAll('#mineTabs [data-mine-tab]').forEach(btn => {
         const active = btn.dataset.mineTab === tab;
         btn.classList.toggle('active', active);
         btn.setAttribute('aria-selected', String(active));
     });
-    document.getElementById('historyList')?.classList.toggle('hidden', fav);
+    document.getElementById('historyList')?.classList.toggle('hidden', fav || dl);
     document.getElementById('favoritesList')?.classList.toggle('hidden', !fav);
-    document.getElementById('historyClearBtn')?.classList.toggle('hidden', fav);
+    document.getElementById('downloadsList')?.classList.toggle('hidden', !dl);
+    document.getElementById('historyClearBtn')?.classList.toggle('hidden', fav || dl);
     if (fav) {
         renderFavoritesPage();
         checkFavoriteUpdates();
+    } else if (dl) {
+        favoritesState.managing = false;
+        document.getElementById('favoritesManageBtn')?.classList.add('hidden');
+        if (typeof refreshDownloadPage === 'function') refreshDownloadPage();
     } else {
         favoritesState.managing = false;
         document.getElementById('favoritesManageBtn')?.classList.add('hidden');
+        document.getElementById('downloadManageBtn')?.classList.add('hidden');
         renderHistoryPage();
     }
 }
@@ -193,7 +200,9 @@ function setupFavoritesPage() {
 
     document.getElementById('mineTabs')?.addEventListener('click', (e) => {
         const tab = e.target.closest('[data-mine-tab]');
-        if (tab) replaceHash(tab.dataset.mineTab === 'fav' ? '#history/fav' : '#history');
+        if (!tab) return;
+        const name = tab.dataset.mineTab;
+        replaceHash(name === 'fav' ? '#history/fav' : name === 'dl' ? '#history/dl' : '#history');
     });
 
     document.getElementById('favoritesManageBtn')?.addEventListener('click', () => {

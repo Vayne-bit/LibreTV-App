@@ -49,6 +49,13 @@ button {
     cursor: pointer;
     -webkit-user-select: none;
     user-select: none;
+    /* 车机 / Android WebView 没有 color-scheme: dark，未写背景的按钮会套上系统浅色底，
+       在深色主题里冒出白圆点、白块（图标按钮、频道 tab 都中招），这里统一抹掉 UA 默认外观 */
+    background: none;
+    border: 0;
+    padding: 0;
+    color: inherit;
+    font: inherit;
 }
 
 .hidden { display: none !important; }
@@ -1041,6 +1048,45 @@ button {
 }
 
 .history-delete:hover { color: #f87171; }
+
+/* ============ 下载管理 ============ */
+.download-tabs { margin-bottom: 10px; }
+
+.download-manage-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 10px;
+    padding: 8px 12px;
+    border-radius: 10px;
+    background: var(--surface-0);
+    font-size: 13px;
+    color: var(--text-muted);
+}
+
+.download-danger { color: #f87171; }
+.download-danger[disabled] { color: var(--text-faint); opacity: .5; }
+
+.download-row { align-items: center; }
+.download-row.selected { background: var(--accent-soft); }
+
+.download-check {
+    flex: 0 0 22px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    border: 1.5px solid var(--text-faint);
+    color: #fff;
+}
+
+.download-check.checked {
+    border-color: var(--accent);
+    background: var(--accent);
+}
 
 /* ============ Favorites ============ */
 .favorites-status {

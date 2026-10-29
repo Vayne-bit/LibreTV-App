@@ -82,6 +82,30 @@ function playerStatsRows(stats) {
     add('当前码率', formatBitrateKbps(stats.currentBitrate));
     add('带宽估计', formatBitrateKbps(stats.bandwidthEstimate));
     add('近 1 分钟卡顿', `${stats.stalls || 0} 次，自动降档 ${stats.downgrades || 0} 次，自动换源 ${stats.switches || 0} 次`);
+    if (stats.video) {
+        const v = stats.video;
+        // 解码成功时 videoWidth/Height 一定非 0；为 0 说明视频轨没解出来（有声音没画面）
+        const size = v.width && v.height ? `${v.width}×${v.height}` : `未解码（${v.width}×${v.height}）`;
+        const extra = [];
+        if (typeof v.readyState === 'number') extra.push(`readyState ${v.readyState}`);
+        if (v.errorCode) extra.push(`错误码 ${v.errorCode}`);
+        add('画面', `${size}${extra.length ? `，${extra.join('，')}` : ''}`);
+        add('视频元素', `${v.boxWidth}×${v.boxHeight}`);
+    }
+    if (stats.playerBox) {
+        const b = stats.playerBox;
+        add('播放器容器', `${b.width}×${b.height}${b.scrollTop ? `，左栏已滚动 ${b.scrollTop}px` : ''}`);
+    }
+    const worst = stats.worst;
+    if (worst && (worst.minAhead >= 0 || worst.peakStalls)) {
+        // 只报「几次卡顿」看不出规律，最低点和最密集的一分钟才能定位到具体位置
+        if (worst.minAhead >= 0) {
+            add('缓冲最低点', `${worst.minAhead}s（${worst.minAheadPosition}s 处，${formatClockTime(worst.minAheadAt)}）`);
+        }
+        if (worst.peakStalls) {
+            add('卡顿最密集', `一分钟内 ${worst.peakStalls} 次（${worst.peakStallsPosition}s 处，${formatClockTime(worst.peakStallsAt)}）`);
+        }
+    }
     if (stats.config) {
         const c = stats.config;
         add('缓冲参数', `maxBufferLength ${c.maxBufferLength}，maxMaxBufferLength ${c.maxMaxBufferLength}，maxBufferHole ${c.maxBufferHole}，maxBufferSize ${Math.round((c.maxBufferSize || 0) / 1000000)}MB`);
@@ -112,6 +136,26 @@ async function segmentCacheRows() {
     add('已缓存', `${summary.entries} 个分片，${formatMegabytes(summary.bytes)} / 上限 ${formatMegabytes(summary.limitBytes)}`);
     add('本次命中', `${summary.hits} 次，读 ${formatMegabytes(summary.bytesRead)}；未命中 ${summary.misses} 次`);
     add('本次写入', formatMegabytes(summary.bytesWritten));
+    return rows;
+}
+
+// 下载模块只在播放页加载，设置页里没有，所以先判类型
+async function downloadRows() {
+    if (typeof downloadSummary !== 'function') return [];
+    const summary = await downloadSummary();
+    if (!summary) return [];
+    const rows = ['【离线下载】'];
+    const add = (label, value) => rows.push(`  ${label}：${value}`);
+    if (!summary.supported) {
+        rows.push('  当前环境不支持 IndexedDB，离线下载不可用');
+        return rows;
+    }
+    add('已完成', `${summary.count} 集，${formatMegabytes(summary.bytes)} / 上限 ${formatMegabytes(summary.limit)}`);
+    add('进行中', `${summary.active} 集，排队 ${summary.queued} 集`);
+    const unfinished = (summary.rows || []).filter(record => record.status !== 'done');
+    if (unfinished.length) {
+        add('未完成', unfinished.map(record => `${record.label || record.index}（${record.done || 0}/${record.total || 0}）`).join('，'));
+    }
     return rows;
 }
 
@@ -149,6 +193,11 @@ async function collectDiagnostics() {
     if (cacheRows.length) {
         rows.push('');
         rows.push(...cacheRows);
+    }
+    const downloads = await downloadRows();
+    if (downloads.length) {
+        rows.push('');
+        rows.push(...downloads);
     }
     return rows.join('\n');
 }

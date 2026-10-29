@@ -214,7 +214,7 @@
     justify-content: center;
     gap: 6px;
     min-height: 44px;
-    padding: 0 8px;
+    padding: 0 28px 0 8px;
     border: 1px solid transparent;
     border-radius: 8px;
     font-size: 14px;
@@ -237,6 +237,39 @@
     overflow: hidden;
     white-space: nowrap;
     text-overflow: ellipsis;
+}
+
+/* 下载图标放在集数按钮右侧，单独吃点击事件，不触发切集 */
+.episode-dl {
+    position: absolute;
+    right: 2px;
+    top: 50%;
+    transform: translateY(-50%);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    font-size: 10px;
+    line-height: 1;
+    color: var(--text-muted, rgba(255, 255, 255, .45));
+    transition: background-color .15s, color .15s;
+}
+
+.episode-dl:hover,
+.episode-dl:active {
+    background: rgba(255, 255, 255, .1);
+    color: var(--text);
+}
+
+.episode-dl.busy,
+.episode-dl.done {
+    color: var(--accent);
+}
+
+.episode-dl.done {
+    background: var(--accent-soft);
 }
 
 .episode-playing {
@@ -352,7 +385,11 @@ body.player-fullscreen {
     }
 
     .player-shell {
-        position: relative;
+        /* 左栏是独立的滚动容器（.watch-main overflow-y: auto），用 sticky 保证往下翻选集时
+           播放器不会被滚出视野——之前是 relative，一滚动画面就整块消失，看着像「有声音没画面」 */
+        position: sticky;
+        top: 0;
+        z-index: 30;
         border-radius: 12px;
         overflow: hidden;
         max-height: calc(100dvh - 180px);
@@ -698,4 +735,16 @@ body.player-fullscreen {
     .switch-source-box {
         border-radius: var(--radius);
     }
+}
+
+/* 挖孔屏 / 刘海屏横屏时左右安全区不为 0，控制条两端要让开，
+   否则左下角的锁定按钮会正好落在前置摄像头下面（手机上横屏实测反馈） */
+.art-video-player .art-bottom {
+    padding-left: env(safe-area-inset-left, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
+}
+
+.player-fs-topbar {
+    padding-left: calc(14px + env(safe-area-inset-left, 0px));
+    padding-right: calc(14px + env(safe-area-inset-right, 0px));
 }

@@ -67,6 +67,9 @@ function renderEpisodeGroups() {
     }).join('');
 }
 
+const EPISODE_DOWNLOAD_ICON = '<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><path d="M12 3a1 1 0 0 1 1 1v8.6l2.3-2.3a1 1 0 0 1 1.4 1.4l-4 4a1 1 0 0 1-1.4 0l-4-4a1 1 0 0 1 1.4-1.4L11 12.6V4a1 1 0 0 1 1-1zM5 18a1 1 0 0 1 1 1h12a1 1 0 0 1 1-1v1a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-1z"/></svg>';
+const EPISODE_DONE_ICON = '<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><path d="M9.5 17.4 4.6 12.5a1 1 0 0 1 1.4-1.4l3.5 3.5 7.5-7.5a1 1 0 1 1 1.4 1.4l-8.2 8.2a1 1 0 0 1-1.4 0z"/></svg>';
+
 function renderEpisodes() {
     const episodesList = document.getElementById('episodesList');
     if (!episodesList) return;
@@ -91,11 +94,41 @@ function renderEpisodes() {
         return `<button type="button" class="episode-btn ${active ? 'active' : ''}" data-index="${i}" title="${escapeHtml(label)}">
             ${active ? '<span class="episode-playing" aria-hidden="true"><i></i><i></i><i></i></span>' : ''}
             <span class="episode-label">${escapeHtml(label)}</span>
+            <span class="episode-dl" data-download="${i}" role="button" aria-label="下载本集" title="下载本集">${EPISODE_DOWNLOAD_ICON}</span>
         </button>`;
     }).join('');
 
     const activeButton = episodesList.querySelector('.episode-btn.active');
     if (activeButton) activeButton.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    updateEpisodeDownloadBadges();
+}
+
+// 只改小图标，不整块重绘列表，否则正在滑动的列表会被拽回去
+function updateEpisodeDownloadBadges() {
+    const episodesList = document.getElementById('episodesList');
+    if (!episodesList || typeof isEpisodeDownloaded !== 'function') return;
+    episodesList.querySelectorAll('.episode-dl[data-download]').forEach(badge => {
+        const index = parseInt(badge.dataset.download, 10);
+        if (!Number.isFinite(index)) return;
+        const key = downloadEpisodeKey(currentVideoTitle, index);
+        const task = typeof downloadTaskFor === 'function' ? downloadTaskFor(key) : null;
+        const running = task && (task.status === 'downloading' || task.status === 'queued');
+        if (running) {
+            const percent = task.total ? Math.min(99, Math.floor(task.done / task.total * 100)) : 0;
+            badge.classList.add('busy');
+            badge.classList.remove('done');
+            badge.textContent = task.status === 'queued' ? '排队' : `${percent}%`;
+            badge.title = '点击取消下载';
+            badge.setAttribute('aria-label', '取消下载');
+            return;
+        }
+        const done = isEpisodeDownloaded(currentVideoTitle, index);
+        badge.classList.remove('busy');
+        badge.classList.toggle('done', done);
+        badge.innerHTML = done ? EPISODE_DONE_ICON : EPISODE_DOWNLOAD_ICON;
+        badge.title = done ? '已下载，点击删除' : '下载本集';
+        badge.setAttribute('aria-label', done ? '删除离线文件' : '下载本集');
+    });
 }
 
 function updateOrderButton() {
@@ -185,9 +218,31 @@ function setupPlayerPageEvents() {
     const episodesList = document.getElementById('episodesList');
     if (episodesList) {
         episodesList.addEventListener('click', (e) => {
+            // 下载图标在剧集按钮里面，要先拦下来，否则点下载会顺带切集
+            const badge = e.target.closest('.episode-dl');
+            if (badge) {
+                e.stopPropagation();
+                e.preventDefault();
+                const index = parseInt(badge.dataset.download, 10);
+                if (!Number.isFinite(index) || typeof toggleEpisodeDownload !== 'function') return;
+                const result = toggleEpisodeDownload(index);
+                if (result && result.message && typeof art !== 'undefined' && art && art.notice) {
+                    art.notice.show = result.message;
+                } else if (result && result.reason && typeof art !== 'undefined' && art && art.notice) {
+                    art.notice.show = result.reason;
+                }
+                updateEpisodeDownloadBadges();
+                return;
+            }
             const btn = e.target.closest('.episode-btn');
             if (btn) playEpisode(parseInt(btn.dataset.index, 10));
         });
+        if (typeof onDownloadChange === 'function') {
+            onDownloadChange(() => updateEpisodeDownloadBadges());
+        }
+        if (typeof refreshDownloadedKeys === 'function') {
+            refreshDownloadedKeys().then(() => updateEpisodeDownloadBadges());
+        }
     }
 
     const groups = document.getElementById('episodeGroups');

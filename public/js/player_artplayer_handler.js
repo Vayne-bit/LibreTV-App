@@ -3,7 +3,8 @@
 const PLAYER_ICONS = {
     next: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M6 6.5v11a1 1 0 0 0 1.52.85l8.5-5.5a1 1 0 0 0 0-1.7l-8.5-5.5A1 1 0 0 0 6 6.5zM17 6h2v12h-2z"/></svg>',
     fullscreenOn: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M4 9V4h5v2H6v3H4zm11-5h5v5h-2V6h-3V4zM6 15v3h3v2H4v-5h2zm12 0h2v5h-5v-2h3v-3z"/></svg>',
-    fullscreenOff: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M7 4h2v5H4V7h3V4zm8 0h2v3h3v2h-5V4zM4 15h5v5H7v-3H4v-2zm11 0h5v2h-3v3h-2v-5z"/></svg>'
+    fullscreenOff: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M7 4h2v5H4V7h3V4zm8 0h2v3h3v2h-5V4zM4 15h5v5H7v-3H4v-2zm11 0h5v2h-3v3h-2v-5z"/></svg>',
+    download: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M12 3a1 1 0 0 1 1 1v8.6l2.3-2.3a1 1 0 0 1 1.4 1.4l-4 4a1 1 0 0 1-1.4 0l-4-4a1 1 0 0 1 1.4-1.4L11 12.6V4a1 1 0 0 1 1-1zM5 18a1 1 0 0 1 1 1h12a1 1 0 0 1 1-1v1a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-1z"/></svg>'
 };
 
 const HLS_BASE_CONFIG = {
@@ -31,6 +32,34 @@ function isMobileDevice() {
 const HLS_CONFIG = isMobileDevice()
     ? { ...HLS_BASE_CONFIG, backBufferLength: 30, maxBufferLength: 30, maxMaxBufferLength: 60, maxBufferSize: 60 * 1000 * 1000 }
     : { ...HLS_BASE_CONFIG, backBufferLength: 90, maxBufferLength: 30, maxMaxBufferLength: 60, maxBufferSize: 30 * 1000 * 1000 };
+
+const BUFFER_LEVEL_STORAGE_KEY = 'playerBufferLevel';
+// 上面那条「缓冲越大越敢升档」只对多码率源成立。采集站常见 1080p 只有一路 2000kbps，
+// 没有档可降，缓冲越大越能扛住网速抖动，所以单档源反而要加深缓冲。
+const BUFFER_PRESETS = {
+    low: { maxBufferLength: 15, maxMaxBufferLength: 30, maxBufferSize: 30 * 1000 * 1000 },
+    normal: { maxBufferLength: 30, maxMaxBufferLength: 60, maxBufferSize: 60 * 1000 * 1000 },
+    deep: { maxBufferLength: 60, maxMaxBufferLength: 120, maxBufferSize: 120 * 1000 * 1000 }
+};
+
+function readBufferLevel() {
+    const saved = localStorage.getItem(BUFFER_LEVEL_STORAGE_KEY);
+    return saved === 'low' || saved === 'high' ? saved : 'auto';
+}
+
+function bufferPresetFor(level, variantCount) {
+    if (level === 'low') return BUFFER_PRESETS.low;
+    if (level === 'high') return BUFFER_PRESETS.deep;
+    return variantCount === 1 ? BUFFER_PRESETS.deep : BUFFER_PRESETS.normal;
+}
+
+// hls.config 就是各个 controller 持有的那个对象，改字段立刻生效
+function applyBufferPreset(hls, preset) {
+    if (!hls || !hls.config || !preset) return;
+    hls.config.maxBufferLength = preset.maxBufferLength;
+    hls.config.maxMaxBufferLength = preset.maxMaxBufferLength;
+    hls.config.maxBufferSize = preset.maxBufferSize;
+}
 
 let playbackStarted = false;
 let pendingSeekPosition = 0;
@@ -74,8 +103,10 @@ function playM3u8(video, url, instance) {
         showPlayerError('当前环境不支持播放 m3u8 视频');
         return;
     }
+    const bufferLevel = readBufferLevel();
     const hls = new Hls({
         ...HLS_CONFIG,
+        ...bufferPresetFor(bufferLevel, 0),
         // 始终用自定义 loader：分片缓存要靠它接管分片请求，关掉广告过滤只是跳过 playlist 处理
         loader: CustomHlsJsLoader
     });
@@ -88,6 +119,8 @@ function playM3u8(video, url, instance) {
         const levels = (data && data.levels) || [];
         const best = levels.reduce((acc, level) => (level && level.height > (acc ? acc.height : 0) ? level : acc), null);
         if (best && best.height) updateResolutionBadge(formatResolution(best.width, best.height));
+        // 「自动」档要等知道有几档才能定：单档源加深缓冲，多档源保持浅缓冲让 ABR 敢升档
+        if (bufferLevel === 'auto') applyBufferPreset(hls, bufferPresetFor(bufferLevel, levels.length));
     });
     hls.on(Hls.Events.LEVEL_SWITCHED, (event, data) => {
         const levels = (hls.levels || []);
@@ -127,9 +160,18 @@ function playFlv(video, url, instance) {
     instance.flv = flv;
 }
 
+function requestEpisodeDownload() {
+    if (typeof toggleEpisodeDownload !== 'function') return;
+    const result = toggleEpisodeDownload(currentEpisodeIndex);
+    const message = (result && (result.message || result.reason)) || '无法下载这一集';
+    if (art && art.notice) art.notice.show = message;
+    if (typeof updateEpisodeDownloadBadges === 'function') updateEpisodeDownloadBadges();
+}
+
 function buildPlayerSettings() {
     const savedFit = localStorage.getItem('playerObjectFit') || 'contain';
     const gestureEnabled = isGestureEnabled();
+    const savedBufferLevel = readBufferLevel();
     return [{
         html: '画面模式',
         width: 200,
@@ -152,6 +194,24 @@ function buildPlayerSettings() {
             const enabled = !!item.switch;
             setGestureEnabled(enabled);
             return enabled ? '开' : '关';
+        }
+    }, {
+        html: '缓冲深度',
+        width: 200,
+        tooltip: { auto: '自动', low: '浅', high: '深' }[savedBufferLevel],
+        selector: [
+            { html: '自动', value: 'auto', default: savedBufferLevel === 'auto' },
+            { html: '浅（起播快）', value: 'low', default: savedBufferLevel === 'low' },
+            { html: '深（抗卡顿）', value: 'high', default: savedBufferLevel === 'high' }
+        ],
+        onSelect(item) {
+            localStorage.setItem(BUFFER_LEVEL_STORAGE_KEY, item.value);
+            // 立即生效，不用等下一集：当前实例的缓冲目标直接改
+            if (art && art.hls) {
+                const count = Array.isArray(art.hls.levels) ? art.hls.levels.length : 0;
+                applyBufferPreset(art.hls, bufferPresetFor(item.value, count));
+            }
+            return item.html;
         }
     }];
 }
@@ -210,6 +270,13 @@ function initPlayer(videoUrl) {
             html: PLAYER_ICONS.next,
             tooltip: '下一集',
             click: () => playNextEpisode()
+        }, {
+            name: 'download-episode',
+            position: 'left',
+            index: 16,
+            html: PLAYER_ICONS.download,
+            tooltip: '下载本集',
+            click: () => requestEpisodeDownload()
         }],
         moreVideoAttr: { preload: 'auto', 'x5-video-player-type': 'h5' }
     });
@@ -385,6 +452,15 @@ async function requestScreenAwake(on) {
 
 // 统一走这个 loader：播放列表要过滤广告，分片要落磁盘缓存，两件事都得经过这里。
 // 广告过滤关掉时只是跳过 manifest 处理，分片缓存照旧生效。
+// 先查整集下载，再查分片缓存：下载是用户主动要的离线文件，命中优先级更高
+function lookupStoredSegment(key) {
+    if (typeof downloadSegmentGet !== 'function') return segmentCacheGet(key);
+    return downloadSegmentGet(key).then(record => {
+        if (record && record.data && record.data.byteLength) return record.data;
+        return segmentCacheGet(key);
+    }).catch(() => segmentCacheGet(key));
+}
+
 class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
     constructor(config) {
         super(config);
@@ -411,7 +487,7 @@ class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
                     if (response.data && typeof response.data === 'string') {
                         // 广告过滤关掉时也走一遍：只统计标记，不改内容，诊断信息才有数据可看
                         const filtering = typeof adFilteringEnabled === 'undefined' ? true : adFilteringEnabled;
-                        response.data = filterAdsFromM3U8(response.data, filtering);
+                        response.data = filterAdsFromM3U8(response.data, filtering, response.url);
                     }
                     return onSuccess(response, stats, ctx, networkDetails);
                 };
@@ -438,7 +514,7 @@ class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
                 if (self.cacheAborted || (loaderStats && loaderStats.aborted)) return;
                 goNetwork();
             };
-            segmentCacheGet(segmentCacheKey(context)).then(buffer => {
+            lookupStoredSegment(segmentCacheKey(context)).then(buffer => {
                 if (settled) return;
                 if (self.cacheAborted) {
                     settled = true;
@@ -472,7 +548,8 @@ class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
 // 没有这份数据就没法判断该按哪种规则去广告，只能靠猜。
 const PLAYLIST_MARKER_STATS_KEY = 'playlistMarkerStats';
 
-function recordPlaylistMarkers(raw, removedSegments, aborted) {
+// mode: 'cue' 按 CUE 标记删的 / 'structure' 按断点+域名结构删的 / 'none' 没动手
+function recordPlaylistMarkers(raw, removedSegments, aborted, mode, adBlocks) {
     if (typeof raw !== 'string' || !raw) return;
     const count = pattern => (raw.match(pattern) || []).length;
     const payload = {
@@ -485,21 +562,140 @@ function recordPlaylistMarkers(raw, removedSegments, aborted) {
         daterange: count(/#EXT-X-DATERANGE/g),
         scte35: count(/#(?:EXT-X-SCTE35|EXT-OATCLS-SCTE35)/g),
         removed: removedSegments || 0,
-        aborted: !!aborted
+        aborted: !!aborted,
+        mode: mode || 'none',
+        adBlocks: adBlocks || 0
     };
     try { localStorage.setItem(PLAYLIST_MARKER_STATS_KEY, JSON.stringify(payload)); } catch (e) { /* 存不下就算了 */ }
+}
+
+// 采集站 SSAI 插播广告的结构特征：广告是一整块被 #EXT-X-DISCONTINUITY 夹住的分片，
+// 分片全部指向另一个域名（广告商的 CDN），块内还常带一句 #EXT-X-KEY:METHOD=NONE。
+// 这类源不会给 CUE-OUT/CUE-IN，所以只能靠结构认。
+const AD_BLOCK_MAX_SECONDS = 180;
+// 删掉的分片超过总量这个比例，说明判定规则在误伤正片，宁可放弃
+const AD_REMOVE_MAX_RATIO = 0.3;
+
+function isDiscontinuityLine(text) {
+    return text === '#EXT-X-DISCONTINUITY' || text.indexOf('#EXT-X-DISCONTINUITY:') === 0;
+}
+
+// 把播放列表按断点标记切成块，每块记录自己的分片、时长、以及前面有没有断点
+function splitPlaylistBlocks(lines) {
+    const blocks = [];
+    let block = { discontinuity: false, lines: [], segments: [], duration: 0 };
+    let pending = 0;
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const trimmed = line.trim();
+        if (isDiscontinuityLine(trimmed)) {
+            blocks.push(block);
+            block = { discontinuity: true, lines: [], segments: [], duration: 0 };
+            continue;
+        }
+        block.lines.push(line);
+        if (trimmed.indexOf('#EXTINF') === 0) {
+            const value = parseFloat(trimmed.slice(8));
+            pending = isNaN(value) ? 0 : value;
+            continue;
+        }
+        // 非 # 开头的非空行就是分片地址
+        if (trimmed && trimmed.charAt(0) !== '#') {
+            block.segments.push({ uri: trimmed, duration: pending });
+            block.duration += pending;
+            pending = 0;
+        }
+    }
+    blocks.push(block);
+    return blocks;
+}
+
+function playlistHost(uri, baseUrl) {
+    try {
+        const resolved = new URL(uri, baseUrl || 'https://placeholder.invalid/');
+        return resolved.host || '';
+    } catch (e) {
+        return '';
+    }
+}
+
+// 结构法：断点夹住、分片全在别的域名上、且整块很短的，判定为广告块，整块删掉。
+// 删的时候连同块前那个断点一起丢，让下一个保留块自己的断点顶上，
+// 正片前后正好剩一个断点——时间轴需要它重新对齐，少了会出现缓冲空洞。
+function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
+    const blocks = splitPlaylistBlocks(lines);
+    let totalSegments = 0;
+    let totalDuration = 0;
+    blocks.forEach(block => block.segments.forEach(segment => {
+        totalSegments += 1;
+        totalDuration += segment.duration;
+    }));
+    // 判广告不看「哪个域名分片多」——广告块比正片块长时那个判据会反过来。
+    // 改成「这块用的域名，前面的正片一个都没用过」：广告和正片永远不在同一个域名上。
+    const contentHosts = new Set();
+    const dropped = [];
+    blocks.forEach((block, index) => {
+        if (!block.segments.length) return;
+        const hosts = block.segments.map(segment => playlistHost(segment.uri, baseUrl));
+        const resetKey = block.lines.some(line => line.trim().indexOf('#EXT-X-KEY:METHOD=NONE') === 0);
+        const short = block.duration > 0 && block.duration <= AD_BLOCK_MAX_SECONDS;
+        const disjoint = hosts.every(host => !contentHosts.has(host));
+        // 没有前置断点就不是插播块：这一条保证「没有断点标记的播放列表一律不动」
+        const isAd = block.discontinuity && short && (disjoint || resetKey);
+        if (isAd) {
+            dropped.push(index);
+            return;
+        }
+        hosts.forEach(host => contentHosts.add(host));
+    });
+    if (!dropped.length) {
+        recordPlaylistMarkers(m3u8Content, 0, false, 'none', 0);
+        return m3u8Content;
+    }
+    let removedSegments = 0;
+    let removedDuration = 0;
+    dropped.forEach(index => {
+        removedSegments += blocks[index].segments.length;
+        removedDuration += blocks[index].duration;
+    });
+    // 兜底：删太多说明判定规则不对，宁可让用户看广告也不能把正片删没
+    const tooMuch = removedSegments >= totalSegments || removedDuration > totalDuration * AD_REMOVE_MAX_RATIO;
+    if (tooMuch || !applyFilter) {
+        recordPlaylistMarkers(m3u8Content, 0, tooMuch, tooMuch ? 'none' : 'structure', dropped.length);
+        return m3u8Content;
+    }
+    const kept = [];
+    const tail = [];
+    let emitted = 0;
+    blocks.forEach((block, index) => {
+        if (dropped.indexOf(index) >= 0) {
+            // 尾部广告块里带着 #EXT-X-ENDLIST，整块丢掉会连播放结束标记一起丢
+            block.lines.forEach(line => {
+                if (line.trim() === '#EXT-X-ENDLIST') tail.push(line);
+            });
+            return;
+        }
+        // 头一个分片之前不需要断点，写了反而是个孤立标记
+        if (block.discontinuity && emitted > 0) kept.push('#EXT-X-DISCONTINUITY');
+        block.lines.forEach(line => kept.push(line));
+        emitted += block.segments.length;
+    });
+    tail.forEach(line => kept.push(line));
+    recordPlaylistMarkers(m3u8Content, removedSegments, false, 'structure', dropped.length);
+    return kept.join('\n');
 }
 
 // 按 SCTE-35 广告标记把标记区间内的分片整段删掉（#EXT-X-CUE-OUT … #EXT-X-CUE-IN）。
 // 早先的实现只删 #EXT-X-DISCONTINUITY 这一行标签、一个分片都不删，所以从来没真正去掉过广告；
 // 反过来删标签还会让 remuxer 按连续时间戳算分段，导致缓冲出现空洞。现在标签一律保留，只删分片。
-function filterAdsFromM3U8(m3u8Content, applyFilter) {
+function filterAdsFromM3U8(m3u8Content, applyFilter, baseUrl) {
     if (!m3u8Content) return '';
     const lines = m3u8Content.split('\n');
-    // 没有广告标记就原样返回，避免误伤正常播放列表
+    // 有 CUE 标记就走标记法，没有就走结构法（采集站插播广告不给 CUE 标记）
     const hasCueOut = lines.some(line => line.trim().indexOf('#EXT-X-CUE-OUT') === 0);
-    if (!hasCueOut || !applyFilter) {
-        recordPlaylistMarkers(m3u8Content, 0);
+    if (!hasCueOut) return filterByStructure(m3u8Content, lines, baseUrl, applyFilter);
+    if (!applyFilter) {
+        recordPlaylistMarkers(m3u8Content, 0, false, 'cue', 0);
         return m3u8Content;
     }
     const kept = [];
@@ -557,16 +753,16 @@ function filterAdsFromM3U8(m3u8Content, applyFilter) {
     }
     // 标记不成对（没有 CUE-IN）说明结构不符合预期，宁可不动，别把正片删了
     if (!sawCueIn) {
-        recordPlaylistMarkers(m3u8Content, 0);
+        recordPlaylistMarkers(m3u8Content, 0, false, 'cue', 0);
         return m3u8Content;
     }
     // 兜底：标记打错位置时会一口气删掉大半正片，超过三成就当标记不可信，原样放行。
     // 宁可让用户看广告，也不能把正片删没。
     const totalSegments = lines.reduce((n, l) => (l.trim().indexOf('#EXTINF') === 0 ? n + 1 : n), 0);
     if (removed > 5 && removed > totalSegments * 0.3) {
-        recordPlaylistMarkers(m3u8Content, 0, true);
+        recordPlaylistMarkers(m3u8Content, 0, true, 'cue', 0);
         return m3u8Content;
     }
-    recordPlaylistMarkers(m3u8Content, removed);
+    recordPlaylistMarkers(m3u8Content, removed, false, 'cue', 0);
     return kept.join('\n');
 }
