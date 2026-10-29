@@ -199,12 +199,14 @@
 
 .episode-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(64px, 1fr));
+    /* 加了下载角标和播放动画之后，64px 的格子放不下「第100集」这种五六个字的标签，
+       文字会被 ellipsis 吃掉。抬高到 100px，右边给角标留 26px、左右对称 */
+    grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
     gap: 8px;
 }
 
 .episode-grid.long-names {
-    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
 }
 
 .episode-btn {
@@ -213,8 +215,8 @@
     align-items: center;
     justify-content: center;
     gap: 6px;
-    min-height: 44px;
-    padding: 0 28px 0 8px;
+    min-height: 46px;
+    padding: 0 26px;
     border: 1px solid transparent;
     border-radius: 8px;
     font-size: 14px;
@@ -272,7 +274,13 @@
     background: var(--accent-soft);
 }
 
+/* 播放中的跳动条绝对定位在左侧，不参与 flex 排布，
+   否则「正在播的这一集」标签会被挤短，正好就是用户看到的「看不到第几集」 */
 .episode-playing {
+    position: absolute;
+    left: 9px;
+    top: 50%;
+    transform: translateY(-50%);
     display: inline-flex;
     align-items: flex-end;
     gap: 2px;
@@ -615,6 +623,42 @@ body.player-fullscreen {
 
 .player-buffer-pill.show {
     opacity: 1;
+}
+
+/* --- 拖动进度条时画面中央的时间 ---
+   ArtPlayer 自带的时间提示贴在进度条上，手指一按就被盖住了，
+   车机屏幕大、手指也大，所以额外在正中间再显示一份。 */
+
+.player-seek-pill {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    z-index: 47;
+    display: inline-flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 12px 20px;
+    border-radius: 14px;
+    background: rgba(0, 0, 0, 0.72);
+    color: #fff;
+    font-size: 24px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    pointer-events: none;
+    opacity: 0;
+    transform: translate(-50%, -50%);
+    transition: opacity .12s linear;
+}
+
+.player-seek-pill.show {
+    opacity: 1;
+}
+
+.player-seek-pill-total {
+    font-size: 14px;
+    font-weight: 400;
+    color: rgba(255, 255, 255, 0.68);
 }
 
 /* --- 全屏顶部信息条 ---

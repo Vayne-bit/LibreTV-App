@@ -297,16 +297,16 @@
                             <div class="storage-row"><span>正在统计…</span></div>
                         </div>
                         <div class="settings-buttons">
-                            <button type="button" onclick="clearSegmentCacheFromSettings()" class="btn-secondary">清理分片缓存</button>
-                            <button type="button" onclick="clearDownloadsFromSettings()" class="btn-secondary">清空离线下载</button>
+                            <button type="button" id="clearSegmentCacheBtn" onclick="clearSegmentCacheFromSettings()" class="btn-secondary">清理分片缓存</button>
+                            <button type="button" id="clearDownloadsBtn" onclick="clearDownloadsFromSettings()" class="btn-secondary">清空离线下载</button>
                         </div>
                     </div>
 
                     <div class="settings-card">
                         <div class="settings-card-title">数据</div>
                         <div class="settings-buttons">
-                            <button type="button" onclick="importConfig()" class="btn-secondary">导入配置</button>
-                            <button type="button" onclick="exportConfig()" class="btn-secondary">导出配置</button>
+                            <button type="button" onclick="withButtonBusy(this, importConfig)" class="btn-secondary">导入配置</button>
+                            <button type="button" onclick="withButtonBusy(this, exportConfig)" class="btn-secondary">导出配置</button>
                             <button type="button" onclick="clearLocalStorage()" class="btn-danger btn-secondary">清除本地数据</button>
                         </div>
                     </div>

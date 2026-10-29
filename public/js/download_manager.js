@@ -210,7 +210,7 @@ function playDownloadedEpisode(key) {
     const index = Math.max(0, Number(record.index) || 0);
     const url = record.url || episodes[index];
     if (!url) {
-        showToast('这一集的地址丢了，请重新搜索', 'error');
+        showAlertDialog({ title: '这一集打不开', message: '下载记录里的地址丢了，请重新搜索这部片再加入下载。' });
         return;
     }
     // 和从历史记录继续观看走同一套参数，播放页才能还原剧集列表和集号
@@ -232,13 +232,24 @@ function playDownloadedEpisode(key) {
     showVideoPlayer(`player.html?${params.toString()}`);
 }
 
-function deleteSelectedDownloads() {
+function deleteSelectedDownloads(button) {
     const keys = Array.from(downloadPageState.selected);
-    if (!keys.length) return;
-    deleteDownloadedEpisodes(keys).then(removed => {
-        downloadPageState.selected.clear();
-        showToast(removed ? `已删除 ${removed} 集` : '删除失败', removed ? 'success' : 'error');
-        return refreshDownloadPage();
+    if (!keys.length) return Promise.resolve();
+    return showConfirmDialog({
+        title: '删除下载',
+        message: `会删掉选中的 ${keys.length} 集，重新看要重新下。`,
+        confirmText: '删除'
+    }).then(ok => {
+        if (!ok) return undefined;
+        return withButtonBusy(button, () => deleteDownloadedEpisodes(keys).then(removed => {
+            downloadPageState.selected.clear();
+            if (!removed) {
+                showAlertDialog({ title: '删除失败', message: '一集都没删掉，请刷新页面后再试。' });
+            } else {
+                showToast(`已删除 ${removed} 集`, 'success');
+            }
+            return refreshDownloadPage();
+        })).catch(() => showAlertDialog({ title: '删除失败', message: '删除过程中出错了，请刷新页面后再试。' }));
     });
 }
 
@@ -262,7 +273,7 @@ function setupDownloadPage() {
             return;
         }
         if (e.target.closest('[data-download-delete]')) {
-            deleteSelectedDownloads();
+            deleteSelectedDownloads(e.target.closest('[data-download-delete]'));
             return;
         }
         const removeBtn = e.target.closest('[data-download-remove]');
@@ -271,16 +282,32 @@ function setupDownloadPage() {
             e.preventDefault();
             e.stopPropagation();
             const key = removeBtn.dataset.downloadRemove;
-            downloadDeleteOne(key).then(removed => {
-                showToast(removed ? '已删除' : '删除失败', removed ? 'success' : 'error');
+            withButtonBusy(removeBtn, () => downloadDeleteOne(key).then(removed => {
+                if (!removed) {
+                    showAlertDialog({ title: '删除失败', message: '这一集没删掉，请刷新页面后再试。' });
+                } else {
+                    showToast('已删除', 'success');
+                }
                 return refreshDownloadPage();
-            });
+            })).catch(() => showAlertDialog({ title: '删除失败', message: '删除过程中出错了，请刷新页面后再试。' }));
             return;
         }
         if (e.target.closest('[data-download-clear]')) {
-            downloadCancelAll().then(removed => {
-                showToast(removed ? `已清空 ${removed} 项` : '没有可清空的项', removed ? 'success' : 'info');
-                return refreshDownloadPage();
+            const clearBtn = e.target.closest('[data-download-clear]');
+            showConfirmDialog({
+                title: '清空未完成的下载',
+                message: '会停掉正在下载和排队的任务，已下载好的不受影响。',
+                confirmText: '清空'
+            }).then(ok => {
+                if (!ok) return undefined;
+                return withButtonBusy(clearBtn, () => downloadCancelAll().then(removed => {
+                    if (!removed) {
+                        showAlertDialog({ title: '没有可清空的项', message: '当前没有下载中或排队的任务。' });
+                        return undefined;
+                    }
+                    showToast(`已清空 ${removed} 项`, 'success');
+                    return refreshDownloadPage();
+                })).catch(() => showAlertDialog({ title: '清空失败', message: '清空过程中出错了，请刷新页面后再试。' }));
             });
             return;
         }
@@ -295,7 +322,10 @@ function setupDownloadPage() {
         }
         const record = downloadPageState.rows.find(item => item.key === key);
         if (record && record.status !== 'done') {
-            showToast('这一集还没下完，可以先删除再重新下载', 'error');
+            showAlertDialog({
+                title: '这一集还没下完',
+                message: '要等下载完成才能离线播放。想重下的话，先删掉这一条再加入下载。'
+            });
             return;
         }
         playDownloadedEpisode(key);

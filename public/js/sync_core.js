@@ -76,16 +76,19 @@ function slimFavoriteEntry(item) {
 
 // 打包本机需要同步的数据
 // devices 记录参与同步的设备，合并时按设备名去重，用于在设置页展示
+// deleted 是本机的删除标记，带上去别的设备才知道这些记录是删掉的而不是还没同步到
 function buildSyncPayload() {
     const history = readJsonArray(LOCAL_KEYS.history);
     const favorites = readJsonArray(LOCAL_KEYS.favorites);
     const devices = mergeDeviceList(readDeviceList(), [currentDeviceInfo()]);
+    const tombstones = readTombstones();
     return {
-        version: 1,
+        version: 2,
         updatedAt: Date.now(),
         history: history.map(slimHistoryEntry).filter(Boolean),
         favorites: favorites.map(slimFavoriteEntry).filter(Boolean),
-        devices
+        devices,
+        deleted: tombstones
     };
 }
 
@@ -141,25 +144,126 @@ function readJsonArray(key) {
     }
 }
 
+// --- 删除标记（tombstone） ---
+// 合并是纯并集，本地删掉的记录下一轮从云端拉回来又会被并进来。
+// 所以删除要留个记号，合并时按记号过滤，并跟着一起推到云端，别的设备也会跟着删。
+const SYNC_TOMBSTONE_KEY = 'syncTombstones';
+const SYNC_TOMBSTONE_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
+
+function readTombstones() {
+    let stored = null;
+    try {
+        stored = JSON.parse(localStorage.getItem(SYNC_TOMBSTONE_KEY) || 'null');
+    } catch (e) {
+        stored = null;
+    }
+    const map = stored && typeof stored === 'object' ? stored : {};
+    const history = map.history && typeof map.history === 'object' ? map.history : {};
+    const favorites = map.favorites && typeof map.favorites === 'object' ? map.favorites : {};
+    return { history, favorites };
+}
+
+function writeTombstones(tombstones) {
+    const cutoff = Date.now() - SYNC_TOMBSTONE_MAX_AGE_MS;
+    const prune = source => {
+        const kept = {};
+        Object.keys(source || {}).forEach(id => {
+            const at = Number(source[id]) || 0;
+            if (at && at >= cutoff) kept[id] = at;
+        });
+        return kept;
+    };
+    const payload = {
+        history: prune(tombstones && tombstones.history),
+        favorites: prune(tombstones && tombstones.favorites)
+    };
+    try {
+        localStorage.setItem(SYNC_TOMBSTONE_KEY, JSON.stringify(payload));
+    } catch (e) { /* 存不下就算了，下次删除还会再写 */ }
+    return payload;
+}
+
+// 条目可能还没有 canonicalId（老数据），这里现算一个，保证删得掉
+function syncTombstoneId(item) {
+    if (!item) return '';
+    if (item.canonicalId) return item.canonicalId;
+    const title = item.title || '';
+    if (!title) return '';
+    return buildCanonicalId(title, item.year || extractYearFromTitle(title));
+}
+
+// kind: 'history' | 'favorites'
+function markSyncDeleted(kind, itemOrId) {
+    const id = typeof itemOrId === 'string' ? itemOrId : syncTombstoneId(itemOrId);
+    if (!id) return false;
+    const tombstones = readTombstones();
+    const bucket = tombstones[kind] || (tombstones[kind] = {});
+    bucket[id] = Date.now();
+    writeTombstones(tombstones);
+    return true;
+}
+
+function markSyncDeletedMany(kind, items) {
+    const tombstones = readTombstones();
+    const bucket = tombstones[kind] || (tombstones[kind] = {});
+    const now = Date.now();
+    let marked = 0;
+    (items || []).forEach(item => {
+        const id = syncTombstoneId(item);
+        if (!id) return;
+        bucket[id] = now;
+        marked++;
+    });
+    writeTombstones(tombstones);
+    return marked;
+}
+
+// 把远端带来的删除标记并进本地，同一个 id 取较晚的时间
+function mergeTombstoneMaps(local, remote) {
+    const result = { history: {}, favorites: {} };
+    ['history', 'favorites'].forEach(kind => {
+        const merged = {};
+        const take = source => {
+            Object.keys(source || {}).forEach(id => {
+                const at = Number(source[id]) || 0;
+                if (!at) return;
+                if (!merged[id] || at > merged[id]) merged[id] = at;
+            });
+        };
+        take(local && local[kind]);
+        take(remote && remote[kind]);
+        result[kind] = merged;
+    });
+    return result;
+}
+
+
 // --- 合并 ---
 
-// 按 canonicalId 对齐，时间戳新的胜出；保留本机原有的剧集列表等重字段
-function mergeSyncList(localList, remoteList, slimFn, mergeInto) {
+// 按 canonicalId 对齐，时间戳新的胜出；保留本机原有的剧集列表等重字段。
+// tombstones 是删除标记表：标记时间不早于条目时间的条目一律丢掉，
+// 但如果条目在删除之后又有新进度（重新看过），说明用户改主意了，让它回来。
+function mergeSyncList(localList, remoteList, slimFn, mergeInto, tombstones) {
+    const deleted = tombstones || {};
+    const deletedAt = id => Number(deleted[id]) || 0;
     const byId = new Map();
     (localList || []).forEach(item => {
         const slim = slimFn(item);
         if (!slim) return;
+        const stamp = slim.timestamp || slim.addedAt || 0;
+        if (deletedAt(slim.canonicalId) >= stamp) return;
         byId.set(slim.canonicalId, { slim, original: item });
     });
     (remoteList || []).forEach(remote => {
         if (!remote || !remote.canonicalId) return;
+        const remoteTime = remote.timestamp || remote.addedAt || 0;
+        if (deletedAt(remote.canonicalId) >= remoteTime) return;
         const existing = byId.get(remote.canonicalId);
         if (!existing) {
             byId.set(remote.canonicalId, { slim: remote, original: null });
             return;
         }
         // 谁的时间戳新用谁的进度
-        const remoteTime = remote.timestamp || remote.addedAt || 0;
         const localTime = existing.slim.timestamp || existing.slim.addedAt || 0;
         if (remoteTime > localTime) {
             byId.set(remote.canonicalId, {
@@ -209,8 +313,8 @@ function buildEntryFromRemote(remoteItem) {
     };
 }
 
-function mergeHistory(localHistory, remoteHistory) {
-    const merged = mergeSyncList(localHistory, remoteHistory, slimHistoryEntry, mergeHistoryEntry);
+function mergeHistory(localHistory, remoteHistory, tombstones) {
+    const merged = mergeSyncList(localHistory, remoteHistory, slimHistoryEntry, mergeHistoryEntry, tombstones);
     const result = merged.map(({ slim, original }) => {
         if (original) return mergeHistoryEntry(original, slim);
         return buildEntryFromRemote(slim);
@@ -219,8 +323,8 @@ function mergeHistory(localHistory, remoteHistory) {
     return result.slice(0, 50);
 }
 
-function mergeFavorites(localFavorites, remoteFavorites) {
-    const merged = mergeSyncList(localFavorites, remoteFavorites, slimFavoriteEntry, null);
+function mergeFavorites(localFavorites, remoteFavorites, tombstones) {
+    const merged = mergeSyncList(localFavorites, remoteFavorites, slimFavoriteEntry, null, tombstones);
     return merged.map(({ slim, original }) => {
         if (original) {
             return {
@@ -258,8 +362,11 @@ function applySyncPayload(payload) {
     const localHistory = readJsonArray(LOCAL_KEYS.history);
     const localFavorites = readJsonArray(LOCAL_KEYS.favorites);
 
-    const mergedHistory = mergeHistory(localHistory, payload.history);
-    const mergedFavorites = mergeFavorites(localFavorites, payload.favorites || []);
+    // 先把双方的删除标记合起来，再拿它去过滤，这样两边删过的都不会被对方拉回来
+    const tombstones = writeTombstones(mergeTombstoneMaps(readTombstones(), payload.deleted));
+
+    const mergedHistory = mergeHistory(localHistory, payload.history, tombstones.history);
+    const mergedFavorites = mergeFavorites(localFavorites, payload.favorites || [], tombstones.favorites);
 
     localStorage.setItem(LOCAL_KEYS.history, JSON.stringify(mergedHistory));
     localStorage.setItem(LOCAL_KEYS.favorites, JSON.stringify(mergedFavorites));

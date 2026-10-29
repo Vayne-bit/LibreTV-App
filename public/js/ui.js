@@ -536,16 +536,118 @@ function addToViewingHistory(videoInfo) {
     }
 }
 
+// 通用确认弹窗。危险操作（清缓存、清下载、删记录）统一走这里。
+// 之前用「再点一次确认」的 toast 提示，车机上 toast 一闪就没了，手指容易点空，
+// 表现就是「一直点、toast 一直弹、事情没做成」。
+function showConfirmDialog(options) {
+    const opts = options || {};
+    const esc = typeof escapeHtml === 'function' ? escapeHtml : value => String(value == null ? '' : value);
+    const title = esc(opts.title || '确认');
+    const message = opts.message ? esc(opts.message) : '';
+    const confirmText = esc(opts.confirmText || '确定');
+    const cancelText = esc(opts.cancelText || '取消');
+    const danger = opts.danger !== false;
+
+    return new Promise(resolve => {
+        const stale = document.getElementById('confirmDialogModal');
+        if (stale) stale.remove();
+
+        const modal = document.createElement('div');
+        modal.id = 'confirmDialogModal';
+        modal.className = 'fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50';
+        modal.innerHTML = `
+            <div class="confirm-dialog" role="dialog" aria-modal="true" aria-label="${title}">
+                <h3 class="confirm-dialog-title${danger ? ' danger' : ''}">${title}</h3>
+                ${message ? `<p class="confirm-dialog-message">${message}</p>` : ''}
+                <div class="confirm-dialog-actions">
+                    ${opts.alert ? '' : `<button type="button" class="confirm-dialog-btn" data-confirm-cancel>${cancelText}</button>`}
+                    <button type="button" class="confirm-dialog-btn${danger ? ' danger' : ' primary'}" data-confirm-ok>${confirmText}</button>
+                </div>
+            </div>`;
+
+        let settled = false;
+        const close = result => {
+            if (settled) return;
+            settled = true;
+            document.removeEventListener('keydown', onKeydown);
+            if (modal.parentNode) modal.parentNode.removeChild(modal);
+            resolve(result);
+        };
+        const onKeydown = e => {
+            if (e.key === 'Escape') close(false);
+        };
+
+        modal.querySelector('[data-confirm-ok]').addEventListener('click', () => close(true));
+        const cancelBtn = modal.querySelector('[data-confirm-cancel]');
+        if (cancelBtn) cancelBtn.addEventListener('click', () => close(false));
+        modal.addEventListener('click', e => {
+            if (e.target === modal) close(false);
+        });
+        document.addEventListener('keydown', onKeydown);
+        document.body.appendChild(modal);
+        (cancelBtn || modal.querySelector('[data-confirm-ok]')).focus();
+    });
+}
+
+// 只有「知道了」一个按钮的提示弹窗。报错、无内容可清这类用它，
+// 不再用 toast——车机上 toast 两秒就没了，容易错过
+function showAlertDialog(options) {
+    return showConfirmDialog(Object.assign({}, options, { alert: true }));
+}
+
+// 网络请求、清库这类耗时操作统一走这里：按钮立刻进入禁用态并转圈，
+// 避免用户以为没点上而反复点击。task 抛错时恢复按钮后继续往外抛。
+function withButtonBusy(button, task) {
+    const el = typeof button === 'string' ? document.getElementById(button) : button;
+    if (el && el.dataset.busy === '1') return Promise.resolve(undefined);
+    const restore = { disabled: el ? el.disabled : false };
+    if (el) {
+        el.dataset.busy = '1';
+        el.classList.add('is-busy');
+        el.setAttribute('aria-busy', 'true');
+        el.disabled = true;
+    }
+    return Promise.resolve()
+        .then(task)
+        .finally(() => {
+            if (!el) return;
+            delete el.dataset.busy;
+            el.classList.remove('is-busy');
+            el.removeAttribute('aria-busy');
+            el.disabled = restore.disabled;
+        });
+}
+
 // 清空观看历史
 function clearViewingHistory() {
+    let history = [];
     try {
-        localStorage.removeItem('viewingHistory');
-        loadViewingHistory(); // 重新加载空的历史记录
-        showToast('观看历史已清空', 'success');
+        history = getViewingHistory();
     } catch (e) {
-        console.error('清除观看历史失败:', e);
-        showToast('清除观看历史失败', 'error');
+        history = [];
     }
+    return showConfirmDialog({
+        title: '清空观看历史',
+        message: '会删掉本机全部观看记录，已同步到云端的记录也会一起删掉。',
+        confirmText: '清空'
+    }).then(ok => {
+        if (!ok) return undefined;
+        return withButtonBusy('historyClearBtn', () => {
+            try {
+                // 不记删除标记的话，下一轮同步会把这些记录从云端并回来
+                if (typeof markSyncDeletedMany === 'function' && history.length) {
+                    markSyncDeletedMany('history', history);
+                }
+                localStorage.removeItem('viewingHistory');
+                loadViewingHistory(); // 重新加载空的历史记录
+                showToast('观看历史已清空', 'success');
+            } catch (e) {
+                console.error('清除观看历史失败:', e);
+                showToast('清除观看历史失败', 'error');
+            }
+            return undefined;
+        });
+    });
 }
 
 // 更新toggleSettings函数以处理历史面板互动

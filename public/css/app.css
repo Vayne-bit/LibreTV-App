@@ -2009,3 +2009,106 @@ button {
     overflow-y: auto;
     margin-top: 4px;
 }
+
+/* 通用确认弹窗：车机上手指点，按钮要够大，主次动作要能一眼分开 */
+.confirm-dialog {
+    width: min(360px, calc(100vw - 48px));
+    padding: 20px 20px 16px;
+    border-radius: 14px;
+    background: var(--surface-1, #191919);
+    box-shadow: 0 18px 48px rgba(0, 0, 0, .55);
+}
+
+.confirm-dialog-title {
+    margin: 0 0 10px;
+    font-size: 17px;
+    font-weight: 600;
+    color: var(--text);
+}
+
+.confirm-dialog-title.danger {
+    color: #f87171;
+}
+
+.confirm-dialog-message {
+    margin: 0 0 18px;
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--text-dim);
+}
+
+.confirm-dialog-actions {
+    display: flex;
+    gap: 10px;
+}
+
+.confirm-dialog-btn {
+    flex: 1;
+    min-height: 42px;
+    border: 0;
+    border-radius: 10px;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text);
+    background: rgba(255, 255, 255, .1);
+    cursor: pointer;
+}
+
+.confirm-dialog-btn:active {
+    background: rgba(255, 255, 255, .18);
+}
+
+.confirm-dialog-btn.danger {
+    color: #fff;
+    background: #dc2626;
+}
+
+.confirm-dialog-btn.danger:active {
+    background: #b91c1c;
+}
+
+.confirm-dialog-btn.primary {
+    color: #fff;
+    background: var(--accent);
+}
+
+/* 耗时操作的按钮状态：禁用 + 转圈，防止反复点击 */
+.is-busy {
+    position: relative;
+    pointer-events: none;
+    opacity: .6;
+}
+
+.is-busy::after {
+    content: '';
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    width: 12px;
+    height: 12px;
+    margin-top: -6px;
+    border: 2px solid rgba(255, 255, 255, .35);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: busy-spin .7s linear infinite;
+}
+
+@keyframes busy-spin {
+    to { transform: rotate(360deg); }
+}
+/* 存储卡片里可点击的行（目前只有「离线下载」，点了跳下载列表） */
+.storage-row-link {
+    cursor: pointer;
+    border-radius: 10px;
+    transition: background .15s ease;
+}
+
+.storage-row-link:active {
+    background: rgba(255, 255, 255, .08);
+}
+
+.storage-row-link .storage-label::after {
+    content: '›';
+    margin-left: 6px;
+    color: var(--text-faint);
+}

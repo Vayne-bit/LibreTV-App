@@ -31,7 +31,13 @@ function isFavorite(sourceCode, id) {
 }
 
 function removeFavorite(sourceCode, id) {
-    saveFavorites(getFavorites().filter(item => !(item.sourceCode === sourceCode && String(item.id) === String(id))));
+    const list = getFavorites();
+    const removed = list.filter(item => item.sourceCode === sourceCode && String(item.id) === String(id));
+    // 收藏和观看历史一样，只删本地会被同步的并集逻辑拉回来，先留删除标记
+    if (typeof markSyncDeleted === 'function') {
+        removed.forEach(item => markSyncDeleted('favorites', item));
+    }
+    saveFavorites(list.filter(item => !(item.sourceCode === sourceCode && String(item.id) === String(id))));
 }
 
 // 返回 true 表示已加入收藏，false 表示已取消收藏

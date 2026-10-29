@@ -169,13 +169,35 @@ function formatStorageSize(bytes) {
     return `${(value / 1000 / 1000 / 1000).toFixed(2)} GB`;
 }
 
-function storageRowHtml(label, value, hint) {
-    return `<div class="storage-row">
+function storageRowHtml(label, value, hint, options) {
+    const opts = options || {};
+    // 可点击的行用 role=button，不再套一层 button（行里有三段文字，套了会破坏布局）
+    const attrs = opts.goto
+        ? ` role="button" tabindex="0" class="storage-row storage-row-link" data-storage-goto="${escapeHtml(opts.goto)}"`
+        : ' class="storage-row"';
+    return `<div${attrs}>
         <span class="storage-label">${escapeHtml(label)}</span>
         <span class="storage-value">${escapeHtml(value)}</span>
         ${hint ? `<span class="storage-hint">${escapeHtml(hint)}</span>` : ''}
     </div>`;
 }
+
+// 存储卡片和诊断面板共用的刷新入口，清完东西两边都要重新读一遍
+function refreshStorageViews() {
+    if (typeof renderStorageCard === 'function') {
+        return Promise.resolve(renderStorageCard()).then(() => {
+            if (typeof refreshDiagnostics === 'function') refreshDiagnostics();
+        }).catch(() => {});
+    }
+    if (typeof refreshDiagnostics === 'function') refreshDiagnostics();
+    return Promise.resolve();
+}
+
+// 下载内容存在 IndexedDB 里，不是磁盘文件，所以「打开下载目录」只能跳到下载列表
+function gotoDownloadsPage() {
+    window.location.hash = '#history/dl';
+}
+
 
 async function renderStorageCard() {
     const container = document.getElementById('storageRows');
@@ -200,7 +222,7 @@ async function renderStorageCard() {
                 const extra = summary.active || summary.queued
                     ? `，进行中 ${summary.active} 集，排队 ${summary.queued} 集`
                     : '';
-                rows.push(storageRowHtml('离线下载', formatStorageSize(summary.bytes), `${summary.count} 集 / 上限 ${formatStorageSize(summary.limit)}${extra}`));
+                rows.push(storageRowHtml('离线下载', formatStorageSize(summary.bytes), `${summary.count} 集 / 上限 ${formatStorageSize(summary.limit)}${extra} · 点这里打开下载列表`, { goto: 'downloads' }));
             }
         }
     }
@@ -216,46 +238,99 @@ async function renderStorageCard() {
     container.innerHTML = rows.length ? rows.join('') : '<div class="storage-row"><span class="storage-label">暂时读不到存储占用</span></div>';
 }
 
-// 清空下载不可恢复，用「再点一次」二次确认，避免误触（车机上是手指点，很容易碰错）
-let storageConfirmTarget = '';
-let storageConfirmTimer = null;
-
-function storageConfirmOnce(action, label) {
-    if (storageConfirmTarget === action) {
-        storageConfirmTarget = '';
-        if (storageConfirmTimer) clearTimeout(storageConfirmTimer);
-        storageConfirmTimer = null;
-        return true;
-    }
-    storageConfirmTarget = action;
-    if (storageConfirmTimer) clearTimeout(storageConfirmTimer);
-    storageConfirmTimer = setTimeout(() => { storageConfirmTarget = ''; storageConfirmTimer = null; }, 4000);
-    showToast(`再点一次确认${label}`, 'warning');
-    return false;
-}
-
+// 清空下载不可恢复，用确认弹窗。之前是「再点一次确认」的 toast，
+// 车机上 toast 一闪就没，点空了会以为清成功了。
 function clearSegmentCacheFromSettings() {
     if (typeof segmentCacheClear !== 'function') {
-        showToast('分片缓存模块没加载', 'error');
-        return;
+        showAlertDialog({ title: '清理失败', message: '分片缓存模块没加载，请刷新页面后再试。' });
+        return Promise.resolve();
     }
-    if (!storageConfirmOnce('cache', '清理分片缓存')) return;
-    segmentCacheClear().then(() => {
-        showToast('分片缓存已清理', 'success');
-        return renderStorageCard();
-    }).catch(() => showToast('清理失败', 'error'));
+    return Promise.resolve()
+        .then(() => segmentCacheSummary())
+        .then(summary => {
+            if (summary && summary.supported && summary.enabled && !summary.entries) {
+                return showAlertDialog({ title: '没有可清理的内容', message: '当前没有缓存的分片，不用清理。' });
+            }
+            const beforeBytes = summary && summary.bytes ? summary.bytes : 0;
+            return showConfirmDialog({
+                title: '清理分片缓存',
+                message: '会删掉已经缓存的全部片段，下次播放要重新下载。离线下载的内容不受影响。',
+                confirmText: '清理'
+            }).then(ok => {
+                if (!ok) return undefined;
+                return withButtonBusy('clearSegmentCacheBtn', () => segmentCacheClear()
+                    // segmentCacheClear 失败时返回 false，以前调用方不看返回值，删不掉也报「已清理」
+                    .then(done => (done ? verifySegmentCacheCleared(beforeBytes) : false))
+                    .then(cleared => {
+                        if (!cleared) {
+                            showAlertDialog({
+                                title: '没清理成功',
+                                message: '缓存还是原来的大小。可能有别的页面正占着这份缓存，关掉其它页面后刷新本页再试一次。'
+                            });
+                            return refreshStorageViews();
+                        }
+                        showToast('分片缓存已清理', 'success');
+                        return refreshStorageViews();
+                    }))
+                    .catch(() => showAlertDialog({ title: '清理失败', message: '清理过程中出错了，刷新本页后再试一次。' }));
+            });
+        })
+        .catch(() => undefined);
+}
+
+// 清完再读一遍，确认真的少了。之前只信 segmentCacheClear 的返回值，
+// 用户看到的现象是「提示清掉了但大小没变」，所以这里以实际读到的数字为准
+function verifySegmentCacheCleared(beforeBytes) {
+    if (!beforeBytes) return Promise.resolve(true);
+    return Promise.resolve()
+        .then(() => segmentCacheSummary())
+        .then(after => (after && Number(after.bytes) < beforeBytes ? true : false))
+        .catch(() => false);
+}
+
+function verifyDownloadsCleared(beforeCount) {
+    if (!beforeCount) return Promise.resolve(true);
+    return Promise.resolve()
+        .then(() => downloadSummary())
+        .then(after => (after && !after.count && !after.active && !after.queued ? true : false))
+        .catch(() => false);
 }
 
 function clearDownloadsFromSettings() {
     if (typeof downloadClear !== 'function') {
-        showToast('下载模块没加载', 'error');
-        return;
+        showAlertDialog({ title: '清空失败', message: '下载模块没加载，请刷新页面后再试。' });
+        return Promise.resolve();
     }
-    if (!storageConfirmOnce('downloads', '清空离线下载')) return;
-    downloadClear().then(() => {
-        showToast('离线下载已清空', 'success');
-        return renderStorageCard();
-    }).catch(() => showToast('清空失败', 'error'));
+    return Promise.resolve()
+        .then(() => downloadSummary())
+        .then(summary => {
+            if (summary && summary.supported && !summary.count && !summary.active && !summary.queued) {
+                return showAlertDialog({ title: '没有可清空的内容', message: '当前没有离线下载，不用清空。' });
+            }
+            const beforeCount = summary && summary.count ? summary.count : 0;
+            return showConfirmDialog({
+                title: '清空离线下载',
+                message: '会删掉全部已下载和正在下载的集数，重新看要重新下。这个操作不可恢复。',
+                confirmText: '清空'
+            }).then(ok => {
+                if (!ok) return undefined;
+                return withButtonBusy('clearDownloadsBtn', () => downloadClear()
+                    .then(done => (done === false ? false : verifyDownloadsCleared(beforeCount)))
+                    .then(cleared => {
+                        if (!cleared) {
+                            showAlertDialog({
+                                title: '没清空成功',
+                                message: '下载记录还在。请刷新本页后再试一次。'
+                            });
+                            return refreshStorageViews();
+                        }
+                        showToast('离线下载已清空', 'success');
+                        return refreshStorageViews();
+                    }))
+                    .catch(() => showAlertDialog({ title: '清空失败', message: '清空过程中出错了，刷新本页后再试一次。' }));
+            });
+        })
+        .catch(() => undefined);
 }
 
 async function collectDiagnostics() {
@@ -352,8 +427,30 @@ function copyDiagnostics() {
 function setupDiagnostics() {
     const copyBtn = document.getElementById('diagnosticsCopyBtn');
     const refreshBtn = document.getElementById('diagnosticsRefreshBtn');
-    if (copyBtn) copyBtn.addEventListener('click', copyDiagnostics);
-    if (refreshBtn) refreshBtn.addEventListener('click', refreshDiagnostics);
+    if (copyBtn) copyBtn.addEventListener('click', () => withButtonBusy(copyBtn, copyDiagnostics));
+    if (refreshBtn) {
+        refreshBtn.addEventListener('click', () => withButtonBusy(refreshBtn, () => {
+            if (typeof renderStorageCard === 'function') return Promise.resolve(renderStorageCard()).then(refreshDiagnostics);
+            refreshDiagnostics();
+            return undefined;
+        }));
+    }
+
+    // 存储卡片里「离线下载」那行可点，直接跳到下载列表
+    const storageRows = document.getElementById('storageRows');
+    if (storageRows) {
+        storageRows.addEventListener('click', e => {
+            const row = e.target.closest('[data-storage-goto]');
+            if (row) gotoDownloadsPage();
+        });
+        storageRows.addEventListener('keydown', e => {
+            if (e.key !== 'Enter' && e.key !== ' ') return;
+            const row = e.target.closest('[data-storage-goto]');
+            if (!row) return;
+            e.preventDefault();
+            gotoDownloadsPage();
+        });
+    }
 
     const page = document.getElementById('page-settings');
     const visible = () => !!page && !page.classList.contains('hidden');

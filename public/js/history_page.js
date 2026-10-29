@@ -72,6 +72,9 @@ function setupHistoryPage() {
             e.stopPropagation();
             const item = history[parseInt(del.dataset.historyDelete, 10)];
             if (item) {
+                // 只删 localStorage 不够：同步是纯并集，下一轮拉取会把它从云端并回来，
+                // 所以要先留一个删除标记，合并时按标记过滤
+                if (typeof markSyncDeleted === 'function') markSyncDeleted('history', item);
                 localStorage.setItem('viewingHistory', JSON.stringify(history.filter(h => h !== item)));
                 renderHistoryPage();
                 showToast('已删除该记录', 'success');

@@ -4,7 +4,8 @@ const PLAYER_ICONS = {
     next: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M6 6.5v11a1 1 0 0 0 1.52.85l8.5-5.5a1 1 0 0 0 0-1.7l-8.5-5.5A1 1 0 0 0 6 6.5zM17 6h2v12h-2z"/></svg>',
     fullscreenOn: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M4 9V4h5v2H6v3H4zm11-5h5v5h-2V6h-3V4zM6 15v3h3v2H4v-5h2zm12 0h2v5h-5v-2h3v-3z"/></svg>',
     fullscreenOff: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M7 4h2v5H4V7h3V4zm8 0h2v3h3v2h-5V4zM4 15h5v5H7v-3H4v-2zm11 0h5v2h-3v3h-2v-5z"/></svg>',
-    download: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M12 3a1 1 0 0 1 1 1v8.6l2.3-2.3a1 1 0 0 1 1.4 1.4l-4 4a1 1 0 0 1-1.4 0l-4-4a1 1 0 0 1 1.4-1.4L11 12.6V4a1 1 0 0 1 1-1zM5 18a1 1 0 0 1 1 1h12a1 1 0 0 1 1-1v1a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-1z"/></svg>'
+    download: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M12 3a1 1 0 0 1 1 1v8.6l2.3-2.3a1 1 0 0 1 1.4 1.4l-4 4a1 1 0 0 1-1.4 0l-4-4a1 1 0 0 1 1.4-1.4L11 12.6V4a1 1 0 0 1 1-1zM5 18a1 1 0 0 1 1 1h12a1 1 0 0 1 1-1v1a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-1z"/></svg>',
+    introMark: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M6 3.5a1 1 0 0 1 1 1v15a1 1 0 0 1-2 0v-15a1 1 0 0 1 1-1zM9 4.6a1 1 0 0 1 1.5-.87l8 5.4a1 1 0 0 1 0 1.74l-8 5.4A1 1 0 0 1 9 15.4V4.6z"/></svg>'
 };
 
 const HLS_BASE_CONFIG = {
@@ -172,7 +173,8 @@ function buildPlayerSettings() {
     const savedFit = localStorage.getItem('playerObjectFit') || 'contain';
     const gestureEnabled = isGestureEnabled();
     const savedBufferLevel = readBufferLevel();
-    return [{
+    const savedIntroSkip = readIntroSkip(currentVideoTitle);
+    const items = [{
         html: '画面模式',
         width: 200,
         tooltip: { contain: '适应', cover: '裁剪填满', fill: '拉伸' }[savedFit],
@@ -213,7 +215,100 @@ function buildPlayerSettings() {
             }
             return item.html;
         }
+    }, {
+        name: 'intro-skip',
+        html: '跳过片头',
+        width: 200,
+        tooltip: introSkipLabel(savedIntroSkip),
+        selector: INTRO_SKIP_OPTIONS.map(seconds => ({
+            html: introSkipLabel(seconds),
+            value: String(seconds),
+            default: seconds === savedIntroSkip
+        })),
+        onSelect(item) {
+            const seconds = Number(item.value) || 0;
+            writeIntroSkip(currentVideoTitle, seconds);
+            // 已经播过片头就不往回跳；还在片头里就立刻跳过去
+            if (seconds > 0 && art && art.video && art.video.currentTime < seconds) {
+                art.currentTime = seconds;
+                art.notice.show = `已跳过片头 ${formatTime(seconds)}`;
+            }
+            return introSkipLabel(seconds);
+        }
     }];
+    // ArtPlayer 给设置项定义了 tooltip 的 setter，控制条上标记之后能实时改这里的显示
+    introSkipSettingItem = items.find(item => item.name === 'intro-skip') || null;
+    return items;
+}
+
+// 指向「跳过片头」设置项，控制条上标记片头之后同步更新它的显示值
+let introSkipSettingItem = null;
+
+// 片头长度按剧名记，同一部剧各集共用一个值；换一部剧就是各自独立的
+const INTRO_SKIP_STORAGE_KEY = 'introSkipMap';
+const INTRO_SKIP_OPTIONS = [0, 30, 60, 90, 120, 180, 300];
+
+function readIntroSkipMap() {
+    try {
+        const raw = localStorage.getItem(INTRO_SKIP_STORAGE_KEY);
+        const map = raw ? JSON.parse(raw) : null;
+        return map && typeof map === 'object' ? map : {};
+    } catch (e) {
+        return {};
+    }
+}
+
+function readIntroSkip(title) {
+    if (!title) return 0;
+    const seconds = Number(readIntroSkipMap()[title]);
+    return Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+}
+
+function writeIntroSkip(title, seconds) {
+    if (!title) return;
+    const map = readIntroSkipMap();
+    if (seconds > 0) map[title] = seconds;
+    else delete map[title];
+    try {
+        localStorage.setItem(INTRO_SKIP_STORAGE_KEY, JSON.stringify(map));
+    } catch (e) {
+        // 存储写不进去就算了，下次再设一次
+    }
+}
+
+function introSkipLabel(seconds) {
+    if (!seconds) return '关';
+    if (seconds < 60) return `${seconds} 秒`;
+    const minutes = seconds / 60;
+    return Number.isInteger(minutes) ? `${minutes} 分钟` : `${seconds} 秒`;
+}
+
+// 控制条上的「以当前位置为片头结束」：播到片头结束那一刻点一下，就把这个秒数记给当前这部剧
+function markIntroEndHere() {
+    if (!art || !art.video) return;
+    if (!currentVideoTitle) {
+        if (art.notice) art.notice.show = '还不知道这是哪部剧，先播一会儿再试';
+        return;
+    }
+    const seconds = Math.floor(art.video.currentTime || 0);
+    if (seconds < 10) {
+        if (art.notice) art.notice.show = '当前位置太靠前，拖到片头结束的地方再点';
+        return;
+    }
+    const duration = art.video.duration || 0;
+    if (duration > 0 && seconds > duration - 30) {
+        if (art.notice) art.notice.show = '已经接近结尾了，这里不像片头结束的位置';
+        return;
+    }
+    writeIntroSkip(currentVideoTitle, seconds);
+    if (introSkipSettingItem) {
+        try {
+            introSkipSettingItem.tooltip = introSkipLabel(seconds);
+        } catch (e) {
+            // 设置面板还没渲染出来，下次打开会读到新值
+        }
+    }
+    if (art.notice) art.notice.show = `已记住：片头到 ${formatTime(seconds)}，下次自动跳过`;
 }
 
 // 画质菜单由官方 hls-control 插件提供，依赖 art.hls 实例，非 m3u8 源不注册
@@ -277,6 +372,13 @@ function initPlayer(videoUrl) {
             html: PLAYER_ICONS.download,
             tooltip: '下载本集',
             click: () => requestEpisodeDownload()
+        }, {
+            name: 'intro-mark',
+            position: 'left',
+            index: 17,
+            html: PLAYER_ICONS.introMark,
+            tooltip: '以当前位置为片头结束',
+            click: () => markIntroEndHere()
         }],
         moreVideoAttr: { preload: 'auto', 'x5-video-player-type': 'h5' }
     });
@@ -288,6 +390,7 @@ function initPlayer(videoUrl) {
         if (typeof setupPlayerGestures === 'function') setupPlayerGestures();
         if (typeof setupPlayerBuffer === 'function') setupPlayerBuffer(art);
         if (typeof setupFullscreenOverlay === 'function') setupFullscreenOverlay(art);
+        if (typeof setupSeekPill === 'function') setupSeekPill(art);
     });
 
     art.on('video:loadedmetadata', () => {
@@ -298,6 +401,13 @@ function initPlayer(videoUrl) {
         if (target > 10 && duration > 0 && target < duration - 5) {
             art.currentTime = target;
             art.notice.show = `已为你跳转到上次观看位置 ${formatTime(target)}`;
+        } else {
+            // 没有可用的续播位置才跳片头；已经看过的部分不往回跳
+            const introSkip = readIntroSkip(currentVideoTitle);
+            if (introSkip > 0 && duration > introSkip + 10) {
+                art.currentTime = introSkip;
+                art.notice.show = `已跳过片头 ${formatTime(introSkip)}`;
+            }
         }
         // mp4/flv 等单码率源拿不到 hls.levels，用视频元素的真实尺寸兜底
         if (!art.hls && art.video.videoHeight) {

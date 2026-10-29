@@ -811,6 +811,7 @@ async function downloadClear() {
     await rows.reduce((chain, record) => chain.then(() => deleteEpisodeDownload(record.key)), Promise.resolve());
     await refreshDownloadedKeys();
     notifyDownloadListeners();
+    return rows.length;
 }
 
 // 下载只在页面停留期间跑，翻页就断。任何页面加载时都自动接着下，

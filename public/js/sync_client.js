@@ -637,9 +637,17 @@ function setupSyncSettings() {
     if (userInput && !userInput.value) userInput.value = creds ? creds.username : '';
     if (passInput && !passInput.value) passInput.value = creds ? creds.password : '';
 
+    // 这些按钮都会发网络请求，点下去到有结果之间界面没有变化，
+    // 用户会以为没点上而反复点，所以统一进禁用态转圈
     const bind = (id, handler) => {
         const el = document.getElementById(id);
-        if (el) el.addEventListener('click', handler);
+        if (!el) return;
+        el.addEventListener('click', () => {
+            if (typeof withButtonBusy === 'function') {
+                return withButtonBusy(el, () => handler());
+            }
+            return handler();
+        });
     };
     bind('syncCreateBtn', handleSyncCreate);
     bind('syncJoinBtn', handleSyncJoin);
