@@ -230,8 +230,17 @@ async function renderStorageCard() {
     if (navigator.storage && typeof navigator.storage.estimate === 'function') {
         const quota = await navigator.storage.estimate().catch(() => null);
         if (quota && quota.quota) {
+            // quota 是浏览器分给本站的额度，跟磁盘剩余空间不是一回事，
+            // 所以这里既要说清真实能存多少，也要说清这个数是从哪来的
             const free = Math.max(0, quota.quota - (quota.usage || 0));
-            rows.push(storageRowHtml('剩余空间', formatStorageSize(free), `总配额 ${formatStorageSize(quota.quota)}`));
+            const cap = typeof DOWNLOAD_LIMIT_BYTES === 'number' && DOWNLOAD_LIMIT_BYTES > 0
+                ? DOWNLOAD_LIMIT_BYTES
+                : 0;
+            const usable = cap ? Math.min(free, cap) : free;
+            const hint = cap && free > cap
+                ? `浏览器配额还剩 ${formatStorageSize(free)}，离线下载自身上限 ${formatStorageSize(cap)}`
+                : `浏览器给本站的配额还剩 ${formatStorageSize(free)}，这是浏览器限制，不是磁盘剩余空间`;
+            rows.push(storageRowHtml('还能存多少', formatStorageSize(usable), hint));
         }
     }
 

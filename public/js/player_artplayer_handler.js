@@ -64,8 +64,57 @@ function applyBufferPreset(hls, preset) {
 
 let playbackStarted = false;
 let pendingSeekPosition = 0;
+let pendingVideoSeek = 0;
+let pendingVideoSeekNotice = '';
+let pendingVideoSeekTimer = null;
 let slowLoadTimer = null;
 let screenWakeLock = null;
+
+function clearPendingVideoSeek() {
+    pendingVideoSeek = 0;
+    pendingVideoSeekNotice = '';
+    if (pendingVideoSeekTimer) {
+        clearInterval(pendingVideoSeekTimer);
+        pendingVideoSeekTimer = null;
+    }
+}
+
+// 直接写 video.currentTime，不走 art.currentTime。
+// art 的 setter 会按 art.duration 夹紧，而 hls.js 刚切源时 video.duration 还是
+// Infinity、art.duration 会读成 0，夹紧后等于 0，表现就是「跳转没反应」。
+function tryPendingVideoSeek() {
+    if (!pendingVideoSeek || !art || !art.video) return false;
+    const video = art.video;
+    const target = pendingVideoSeek;
+    // 已经在目标之后（用户自己拖过去了）就别往回跳
+    if (video.currentTime >= target - 1) {
+        clearPendingVideoSeek();
+        return true;
+    }
+    // 时长还没定下来、或者可跳范围还没铺到目标位置，都等下一次
+    if (!Number.isFinite(video.duration) || video.duration <= target + 5) return false;
+    const seekable = video.seekable;
+    if (seekable && seekable.length && seekable.end(seekable.length - 1) <= target + 1) return false;
+    const notice = pendingVideoSeekNotice;
+    clearPendingVideoSeek();
+    video.currentTime = target;
+    if (notice && art.notice) art.notice.show = notice;
+    return true;
+}
+
+// 切源之后要等元数据就绪才能跳，这里重试到能跳为止（最多 6 秒）
+function scheduleVideoSeek(seconds, notice) {
+    clearPendingVideoSeek();
+    if (!(seconds > 0)) return;
+    pendingVideoSeek = seconds;
+    pendingVideoSeekNotice = notice || '';
+    if (tryPendingVideoSeek()) return;
+    let tries = 0;
+    pendingVideoSeekTimer = setInterval(() => {
+        tries += 1;
+        if (tries > 24 || tryPendingVideoSeek()) clearPendingVideoSeek();
+    }, 250);
+}
 
 function getVideoType(url) {
     const path = String(url || '').split('?')[0].toLowerCase();
@@ -230,8 +279,7 @@ function buildPlayerSettings() {
             writeIntroSkip(currentVideoTitle, seconds);
             // 已经播过片头就不往回跳；还在片头里就立刻跳过去
             if (seconds > 0 && art && art.video && art.video.currentTime < seconds) {
-                art.currentTime = seconds;
-                art.notice.show = `已跳过片头 ${formatTime(seconds)}`;
+                scheduleVideoSeek(seconds, `已跳过片头 ${formatTime(seconds)}`);
             }
             return introSkipLabel(seconds);
         }
@@ -399,15 +447,11 @@ function initPlayer(videoUrl) {
         const target = pendingSeekPosition;
         pendingSeekPosition = 0;
         if (target > 10 && duration > 0 && target < duration - 5) {
-            art.currentTime = target;
-            art.notice.show = `已为你跳转到上次观看位置 ${formatTime(target)}`;
+            scheduleVideoSeek(target, `已为你跳转到上次观看位置 ${formatTime(target)}`);
         } else {
             // 没有可用的续播位置才跳片头；已经看过的部分不往回跳
             const introSkip = readIntroSkip(currentVideoTitle);
-            if (introSkip > 0 && duration > introSkip + 10) {
-                art.currentTime = introSkip;
-                art.notice.show = `已跳过片头 ${formatTime(introSkip)}`;
-            }
+            if (introSkip > 0) scheduleVideoSeek(introSkip, `已跳过片头 ${formatTime(introSkip)}`);
         }
         // mp4/flv 等单码率源拿不到 hls.levels，用视频元素的真实尺寸兜底
         if (!art.hls && art.video.videoHeight) {
@@ -482,13 +526,20 @@ window.__libretvNativeBack = function () {
 function switchPlayerUrl(url, startPosition = 0) {
     playbackStarted = false;
     videoHasEnded = false;
+    // 换集/换源时把上一集没来得及执行的跳转作废，否则会跳错位置
+    clearPendingVideoSeek();
     pendingSeekPosition = startPosition;
     hidePlayerError();
     if (!art) { initPlayer(url); return; }
     const type = getVideoType(url);
     if (type !== 'm3u8' && type !== 'flv') destroyStreamEngines(art);
     art.option.type = type;
-    art.switchUrl(url).catch(e => console.warn('switchUrl failed', e));
+    // switchUrl 解析后 duration 才是新片源的，这里补一次兜底，
+    // 免得 loadedmetadata 没触发时片头跳过完全失效
+    art.switchUrl(url).then(() => {
+        const introSkip = startPosition > 0 ? 0 : readIntroSkip(currentVideoTitle);
+        if (introSkip > 0) scheduleVideoSeek(introSkip, `已跳过片头 ${formatTime(introSkip)}`);
+    }).catch(e => console.warn('switchUrl failed', e));
     updateNextEpisodeControl();
     armSlowLoadHint();
 }
