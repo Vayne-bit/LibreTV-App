@@ -9,6 +9,16 @@ const FS_BACK_ICON = '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidde
     + '<path d="M15.5 4.5 8 12l7.5 7.5" fill="none" stroke="currentColor" '
     + 'stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
+// 下载和片头标记原本挂在播放器控制条上，手机上会把「全屏」按钮挤出屏幕，
+// 全屏时又摸不到下面的按钮，所以统一挪到顶部条右上角
+const FS_DOWNLOAD_ICON = '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="currentColor">'
+    + '<path d="M12 3a1 1 0 0 1 1 1v8.6l2.3-2.3a1 1 0 0 1 1.4 1.4l-4 4a1 1 0 0 1-1.4 0l-4-4a1 1 0 0 1 1.4-1.4L11 12.6V4a1 1 0 0 1 1-1z"/>'
+    + '<path d="M5 18a1 1 0 0 1 1 1h12a1 1 0 0 1 1-1v1a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-1z"/></svg>';
+
+const FS_INTRO_ICON = '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="currentColor">'
+    + '<path d="M6 3.5a1 1 0 0 1 1 1v15a1 1 0 0 1-2 0v-15a1 1 0 0 1 1-1z"/>'
+    + '<path d="M9 4.6a1 1 0 0 1 1.5-.87l8 5.4a1 1 0 0 1 0 1.74l-8 5.4A1 1 0 0 1 9 15.4V4.6z"/></svg>';
+
 const fsOverlayState = {
     bound: false,
     root: null,
@@ -17,6 +27,8 @@ const fsOverlayState = {
     metaEl: null,
     batteryEl: null,
     clockEl: null,
+    downloadEl: null,
+    introEl: null,
     clockTimer: null,
     batteryManager: null
 };
@@ -100,6 +112,28 @@ function setupBatteryWatch() {
     }).catch(() => renderBattery(NaN, false));
 }
 
+// 顶部条上的动作按钮：下载本集、以当前位置为片头结束。
+// 这两个动作原本在播放器控制条里，手机上挤掉「全屏」按钮，所以搬到这里。
+function runFsOverlayAction(name, event) {
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+    if (name === 'download') {
+        if (typeof requestEpisodeDownload === 'function') requestEpisodeDownload();
+        return;
+    }
+    if (name === 'intro' && typeof markIntroEndHere === 'function') markIntroEndHere();
+}
+
+function bindFsOverlayAction(el, name) {
+    if (!el) return;
+    const handler = event => runFsOverlayAction(name, event);
+    el.addEventListener('click', handler);
+    // 车机上 touchstart 比 click 可靠，preventDefault 之后浏览器不会再补发 click
+    el.addEventListener('touchstart', handler, { passive: false });
+}
+
 function ensureFsOverlay() {
     const host = art && art.template && art.template.$player;
     if (!host) return null;
@@ -115,6 +149,8 @@ function ensureFsOverlay() {
             <span class="player-fs-topbar-meta hidden"></span>
         </div>
         <div class="player-fs-topbar-side">
+            <button type="button" class="player-fs-topbar-action" data-fs-action="download" aria-label="下载本集" title="下载本集">${FS_DOWNLOAD_ICON}</button>
+            <button type="button" class="player-fs-topbar-action" data-fs-action="intro" aria-label="以当前位置为片头结束" title="以当前位置为片头结束">${FS_INTRO_ICON}</button>
             <span class="player-fs-topbar-clock"></span>
             <span class="player-fs-topbar-battery hidden"></span>
         </div>`;
@@ -125,10 +161,18 @@ function ensureFsOverlay() {
     fsOverlayState.metaEl = root.querySelector('.player-fs-topbar-meta');
     fsOverlayState.batteryEl = root.querySelector('.player-fs-topbar-battery');
     fsOverlayState.clockEl = root.querySelector('.player-fs-topbar-clock');
+    fsOverlayState.downloadEl = root.querySelector('[data-fs-action="download"]');
+    fsOverlayState.introEl = root.querySelector('[data-fs-action="intro"]');
     if (fsOverlayState.backEl) {
         fsOverlayState.backEl.addEventListener('click', exitFullscreenFromOverlay);
         // 车机上 touchstart 比 click 可靠，preventDefault 之后浏览器不会再补发 click
         fsOverlayState.backEl.addEventListener('touchstart', exitFullscreenFromOverlay, { passive: false });
+    }
+    bindFsOverlayAction(fsOverlayState.downloadEl, 'download');
+    bindFsOverlayAction(fsOverlayState.introEl, 'intro');
+    // 没有下载模块时（比如播放页没加载 player_download.js）不留一个点不动的按钮
+    if (fsOverlayState.downloadEl && typeof requestEpisodeDownload !== 'function') {
+        fsOverlayState.downloadEl.classList.add('hidden');
     }
     return root;
 }

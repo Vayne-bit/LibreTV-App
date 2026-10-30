@@ -720,6 +720,39 @@ body.player-fullscreen {
     background: rgba(255, 255, 255, 0.16);
 }
 
+/* 顶部条上的下载/片头标记：从播放器控制条挪过来的，尺寸比返回箭头略小 */
+.player-fs-topbar-action {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    pointer-events: auto;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.player-fs-topbar-action:active {
+    background: rgba(255, 255, 255, 0.16);
+}
+
+.player-fs-topbar-action.hidden {
+    display: none;
+}
+
+/* 竖屏窄屏上顶部条要塞下返回、标题、两个动作按钮和电量，时钟让位 */
+@media (max-width: 420px) {
+    .player-fs-topbar-clock {
+        display: none;
+    }
+}
+
 .player-fs-topbar-main {
     display: flex;
     flex-direction: column;

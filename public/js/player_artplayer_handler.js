@@ -3,9 +3,7 @@
 const PLAYER_ICONS = {
     next: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M6 6.5v11a1 1 0 0 0 1.52.85l8.5-5.5a1 1 0 0 0 0-1.7l-8.5-5.5A1 1 0 0 0 6 6.5zM17 6h2v12h-2z"/></svg>',
     fullscreenOn: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M4 9V4h5v2H6v3H4zm11-5h5v5h-2V6h-3V4zM6 15v3h3v2H4v-5h2zm12 0h2v5h-5v-2h3v-3z"/></svg>',
-    fullscreenOff: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M7 4h2v5H4V7h3V4zm8 0h2v3h3v2h-5V4zM4 15h5v5H7v-3H4v-2zm11 0h5v2h-3v3h-2v-5z"/></svg>',
-    download: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M12 3a1 1 0 0 1 1 1v8.6l2.3-2.3a1 1 0 0 1 1.4 1.4l-4 4a1 1 0 0 1-1.4 0l-4-4a1 1 0 0 1 1.4-1.4L11 12.6V4a1 1 0 0 1 1-1zM5 18a1 1 0 0 1 1 1h12a1 1 0 0 1 1-1v1a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-1z"/></svg>',
-    introMark: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M6 3.5a1 1 0 0 1 1 1v15a1 1 0 0 1-2 0v-15a1 1 0 0 1 1-1zM9 4.6a1 1 0 0 1 1.5-.87l8 5.4a1 1 0 0 1 0 1.74l-8 5.4A1 1 0 0 1 9 15.4V4.6z"/></svg>'
+    fullscreenOff: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M7 4h2v5H4V7h3V4zm8 0h2v3h3v2h-5V4zM4 15h5v5H7v-3H4v-2zm11 0h5v2h-3v3h-2v-5z"/></svg>'
 };
 
 const HLS_BASE_CONFIG = {
@@ -210,12 +208,34 @@ function playFlv(video, url, instance) {
     instance.flv = flv;
 }
 
-function requestEpisodeDownload() {
-    if (typeof toggleEpisodeDownload !== 'function') return;
+function applyEpisodeDownloadToggle() {
     const result = toggleEpisodeDownload(currentEpisodeIndex);
     const message = (result && (result.message || result.reason)) || '无法下载这一集';
     if (art && art.notice) art.notice.show = message;
     if (typeof updateEpisodeDownloadBadges === 'function') updateEpisodeDownloadBadges();
+}
+
+function requestEpisodeDownload() {
+    if (typeof toggleEpisodeDownload !== 'function') return;
+    const downloaded = typeof isEpisodeDownloaded === 'function'
+        && isEpisodeDownloaded(currentVideoTitle, currentEpisodeIndex);
+    if (!downloaded) {
+        applyEpisodeDownloadToggle();
+        return;
+    }
+    // 已经下过的时候再点一下就是删除。这个入口现在在全屏顶部条上，
+    // 全屏时误触代价大，所以先问一句再删。
+    if (typeof showConfirmDialog !== 'function') {
+        applyEpisodeDownloadToggle();
+        return;
+    }
+    showConfirmDialog({
+        title: '删除这一集的离线文件',
+        message: '删掉之后再看要重新下载。已经下好的其它集不受影响。',
+        confirmText: '删除'
+    }).then(ok => {
+        if (ok) applyEpisodeDownloadToggle();
+    });
 }
 
 function buildPlayerSettings() {
@@ -283,6 +303,16 @@ function buildPlayerSettings() {
             }
             return introSkipLabel(seconds);
         }
+    }, {
+        // ArtPlayer 的设置项带 onClick 会渲染成一个可点的按钮。
+        // 片头标记按钮从控制条挪走后，这里留一个不进全屏也能点到的入口。
+        name: 'intro-mark',
+        html: '以当前位置为片头结束',
+        width: 200,
+        tooltip: introSkipLabel(savedIntroSkip),
+        onClick() {
+            return markIntroEndHere();
+        }
     }];
     // ArtPlayer 给设置项定义了 tooltip 的 setter，控制条上标记之后能实时改这里的显示
     introSkipSettingItem = items.find(item => item.name === 'intro-skip') || null;
@@ -331,22 +361,23 @@ function introSkipLabel(seconds) {
     return Number.isInteger(minutes) ? `${minutes} 分钟` : `${seconds} 秒`;
 }
 
-// 控制条上的「以当前位置为片头结束」：播到片头结束那一刻点一下，就把这个秒数记给当前这部剧
+// 全屏顶部条和设置面板里的「以当前位置为片头结束」：
+// 播到片头结束那一刻点一下，就把这个秒数记给当前这部剧
 function markIntroEndHere() {
-    if (!art || !art.video) return;
+    if (!art || !art.video) return '不可用';
     if (!currentVideoTitle) {
         if (art.notice) art.notice.show = '还不知道这是哪部剧，先播一会儿再试';
-        return;
+        return '未知';
     }
     const seconds = Math.floor(art.video.currentTime || 0);
     if (seconds < 10) {
         if (art.notice) art.notice.show = '当前位置太靠前，拖到片头结束的地方再点';
-        return;
+        return '太靠前';
     }
     const duration = art.video.duration || 0;
     if (duration > 0 && seconds > duration - 30) {
         if (art.notice) art.notice.show = '已经接近结尾了，这里不像片头结束的位置';
-        return;
+        return '接近结尾';
     }
     writeIntroSkip(currentVideoTitle, seconds);
     if (introSkipSettingItem) {
@@ -357,6 +388,8 @@ function markIntroEndHere() {
         }
     }
     if (art.notice) art.notice.show = `已记住：片头到 ${formatTime(seconds)}，下次自动跳过`;
+    // 返回值会变成设置面板那一行右侧的提示文字
+    return introSkipLabel(seconds);
 }
 
 // 画质菜单由官方 hls-control 插件提供，依赖 art.hls 实例，非 m3u8 源不注册
@@ -406,6 +439,8 @@ function initPlayer(videoUrl) {
         settings: buildPlayerSettings(),
         plugins: [buildHlsControlPlugin()].filter(Boolean),
         icons: androidBridge ? { fullscreenWebOn: PLAYER_ICONS.fullscreenOn, fullscreenWebOff: PLAYER_ICONS.fullscreenOff } : {},
+        // 控制条只留「下一集」一个自定义按钮。之前这里还挂了下载和片头标记，
+        // 361px 宽的手机上会把「全屏」按钮挤出屏幕，两个动作都挪到全屏顶部条去了。
         controls: [{
             name: 'next-episode',
             position: 'left',
@@ -413,20 +448,6 @@ function initPlayer(videoUrl) {
             html: PLAYER_ICONS.next,
             tooltip: '下一集',
             click: () => playNextEpisode()
-        }, {
-            name: 'download-episode',
-            position: 'left',
-            index: 16,
-            html: PLAYER_ICONS.download,
-            tooltip: '下载本集',
-            click: () => requestEpisodeDownload()
-        }, {
-            name: 'intro-mark',
-            position: 'left',
-            index: 17,
-            html: PLAYER_ICONS.introMark,
-            tooltip: '以当前位置为片头结束',
-            click: () => markIntroEndHere()
         }],
         moreVideoAttr: { preload: 'auto', 'x5-video-player-type': 'h5' }
     });
