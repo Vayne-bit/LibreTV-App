@@ -2112,3 +2112,61 @@ button {
     margin-left: 6px;
     color: var(--text-faint);
 }
+/* ============ 老内核兼容（Chrome 88 以前） ============
+   下面每一条都关在 @supports not 里：现代浏览器解析时直接跳过整块，
+   现有布局行为完全不变；老内核才吃到这些兜底。 */
+
+/* inset 简写是 Chrome 87 才有的，老内核上这些绝对定位元素会退回静态位置 */
+@supports not (inset: 0) {
+    .toggle input,
+    .toggle .toggle-bg,
+    .banner-slide::after,
+    .sheet-mask,
+    #loading,
+    .password-modal,
+    .dialog-mask,
+    .sync-overlay {
+        top: 0;
+        right: 0;
+        bottom: 0;
+        left: 0;
+    }
+
+    .banner-bg {
+        top: -20px;
+        right: -20px;
+        bottom: -20px;
+        left: -20px;
+    }
+}
+
+/* aspect-ratio 是 Chrome 88 才有的。下面这几个封面只靠它撑高度，老内核上会塌成 0。
+   用 ::before 的百分比 padding 撑出 2:3 —— 百分比 padding 按元素自身内容宽度算，
+   所以固定宽度的 flex 项和自适应宽度的网格项都能算对；图片改成绝对定位铺满。 */
+@supports not (aspect-ratio: 2 / 3) {
+    .poster-thumb::before,
+    .history-cover::before,
+    .detail-poster::before,
+    .intro-poster::before {
+        content: '';
+        display: block;
+        padding-top: 150%;
+    }
+
+    .poster-thumb img,
+    .history-cover img,
+    .detail-poster img,
+    .intro-poster img {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+    }
+
+    .history-cover,
+    .detail-poster,
+    .intro-poster {
+        position: relative;
+    }
+}

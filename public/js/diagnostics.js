@@ -342,6 +342,46 @@ function clearDownloadsFromSettings() {
         .catch(() => undefined);
 }
 
+// 老内核（Chrome 88 以前）缺 aspect-ratio，播放器会塌成 0 高。
+// 这里把关键特性的支持情况和实际量到的尺寸都打出来，免得再靠猜。
+function compatibilityRows() {
+    const rows = ['【兼容性】'];
+    const supports = (prop, value) => {
+        try {
+            if (typeof CSS === 'undefined' || !CSS || typeof CSS.supports !== 'function') return false;
+            return !!CSS.supports(prop, value);
+        } catch (e) {
+            return false;
+        }
+    };
+    const mark = ok => (ok ? '是' : '否');
+    rows.push(`aspect-ratio：${mark(supports('aspect-ratio', '16 / 9'))}`);
+    rows.push(`inset 简写：${mark(supports('inset', '0'))}`);
+    rows.push(`dvh 单位：${mark(supports('height', '100dvh'))}`);
+
+    const size = selector => {
+        let el;
+        try {
+            el = document.querySelector(selector);
+        } catch (e) {
+            return '读取失败';
+        }
+        if (!el) return '不存在';
+        try {
+            const rect = el.getBoundingClientRect();
+            return `${Math.round(rect.width)}×${Math.round(rect.height)}`;
+        } catch (e) {
+            return '读取失败';
+        }
+    };
+    const shell = document.querySelector('.player-shell');
+    const inline = shell && shell.style && shell.style.height ? shell.style.height : '无';
+    rows.push(`播放器外壳：${size('.player-shell')}，内联高度 ${inline}`);
+    rows.push(`播放器盒子：${size('.player-box')}`);
+    rows.push(`视频元素：${size('video')}`);
+    return rows;
+}
+
 async function collectDiagnostics() {
     const vv = window.visualViewport;
     const rows = [];
@@ -365,6 +405,8 @@ async function collectDiagnostics() {
     add('方向', diagnosticsSafe(() => (window.matchMedia('(orientation: landscape)').matches ? '横屏' : '竖屏')));
     add('页面滚动锁', document.body.style.overflow === 'hidden' ? '已锁定' : '正常');
     add('采集时间', new Date().toLocaleString('zh-CN', { hour12: false }));
+    rows.push('');
+    rows.push(...compatibilityRows());
     // 缓冲相关的现场数据放在最后，方便复制后直接看
     rows.push('');
     rows.push('【上次播放】');

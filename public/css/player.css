@@ -129,6 +129,7 @@
 
 .watch-tabs {
     position: sticky;
+    top: min(calc(100vw * 9 / 16), 100vh);
     top: min(calc(100vw * 9 / 16), 100dvh);
     z-index: 20;
     display: flex;
@@ -400,6 +401,7 @@ body.player-fullscreen {
         z-index: 30;
         border-radius: 12px;
         overflow: hidden;
+        max-height: calc(100vh - 180px);
         max-height: calc(100dvh - 180px);
     }
 
@@ -791,4 +793,28 @@ body.player-fullscreen {
 .player-fs-topbar {
     padding-left: calc(14px + env(safe-area-inset-left, 0px));
     padding-right: calc(14px + env(safe-area-inset-right, 0px));
+}
+
+/* ============ 老内核兼容（Chrome 88 以前） ============
+   下面每一条都关在 @supports not 里：现代浏览器解析时直接跳过整块，
+   现有布局行为完全不变；老内核才吃到这些兜底。 */
+
+/* aspect-ratio 是 Chrome 88 才有的，老内核上 .player-shell 只有宽度没有高度，
+   高度链一路百分比失效后塌成 0（有声音没画面）。这里先给一个按视口宽度算的近似值，
+   JS 的 player_layout.js 会用内联高度覆盖成精确值；JS 没跑起来时至少不会塌。 */
+@supports not (aspect-ratio: 16 / 9) {
+    .player-shell {
+        height: 56.25vw;
+    }
+}
+
+/* inset 简写是 Chrome 87 才有的，老内核上这些绝对定位元素会退回静态位置 */
+@supports not (inset: 0) {
+    .player-brightness-overlay,
+    .switch-source-modal {
+        top: 0;
+        right: 0;
+        bottom: 0;
+        left: 0;
+    }
 }
