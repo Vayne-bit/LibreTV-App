@@ -1,3 +1,11 @@
+// 搜索结果卡片统一入口：标题等来自采集站 API 的数据经 data-* 属性传递（escapeHtml 转义），
+// 不再拼进内联 JS 字符串，杜绝引号逃逸注入
+function showDetailsCard(card) {
+    if (typeof showDetails === 'function') {
+        showDetails(card.dataset.searchId || '', card.dataset.searchName || '', card.dataset.searchSource || '');
+    }
+}
+
 // 搜索功能 - 修改为支持多选API和多页结果
 async function search() {
     // 密码保护校验
@@ -224,52 +232,51 @@ async function search() {
         }
 
         const safeResults = allResults.map(item => {
+            // 所有来自采集站 API 的字段统一走 escapeHtml（common.js），
+            // 旧版这里的 .replace(/</g,'<') 是恒等替换（真 bug，等于没转义）。
             const safeId = item.vod_id ? item.vod_id.toString().replace(/[^\w-]/g, '') : '';
-            const safeName = (item.vod_name || '').toString()
-                .replace(/</g, '<')
-                .replace(/>/g, '>')
-                .replace(/"/g, '"');
-            const sourceInfo = item.source_name ? 
-                `<span class="bg-[#222] text-xs px-1.5 py-0.5 rounded-full">${item.source_name}</span>` : '';
+            const safeName = escapeHtml(item.vod_name || '');
+            const sourceInfo = item.source_name ?
+                `<span class="bg-[#222] text-xs px-1.5 py-0.5 rounded-full">${escapeHtml(item.source_name)}</span>` : '';
             const sourceCode = item.source_code || '';
-            
-            const apiUrlAttr = item.api_url ? 
-                `data-api-url="${item.api_url.replace(/"/g, '"')}"` : '';
-            
+
+            const apiUrlAttr = item.api_url ?
+                `data-api-url="${escapeHtml(item.api_url)}"` : '';
+
             const hasCover = item.vod_pic && item.vod_pic.startsWith('http');
-            
+
             return `
-                <div class="card-hover bg-[#111] rounded-lg overflow-hidden cursor-pointer transition-all hover:scale-[1.02] h-full shadow-sm hover:shadow-md" 
-                     onclick="showDetails('${safeId}','${safeName}','${sourceCode}')" ${apiUrlAttr}>
+                <div class="card-hover bg-[#111] rounded-lg overflow-hidden cursor-pointer transition-all hover:scale-[1.02] h-full shadow-sm hover:shadow-md"
+                     onclick="showDetailsCard(this)" data-search-id="${safeId}" data-search-name="${safeName}" data-search-source="${escapeHtml(String(sourceCode || ''))}" ${apiUrlAttr}>
                     <div class="flex h-full">
                         ${hasCover ? `
                         <div class="relative flex-shrink-0 search-card-img-container">
-                            <img src="${item.vod_pic}" alt="${safeName}" 
-                                 class="h-full w-full object-cover transition-transform hover:scale-110" 
-                                 onerror="this.onerror=null; this.src='https://via.placeholder.com/300x450?text=无封面'; this.classList.add('object-contain');" 
+                            <img src="${escapeHtml(item.vod_pic)}" alt="${safeName}"
+                                 class="h-full w-full object-cover transition-transform hover:scale-110"
+                                 onerror="this.onerror=null; this.src='https://via.placeholder.com/300x450?text=无封面'; this.classList.add('object-contain');"
                                  loading="lazy">
                             <div class="absolute inset-0 bg-gradient-to-r from-black/30 to-transparent"></div>
                         </div>` : ''}
-                        
+
                         <div class="p-2 flex flex-col flex-grow">
                             <div class="flex-grow">
                                 <h3 class="font-semibold mb-2 break-words line-clamp-2 ${hasCover ? '' : 'text-center'}" title="${safeName}">${safeName}</h3>
-                                
+
                                 <div class="flex flex-wrap ${hasCover ? '' : 'justify-center'} gap-1 mb-2">
-                                    ${(item.type_name || '').toString().replace(/</g, '<') ? 
+                                    ${(item.type_name || '').toString() ?
                                       `<span class="text-xs py-0.5 px-1.5 rounded bg-opacity-20 bg-blue-500 text-blue-300">
-                                          ${(item.type_name || '').toString().replace(/</g, '<')}
+                                          ${escapeHtml(item.type_name || '')}
                                       </span>` : ''}
-                                    ${(item.vod_year || '') ? 
+                                    ${(item.vod_year || '') ?
                                       `<span class="text-xs py-0.5 px-1.5 rounded bg-opacity-20 bg-purple-500 text-purple-300">
-                                          ${item.vod_year}
+                                          ${escapeHtml(item.vod_year)}
                                       </span>` : ''}
                                 </div>
                                 <p class="text-gray-400 line-clamp-2 overflow-hidden ${hasCover ? '' : 'text-center'} mb-2">
-                                    ${(item.vod_remarks || '暂无介绍').toString().replace(/</g, '<')}
+                                    ${escapeHtml((item.vod_remarks || '暂无介绍').toString())}
                                 </p>
                             </div>
-                            
+
                             <div class="flex justify-between items-center mt-1 pt-1 border-t border-gray-800">
                                 ${sourceInfo ? `<div>${sourceInfo}</div>` : '<div></div>'}
                             </div>

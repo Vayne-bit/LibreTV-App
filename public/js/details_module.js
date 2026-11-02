@@ -97,9 +97,9 @@ async function showDetails(id, vod_name, sourceCode) {
                 sourceNameDisplay = API_SITES[sourceCode].name;
             }
         }
-        const sourceNameSpan = sourceNameDisplay ? ` <span class="text-sm font-normal text-gray-400">(${(sourceNameDisplay || '').replace(/</g, '<').replace(/>/g, '>')})</span>` : '';
-        
-        const safeVodName = (vod_name || (videoData ? videoData.vod_name : '未知视频')).replace(/</g, '<').replace(/>/g, '>');
+        const sourceNameSpan = sourceNameDisplay ? ` <span class="text-sm font-normal text-gray-400">(${escapeHtml(sourceNameDisplay)})</span>` : '';
+
+        const safeVodName = escapeHtml(vod_name || (videoData ? videoData.vod_name : '未知视频'));
         modalTitle.innerHTML = `<span class="break-words">${safeVodName}</span>${sourceNameSpan}`;
         currentVideoTitle = vod_name || (videoData ? videoData.vod_name : '未知视频');
         
@@ -184,21 +184,31 @@ function renderEpisodes(vodName, sourceCode, parsedEpisodesArray) {
             realIndex = episodesReversed ? (parsedEpisodesArray.length - 1 - loopIndex) : loopIndex;
         }
 
-        const safeEpisodeUrl = (episodeData.url || '').replace(/"/g, '"');
-        const safeVodName = (vodName || '').replace(/"/g, '"');
-        
+        const safeEpisodeUrl = escapeHtml(episodeData.url || '');
+        const safeVodName = escapeHtml(vodName || '');
+
         // Display number should be based on the visual order (loopIndex)
         const displayEpisodeText = `第${loopIndex + 1}集`;
         // Tooltip can use the name from data, or fallback to display number
-        const tooltipText = (episodeData.name || displayEpisodeText).replace(/</g, '<').replace(/>/g, '>');
-        
+        const tooltipText = escapeHtml(episodeData.name || displayEpisodeText);
+        // 数据（URL/标题）来自采集站 API，不再拼进内联 JS 字符串，
+        // 改走 data-* 属性 + this.dataset 读取，杜绝属性/单引号逃逸。
+        const dataAttrs = `data-ep-url="${safeEpisodeUrl}" data-ep-title="${safeVodName}" data-ep-source="${escapeHtml(String(sourceCode || ''))}" data-ep-index="${Number(realIndex) || 0}"`;
+
         return `
-            <button id="episode-${realIndex}" onclick="playVideo('${safeEpisodeUrl}','${safeVodName}', '${sourceCode}', ${realIndex})" 
-                    class="px-4 py-2 bg-[#222] hover:bg-[#333] border border-[#333] rounded-lg transition-colors text-center episode-btn truncate" title="${tooltipText}">
+            <button id="episode-${realIndex}" onclick="playEpisodeButton(this)"
+                    class="px-4 py-2 bg-[#222] hover:bg-[#333] border border-[#333] rounded-lg transition-colors text-center episode-btn truncate" title="${tooltipText}" ${dataAttrs}>
                 ${displayEpisodeText}
             </button>
         `;
     }).join('');
+}
+
+// 集数按钮统一入口：数据经 data-* 属性传递（escapeHtml 转义），避免内联 JS 字符串拼接逃逸
+function playEpisodeButton(btn) {
+    if (typeof playVideo === 'function') {
+        playVideo(btn.dataset.epUrl || '', btn.dataset.epTitle || '', btn.dataset.epSource || '', Number(btn.dataset.epIndex) || 0);
+    }
 }
 
 // 复制视频链接到剪贴板

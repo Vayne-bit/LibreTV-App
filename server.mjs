@@ -12,13 +12,19 @@ const app = express();
 const port = 8080;
 
 const LOG_FILE_PATH = path.join(__dirname, 'proxy_debug.log');
-try {
-  fs.writeFileSync(LOG_FILE_PATH, `Server log started at ${new Date().toISOString()} (Version with sync body read)\n`);
-} catch (err) {
-  console.error('Failed to clear/initialize log file:', err);
+// 安全说明：调试日志会把所有被代理的 URL（即用户看过的片源）明文落盘，
+// 属于隐私风险。默认关闭，需要时设 PROXY_DEBUG=1 启动：node server.mjs
+const DEBUG_LOG = process.env.PROXY_DEBUG === '1';
+if (DEBUG_LOG) {
+  try {
+    fs.writeFileSync(LOG_FILE_PATH, `Server log started at ${new Date().toISOString()} (Version with sync body read)\n`);
+  } catch (err) {
+    console.error('Failed to clear/initialize log file:', err);
+  }
 }
 
 function appendToLogFile(message) {
+  if (!DEBUG_LOG) return;
   try {
     fs.appendFileSync(LOG_FILE_PATH, `${new Date().toISOString()} - ${message}\n`);
   } catch (err) {
@@ -71,9 +77,16 @@ app.get('/proxy/:encodedUrl', async (req, res) => {
       try {
         const parsed = new URL(urlString);
         const allowedProtocols = ['http:', 'https:'];
-        const blockedHostnames = ['localhost', '127.0.0.1'];
-        return allowedProtocols.includes(parsed.protocol) &&
-          !blockedHostnames.includes(parsed.hostname);
+        if (!allowedProtocols.includes(parsed.protocol)) return false;
+        const hostname = parsed.hostname.toLowerCase();
+        // 只拦 localhost 不够：开放代理会把整个内网（路由器/NAS/摄像头等）
+        // 暴露给任意访问者（SSRF）。这里一并拦截私网与链路本地地址。
+        if (hostname === 'localhost' || hostname.endsWith('.local') || hostname.endsWith('.internal')) return false;
+        if (/^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(hostname)) return false;
+        if (/^172\.(1[6-9]|2\d|3[01])\./.test(hostname)) return false;
+        if (hostname === '::1' || hostname.startsWith('fc') || hostname.startsWith('fd') || hostname.startsWith('fe80:')) return false;
+        if (hostname === '[::1]') return false;
+        return true;
       } catch {
         return false;
       }
@@ -211,7 +224,7 @@ app.get('/proxy/:encodedUrl', async (req, res) => {
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.listen(port, '0.0.0.0', () => {
-  const startupMsg = `Server (Full Debug - v3) running at http://0.0.0.0:${port} (accessible on your local network). Logs will be written to ${LOG_FILE_PATH}`;
+  const startupMsg = `Server running at http://0.0.0.0:${port} (accessible on your local network).${DEBUG_LOG ? ' Debug log: ' + LOG_FILE_PATH : ' Debug log disabled (set PROXY_DEBUG=1 to enable)'}`;
   console.log(startupMsg);
   appendToLogFile(startupMsg);
 });

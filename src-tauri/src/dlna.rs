@@ -34,14 +34,33 @@ struct Upstream {
     referer: Option<String>,
     user_agent: Option<String>,
     cookie: Option<String>,
+    /// 会话令牌：代理路径必须携带，防止局域网内其他主机把本机当公开跳板用
+    token: String,
 }
 
 struct ProxyState {
     base: String, // http://<lan-ip>:<port>
+    token: String,
 }
 
 static PROXY: Lazy<Mutex<Option<ProxyState>>> = Lazy::new(|| Mutex::new(None));
 static PROXY_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 生成投屏会话令牌。RandomState 每次实例化使用随机种子（标准库自带熵源），
+/// 再混入纳秒时间与会话序号，无需引入随机数 crate。
+fn generate_session_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = RandomState::new().build_hasher();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    hasher.write_u64(nanos);
+    hasher.write_u64(PROXY_SEQ.load(Ordering::Relaxed));
+    let v = hasher.finish();
+    format!("{:016x}{:016x}", v, !v)
+}
 
 static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
@@ -88,6 +107,7 @@ pub async fn cast_to_device(
     let playback_url = if has_header(&referer) || has_header(&user_agent) || has_header(&cookie) {
         start_stream_proxy(
             url.clone(),
+            generate_session_token(),
             referer.filter(|s| !s.trim().is_empty()),
             user_agent.filter(|s| !s.trim().is_empty()),
             cookie.filter(|s| !s.trim().is_empty()),
@@ -374,9 +394,10 @@ fn local_lan_ip() -> Option<IpAddr> {
 }
 
 /// 启动本地流代理（每次投屏新建），返回电视可拉流的代理入口地址
-/// （入口即原始目标地址的 b64 包装；分片/密钥/子列表会在列表改写时陆续指向代理）。
+/// （入口为 /s/<token>/<b64 目标>；分片/密钥/子列表会在列表改写时陆续指向代理）。
 async fn start_stream_proxy(
     target: String,
+    token: String,
     referer: Option<String>,
     user_agent: Option<String>,
     cookie: Option<String>,
@@ -390,12 +411,18 @@ async fn start_stream_proxy(
         .port();
     let ip = local_lan_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
     let base = format!("http://{}:{}", ip, port);
-    let entry = format!("{}/s/{}", base, b64url_encode(target.as_bytes()));
+    let entry = format!(
+        "{}/s/{}/{}",
+        base,
+        token,
+        b64url_encode(target.as_bytes())
+    );
 
     let upstream = Arc::new(Upstream {
         referer,
         user_agent,
         cookie,
+        token: token.clone(),
     });
     tauri::async_runtime::spawn(async move {
         loop {
@@ -412,7 +439,7 @@ async fn start_stream_proxy(
     });
 
     if let Ok(mut guard) = PROXY.lock() {
-        *guard = Some(ProxyState { base: base.clone() });
+        *guard = Some(ProxyState { base: base.clone(), token });
     }
     let _ = PROXY_SEQ.fetch_add(1, Ordering::Relaxed);
     Ok(entry)
@@ -462,7 +489,7 @@ async fn handle_proxy_conn(mut stream: tokio::net::TcpStream, upstream: Arc<Upst
         .and_then(|line| line.split_once(':'))
         .map(|(_, value)| value.trim().to_string());
 
-    // 健康检查路径：返回 200，电视/前端可用它确认代理可达
+    // 路径形如 /s/<token>/<b64url(目标地址)>，健康检查路径直接放行
     if !path.contains("/s/") {
         let body = b"LibreTV DLNA proxy";
         let response = format!(
@@ -475,8 +502,23 @@ async fn handle_proxy_conn(mut stream: tokio::net::TcpStream, upstream: Arc<Upst
         return Ok(());
     }
 
-    // 路径形如 /s/<b64url(目标地址)>
-    let encoded = path.split("/s/").nth(1).unwrap_or_default();
+    // 校验会话令牌：不匹配一律 403（防止局域网其他主机把本机当公开跳板）
+    let after_s = path.split("/s/").nth(1).unwrap_or_default();
+    let (req_token, encoded) = match after_s.split_once('/') {
+        Some((t, e)) => (t, e),
+        None => ("", after_s),
+    };
+    if req_token.is_empty() || req_token != upstream.token {
+        let body = b"forbidden";
+        let response = format!(
+            "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.write_all(body).await;
+        let _ = stream.flush().await;
+        return Ok(());
+    }
     let encoded = encoded.split('?').next().unwrap_or_default();
     if encoded.is_empty() {
         return Err("代理路径缺少目标地址".to_string());
@@ -646,14 +688,19 @@ fn rewrite_tag_uris(line: &str, playlist_url: &str) -> String {
     result
 }
 
-/// 目标地址 -> 本地代理地址。
+/// 目标地址 -> 本地代理地址（带会话令牌）。
 fn proxy_url_for(resolved: &str) -> String {
-    let base = match PROXY.lock() {
-        Ok(guard) => guard.as_ref().map(|state| state.base.clone()),
+    let state = match PROXY.lock() {
+        Ok(guard) => guard.as_ref().map(|s| (s.base.clone(), s.token.clone())),
         Err(_) => None,
     };
-    match base {
-        Some(base) => format!("{}/s/{}", base, b64url_encode(resolved.as_bytes())),
+    match state {
+        Some((base, token)) => format!(
+            "{}/s/{}/{}",
+            base,
+            token,
+            b64url_encode(resolved.as_bytes())
+        ),
         None => resolved.to_string(),
     }
 }
