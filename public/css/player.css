@@ -851,3 +851,17 @@ body.player-fullscreen {
         left: 0;
     }
 }
+
+/* 挖孔屏全屏修复：ArtPlayer 的锁按钮 .art-layer-lock 固定在 left:var(--art-padding)、
+   top:50%（垂直居中）。横屏全屏时挖孔屏的摄像头正好在左右边缘垂直居中位置，
+   锁按钮会被挖孔挡住点不到。把 left 抬到「安全区内边距与原值的较大者」；
+   env() 不被支持或没有挖孔时回落到原值，零回归。
+   Android WebView（Tauri 壳）对 safe-area-inset 上报不稳定，额外整体右移 16px
+   兜底：非挖孔设备上只是按钮离边缘远一点，不影响操作。 */
+.art-video-player .art-layer-lock {
+    left: max(var(--art-padding), env(safe-area-inset-left, 0px));
+}
+
+.art-android .art-video-player .art-layer-lock {
+    left: calc(max(var(--art-padding), env(safe-area-inset-left, 0px)) + 16px);
+}

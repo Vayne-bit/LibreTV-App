@@ -403,6 +403,8 @@ function buildHlsControlPlugin() {
 function initPlayer(videoUrl) {
     if (!videoUrl) return;
     const androidBridge = getAndroidBridge();
+    // Android 壳里锁按钮整体外移一点，避开挖孔屏摄像头（配合 player.css 的安全区规则）
+    document.body.classList.toggle('art-android', !!androidBridge);
     playbackStarted = false;
     hidePlayerError();
 
@@ -440,18 +442,12 @@ function initPlayer(videoUrl) {
         settings: buildPlayerSettings(),
         plugins: [buildHlsControlPlugin()].filter(Boolean),
         icons: androidBridge ? { fullscreenWebOn: PLAYER_ICONS.fullscreenOn, fullscreenWebOff: PLAYER_ICONS.fullscreenOff } : {},
-        // 控制条自定义按钮：投屏（仅桌面 Chrome/Edge 显示）+ 下一集。之前这里还挂了下载和
-        // 片头标记，361px 宽的手机上会把「全屏」按钮挤出屏幕，两个动作都挪到全屏顶部条去了。
-        // 投屏按钮只在不挤占手机空间的环境出现，所以不会复现那个问题。
+        // 控制条自定义按钮：投屏（由 PlayerCast.buttonConfig() 按环境决定：
+        // Tauri 壳 -> DLNA；桌面 Chrome/Edge -> Chromecast；不占手机空间）+ 下一集。
+        // 之前这里还挂了下载和片头标记，361px 宽的手机上会把「全屏」按钮挤出屏幕，
+        // 两个动作都挪到全屏顶部条去了。
         controls: [
-            ...(window.PlayerCast && PlayerCast.buttonVisible() ? [{
-                name: 'cast',
-                position: 'left',
-                index: 14,
-                html: PlayerCast.icon,
-                tooltip: '投屏',
-                click: function () { PlayerCast.toggle(art); }
-            }] : []),
+            ...(window.PlayerCast && PlayerCast.buttonConfig() ? [PlayerCast.buttonConfig()] : []),
             {
                 name: 'next-episode',
                 position: 'left',

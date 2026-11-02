@@ -8,6 +8,8 @@ use tauri;
 use tauri::Manager;
 use once_cell::sync::{Lazy, OnceCell}; // For lazy static initialization
 
+mod dlna;
+
 // --- API Configuration Structures ---
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -752,7 +754,10 @@ pub fn run() {
         search_videos,
         set_window_fullscreen,
         probe_url,
-        probe_m3u8_resolution
+        probe_m3u8_resolution,
+        dlna::search_dlna_devices,
+        dlna::cast_to_device,
+        dlna::stop_dlna_cast
     ])
     .setup(|app| {
       if let Ok(cache_dir) = app.path().app_cache_dir() {

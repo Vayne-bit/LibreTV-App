@@ -22,9 +22,23 @@ class MainActivity : TauriActivity() {
   @Volatile
   private var playerFullscreen = false
 
+  // DLNA 投屏需要收发 SSDP 组播包（239.255.255.250:1900），
+  // Android WiFi 默认过滤组播，必须持有 MulticastLock 才能收到设备应答。
+  private var multicastLock: android.net.wifi.WifiManager.MulticastLock? = null
+
   override fun onCreate(savedInstanceState: Bundle?) {
     WindowCompat.setDecorFitsSystemWindows(window, false)
     super.onCreate(savedInstanceState)
+
+    try {
+      val wifi = applicationContext.getSystemService(WIFI_SERVICE) as android.net.wifi.WifiManager
+      multicastLock = wifi.createMulticastLock("LibreTV-DLNA").apply {
+        setReferenceCounted(false)
+        acquire()
+      }
+    } catch (e: Exception) {
+      // 无 WiFi 权限等场景下静默失败，投屏功能不可用但不影响 App 其他功能
+    }
 
     window.statusBarColor = Color.TRANSPARENT
     window.navigationBarColor = Color.BLACK

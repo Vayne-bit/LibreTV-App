@@ -36,5 +36,12 @@ if (!manifest.includes('android:usesCleartextTraffic')) {
 if (!manifest.includes('android:resizeableActivity')) {
   manifest = manifest.replace('<application', '<application\n        android:resizeableActivity="true"');
 }
+// DLNA 投屏：SSDP 组播需要 CHANGE_WIFI_MULTICAST_STATE 权限（MainActivity 里 acquire MulticastLock）。
+if (!manifest.includes('CHANGE_WIFI_MULTICAST_STATE')) {
+  manifest = manifest.replace(
+    '<application',
+    '    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />\n    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />\n    <uses-permission android:name="android.permission.INTERNET" />\n    <application'
+  );
+}
 writeFileSync(manifestPath, manifest);
 console.log('[android-overrides] patched AndroidManifest.xml');
