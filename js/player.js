@@ -728,13 +728,13 @@ class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
             // 拦截manifest和level请求
             if (context.type === 'manifest' || context.type === 'level') {
                 const onSuccess = callbacks.onSuccess;
-                callbacks.onSuccess = function(response, stats, context) {
-                    // 如果是m3u8文件，处理内容以移除广告分段
+                const manifestUrl = context.url;
+                callbacks.onSuccess = function(response, stats, ctx) {
+                    // 如果是m3u8文件，处理内容以移除广告分片
                     if (response.data && typeof response.data === 'string') {
-                        // 过滤掉广告段 - 实现更精确的广告过滤逻辑
-                        response.data = filterAdsFromM3U8(response.data, true);
+                        response.data = filterAdsFromM3U8(response.data, true, ctx && ctx.url ? ctx.url : manifestUrl);
                     }
-                    return onSuccess(response, stats, context);
+                    return onSuccess(response, stats, ctx);
                 };
             }
             // 执行原始load方法
@@ -743,24 +743,186 @@ class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
     }
 }
 
-// M3U8清单广告过滤函数
-function filterAdsFromM3U8(m3u8Content, strictMode = false) {
-    if (!m3u8Content) return '';
+// M3U8清单广告过滤函数（修复版）
+// 修复说明：旧实现只删除 #EXT-X-DISCONTINUITY 标签行，广告分片仍然照播，
+// 还抹掉了断点标记导致时间戳空洞。正确做法是保留断点标记、把广告分片整块删掉。
+// 规则来源：SCTE-35 CUE 标记法（#EXT-X-CUE-OUT … #EXT-X-CUE-IN 区间内分片）+
+// 采集站 SSAI 结构法（断点夹住、分片均不在正片域名上、时长很短的块判为广告）。
+const AD_BLOCK_MAX_SECONDS = 180;
+// 删掉的分片超过总量这个比例，说明判定规则在误伤正片，宁可放弃
+const AD_REMOVE_MAX_RATIO = 0.3;
 
-    // 按行分割M3U8内容
-    const lines = m3u8Content.split('\n');
-    const filteredLines = [];
+function isDiscontinuityLine(text) {
+    return text === '#EXT-X-DISCONTINUITY' || text.indexOf('#EXT-X-DISCONTINUITY:') === 0;
+}
 
+// 把播放列表按断点标记切成块，每块记录自己的分片、时长、以及前面有没有断点
+function splitPlaylistBlocks(lines) {
+    const blocks = [];
+    let block = { discontinuity: false, lines: [], segments: [], duration: 0 };
+    let pending = 0;
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
-
-        // 只过滤#EXT-X-DISCONTINUITY标识
-        if (!line.includes('#EXT-X-DISCONTINUITY')) {
-            filteredLines.push(line);
+        const trimmed = line.trim();
+        if (isDiscontinuityLine(trimmed)) {
+            blocks.push(block);
+            block = { discontinuity: true, lines: [], segments: [], duration: 0 };
+            continue;
+        }
+        block.lines.push(line);
+        if (trimmed.indexOf('#EXTINF') === 0) {
+            const value = parseFloat(trimmed.slice(8));
+            pending = isNaN(value) ? 0 : value;
+            continue;
+        }
+        // 非 # 开头的非空行就是分片地址
+        if (trimmed && trimmed.charAt(0) !== '#') {
+            block.segments.push({ uri: trimmed, duration: pending });
+            block.duration += pending;
+            pending = 0;
         }
     }
+    blocks.push(block);
+    return blocks;
+}
 
-    return filteredLines.join('\n');
+function playlistHost(uri, baseUrl) {
+    try {
+        const resolved = new URL(uri, baseUrl || 'https://placeholder.invalid/');
+        return resolved.host || '';
+    } catch (e) {
+        return '';
+    }
+}
+
+// 结构法：断点夹住、分片全在别的域名上、且整块很短的，判定为广告块，整块删掉。
+function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
+    const blocks = splitPlaylistBlocks(lines);
+    const totalSegments = lines.reduce((n, l) => (l.trim().indexOf('#EXTINF') === 0 ? n + 1 : n), 0);
+    if (!totalSegments) return m3u8Content;
+    const totalDuration = blocks.reduce((n, b) => n + b.duration, 0);
+    const contentHosts = new Set();
+    const dropped = [];
+    blocks.forEach((block, index) => {
+        if (!block.segments.length) return;
+        const hosts = block.segments.map(segment => playlistHost(segment.uri, baseUrl));
+        const resetKey = block.lines.some(line => line.trim().indexOf('#EXT-X-KEY:METHOD=NONE') === 0);
+        const short = block.duration > 0 && block.duration <= AD_BLOCK_MAX_SECONDS;
+        const disjoint = hosts.every(host => !contentHosts.has(host));
+        // 没有前置断点就不是插播块：这一条保证「没有断点标记的播放列表一律不动」
+        const isAd = block.discontinuity && short && (disjoint || resetKey);
+        if (isAd) {
+            dropped.push(index);
+            return;
+        }
+        hosts.forEach(host => contentHosts.add(host));
+    });
+    if (!dropped.length) {
+        return m3u8Content;
+    }
+    let removedSegments = 0;
+    let removedDuration = 0;
+    dropped.forEach(index => {
+        removedSegments += blocks[index].segments.length;
+        removedDuration += blocks[index].duration;
+    });
+    // 兜底：删太多说明判定规则不对，宁可让用户看广告也不能把正片删没
+    const tooMuch = removedSegments >= totalSegments || removedDuration > totalDuration * AD_REMOVE_MAX_RATIO;
+    if (tooMuch || !applyFilter) {
+        return m3u8Content;
+    }
+    const kept = [];
+    const tail = [];
+    let emitted = 0;
+    blocks.forEach((block, index) => {
+        if (dropped.indexOf(index) >= 0) {
+            // 尾部广告块里带着 #EXT-X-ENDLIST，整块丢掉会连播放结束标记一起丢
+            block.lines.forEach(line => {
+                if (line.trim() === '#EXT-X-ENDLIST') tail.push(line);
+            });
+            return;
+        }
+        // 头一个分片之前不需要断点，写了反而是个孤立标记
+        if (block.discontinuity && emitted > 0) kept.push('#EXT-X-DISCONTINUITY');
+        block.lines.forEach(line => kept.push(line));
+        emitted += block.segments.length;
+    });
+    tail.forEach(line => kept.push(line));
+    return kept.join('\n');
+}
+
+// 按 SCTE-35 广告标记把标记区间内的分片整段删掉（#EXT-X-CUE-OUT … #EXT-X-CUE-IN）。
+// 广告分片与正片时间戳不连续，删除前后按需补回/合并断点标记。
+function filterAdsFromM3U8(m3u8Content, applyFilter = true, baseUrl = '') {
+    if (!m3u8Content) return '';
+    const lines = m3u8Content.split('\n');
+    // 有 CUE 标记就走标记法，没有就确认结构（播放站插播广告不给 CUE 标记）
+    const hasCueOut = lines.some(line => line.trim().indexOf('#EXT-X-CUE-OUT') === 0);
+    if (!hasCueOut) return filterByStructure(m3u8Content, lines, baseUrl, applyFilter);
+    if (!applyFilter) return m3u8Content;
+    const kept = [];
+    let inAd = false;
+    let removed = 0;
+    let sawCueIn = false;
+    let pendingBreak = false;
+    let insertBreak = false;
+    // 已经保留的最后一行是不是 DISCONTINUITY：决定广告断点处要不要补标记
+    const lastKeptIsDiscontinuity = () => {
+        for (let i = kept.length - 1; i >= 0; i--) {
+            const t = kept[i].trim();
+            if (!t) continue;
+            return t.indexOf('#EXT-X-DISCONTINUITY') === 0;
+        }
+        return true;
+    };
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const trimmed = line.trim();
+        // CUE-OUT-CONT 也是以 CUE-OUT 开头，一并算作广告区间内
+        if (trimmed.indexOf('#EXT-X-CUE-OUT') === 0) {
+            inAd = true;
+            continue;
+        }
+        if (trimmed.indexOf('#EXT-X-CUE-IN') === 0) {
+            inAd = false;
+            sawCueIn = true;
+            pendingBreak = true;
+            continue;
+        }
+        if (inAd) {
+            if (trimmed.indexOf('#EXTINF') === 0) removed += 1;
+            continue;
+        }
+        if (pendingBreak) {
+            if (!trimmed) continue;
+            pendingBreak = false;
+            if (trimmed.indexOf('#EXT-X-DISCONTINUITY') === 0) {
+                // 广告段后紧跟的 DISCONTINUITY：前面已经有了就合并成一个，没有就留着这个
+                if (lastKeptIsDiscontinuity()) continue;
+                kept.push(line);
+                continue;
+            }
+            // 广告前后都没打断点标记，下一个分片前补一个：广告分片与正片的时间戳不连续，
+            // 不标出来的话 remuxer 会按连续时间戳算分段时长，缓冲区里出现空洞
+            insertBreak = !lastKeptIsDiscontinuity();
+        }
+        // 断点标记要落在分片前面，且后面没有分片时不必补（否则 ENDLIST 前会多一行空断点）
+        if (insertBreak && trimmed.indexOf('#EXTINF') === 0) {
+            kept.push('#EXT-X-DISCONTINUITY');
+            insertBreak = false;
+        }
+        kept.push(line);
+    }
+    // 标记不成对（没有 CUE-IN）说明结构不符合预期，宁可不动，别把正片删了
+    if (!sawCueIn) {
+        return m3u8Content;
+    }
+    // 兜底：标记打错位置时会一口气删掉大半正片，超过三成就当标记不可信，原样放行。
+    const totalSegments = lines.reduce((n, l) => (l.trim().indexOf('#EXTINF') === 0 ? n + 1 : n), 0);
+    if (removed > 5 && removed > totalSegments * 0.3) {
+        return m3u8Content;
+    }
+    return kept.join('\n');
 }
 
 
