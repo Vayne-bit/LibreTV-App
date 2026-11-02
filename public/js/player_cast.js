@@ -49,7 +49,8 @@
     // click 里的 art 是 player_artplayer_handler.js 的全局变量（经典脚本共享全局词法作用域），
     // 点击时 initPlayer 已执行完毕，引用安全。
     function buttonConfig() {
-        if (androidBridge()) return null;
+        // 注意顺序：Tauri Android 壳也注入了 LibreTVAndroid 原生桥（全屏/亮度/音量控制），
+        // isTauri 必须先判，否则安卓 APK 里的 DLNA 按钮会被下面的 androidBridge 误杀。
         if (isTauri()) {
             return {
                 name: 'cast',
@@ -60,6 +61,8 @@
                 click: function () { toggleDlna(art); }
             };
         }
+        // 非 Tauri 的老安卓 WebView 壳（DPlayer 版）：控制条空间有限，不显示网页投屏按钮
+        if (androidBridge()) return null;
         if (!isSecure()) return null;
         if (/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)) return null;
         if (!window.chrome) return null;

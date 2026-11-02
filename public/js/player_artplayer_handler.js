@@ -316,6 +316,20 @@ function buildPlayerSettings() {
     }];
     // ArtPlayer 给设置项定义了 tooltip 的 setter，控制条上标记之后能实时改这里的显示
     introSkipSettingItem = items.find(item => item.name === 'intro-skip') || null;
+    // 投屏入口：齿轮菜单里也放一个（仅 Tauri 壳等支持投屏的环境出现，buttonConfig()
+    // 为 null 的环境不会加这一项）。点击后反馈走播放器顶部通知（搜索设备/已投屏/已停止）。
+    if (window.PlayerCast && PlayerCast.buttonConfig()) {
+        items.push({
+            name: 'cast',
+            html: '投屏到电视',
+            width: 200,
+            tooltip: 'DLNA',
+            onClick() {
+                PlayerCast.toggleDlna(art);
+                return '投屏到电视';
+            }
+        });
+    }
     return items;
 }
 
