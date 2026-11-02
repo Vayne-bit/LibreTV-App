@@ -120,6 +120,15 @@
         } catch (e) { /* ignore */ }
     }
 
+    // Tauri 命令失败时 reject 的值可能是字符串（Rust 侧 Err(String) 原样透传），
+    // 也可能是 Error 对象；统一取可读文本，不再被 err.message 未定义掩盖真实原因。
+    function errMsg(err) {
+        if (err === null || err === undefined) return '未知错误';
+        if (typeof err === 'string') return err;
+        if (err.message) return String(err.message);
+        try { return JSON.stringify(err); } catch (e) { return String(err); }
+    }
+
     function bindSessionEvents() {
         if (sessionBound || !castReady()) return;
         sessionBound = true;
@@ -218,7 +227,7 @@
         }).catch(err => {
             dlnaSearching = false;
             console.warn('DLNA search failed', err);
-            notice(activeArt, '搜索设备失败：' + (err && err.message ? err.message : '未知错误'));
+            notice(activeArt, '搜索设备失败：' + errMsg(err));
         });
     }
 
@@ -282,7 +291,7 @@
             notice(art, viaProxy ? '已投屏（经本机代理转发，防盗链源已处理）' : '已投屏到电视');
         }).catch(err => {
             console.warn('DLNA cast failed', err);
-            notice(art, '投屏失败：' + (err && err.message ? err.message : '设备拒绝了指令'));
+            notice(art, '投屏失败：' + errMsg(err));
         });
     }
 

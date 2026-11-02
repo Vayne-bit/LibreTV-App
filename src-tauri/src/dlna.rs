@@ -307,30 +307,259 @@ s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body>{}</s:Body
 
 async fn dlna_soap_call(control_url: &str, action: &str, body: &str) -> Result<(), String> {
     let envelope = soap_envelope(body);
-    let soap_action = format!("\"urn:schemas-upnp-org:service:AVTransport:1#{}\"", action);
-    let response = HTTP
-        .post(control_url)
-        .header("SOAPACTION", &soap_action)
-        .header("Content-Type", "text/xml; charset=utf-8")
-        .body(envelope)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| format!("投屏指令({})发送失败: {}", action, e))?;
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(format!(
-            "投屏指令({})被设备拒绝: HTTP {}",
-            action,
-            status.as_u16()
-        ));
+    let soap_action = format!("urn:schemas-upnp-org:service:AVTransport:1#{}", action);
+    let (status, text) = soap_post(control_url, &soap_action, &envelope).await?;
+    if !(200..300).contains(&status) {
+        let detail = soap_fault_desc(&text).unwrap_or_else(|| {
+            let snippet: String = text.chars().take(160).collect();
+            if snippet.trim().is_empty() {
+                format!("HTTP {}", status)
+            } else {
+                snippet
+            }
+        });
+        return Err(format!("投屏指令({})被设备拒绝: HTTP {}，{}", action, status, detail));
     }
     // 部分设备返回 200 但体内带 UPnPError
     if text.contains("UPnPError") {
-        return Err(format!("投屏指令({})被设备拒绝: UPnPError", action));
+        let detail = soap_fault_desc(&text).unwrap_or_else(|| "设备返回了未知错误".to_string());
+        return Err(format!("投屏指令({})被设备拒绝: {}", action, detail));
     }
     Ok(())
+}
+
+/// 发送 SOAP 指令：优先走手写 TCP 通道（SOAPAction 头名大小写规范、Connection: close；
+/// reqwest/hyper 会把头名转小写发出，部分电视的 HTTP 栈对此挑剔直接拒收），
+/// 传输层失败时退回 reqwest 兜底。
+async fn soap_post(control_url: &str, soap_action: &str, envelope: &str) -> Result<(u16, String), String> {
+    match soap_post_raw(control_url, soap_action, envelope).await {
+        Ok(result) => Ok(result),
+        Err(raw_err) => soap_post_reqwest(control_url, soap_action, envelope)
+            .await
+            .map_err(|fallback_err| format!("{}；备用通道同样失败: {}", raw_err, fallback_err)),
+    }
+}
+
+async fn soap_post_raw(control_url: &str, soap_action: &str, envelope: &str) -> Result<(u16, String), String> {
+    let (host, port, path) = parse_http_url(control_url)
+        .ok_or_else(|| "控制地址不是合法的 http URL".to_string())?;
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(8),
+        tokio::net::TcpStream::connect((host.as_str(), port)),
+    )
+    .await
+    .map_err(|_| "连接设备超时".to_string())?
+    .map_err(|e| format!("连接设备失败: {}", e))?;
+    let request = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: text/xml; charset=\"utf-8\"\r\nSOAPAction: \"{}\"\r\nContent-Length: {}\r\nAccept: text/xml\r\nConnection: close\r\nUser-Agent: LibreTV/1.3.7\r\n\r\n{}",
+        path,
+        host_header(&host, port),
+        soap_action,
+        envelope.len(),
+        envelope
+    );
+    tokio::time::timeout(Duration::from_secs(8), stream.write_all(request.as_bytes()))
+        .await
+        .map_err(|_| "发送指令超时".to_string())?
+        .map_err(|e| format!("发送指令失败: {}", e))?;
+    let mut response = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut chunk))
+            .await
+            .map_err(|_| "读取设备响应超时".to_string())?
+            .map_err(|e| format!("读取设备响应失败: {}", e))?;
+        if n == 0 {
+            break;
+        }
+        response.extend_from_slice(&chunk[..n]);
+        if response.len() > 512 * 1024 {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&response).to_string();
+    let status_line = text.lines().next().unwrap_or_default();
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| {
+            let snippet: String = text.chars().take(120).collect();
+            format!("设备响应异常: {}", snippet)
+        })?;
+    let body_start = text.find("\r\n\r\n").map(|p| p + 4).unwrap_or(text.len());
+    let body = if text.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+        dechunk(&text[body_start..])
+    } else {
+        text[body_start..].to_string()
+    };
+    Ok((status, body))
+}
+
+/// reqwest 兜底通道。
+async fn soap_post_reqwest(control_url: &str, soap_action: &str, envelope: &str) -> Result<(u16, String), String> {
+    let response = HTTP
+        .post(control_url)
+        .header("SOAPAction", format!("\"{}\"", soap_action))
+        .header("Content-Type", "text/xml; charset=utf-8")
+        .body(envelope.to_string())
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("投屏指令发送失败: {}", e))?;
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap_or_default();
+    Ok((status, text))
+}
+
+/// 从 SOAP fault 里提取 UPnP 错误码与描述，给用户看得懂的原因。
+fn soap_fault_desc(response_body: &str) -> Option<String> {
+    let lower = response_body.to_ascii_lowercase();
+    let code = extract_tag_value(&lower, response_body, "errorcode");
+    let desc = extract_tag_value(&lower, response_body, "errordescription");
+    match (code, desc) {
+        (Some(c), Some(d)) => Some(format!("UPnP 错误 {}: {}", c, d)),
+        (Some(c), None) => Some(format!("UPnP 错误 {}", c)),
+        (None, Some(d)) => Some(d),
+        (None, None) => None,
+    }
+}
+
+/// lower 是原文的 ASCII 小写副本（字节长度一致），按小写定位、从原文取值。
+fn extract_tag_value(lower: &str, original: &str, tag: &str) -> Option<String> {
+    let open = format!("<{}", tag);
+    let start = lower.find(&open)?;
+    let value_start = start + lower[start..].find('>')? + 1;
+    let close = format!("</{}>", tag);
+    let value_end = value_start + lower[value_start..].find(&close)?;
+    Some(xml_unescape(original[value_start..value_end].trim()).to_string())
+}
+
+/// 极简 http URL 解析（控制地址都是局域网 http），返回 (host 无括号, port, path)。
+fn parse_http_url(url: &str) -> Option<(String, u16, String)> {
+    let rest = url.strip_prefix("http://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(pos) => (&rest[..pos], &rest[pos..]),
+        None => (rest, "/"),
+    };
+    if authority.is_empty() {
+        return None;
+    }
+    if let Some(stripped) = authority.strip_prefix('[') {
+        // IPv6 带方括号形态
+        let close = stripped.find(']')?;
+        let host = stripped[..close].to_string();
+        let after = &stripped[close + 1..];
+        let port = match after.strip_prefix(':') {
+            Some(p) => p.parse().ok()?,
+            None => 80,
+        };
+        return Some((host, port, path.to_string()));
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().ok()?),
+        None => (authority.to_string(), 80),
+    };
+    Some((host, port, path.to_string()))
+}
+
+fn host_header(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{}]:{}", host, port)
+    } else if port == 80 {
+        host.to_string()
+    } else {
+        format!("{}:{}", host, port)
+    }
+}
+
+/// 解析 chunked 响应体（设备几乎都因 Connection: close 直接发原文，此为兜底）。
+fn dechunk(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    loop {
+        let line_end = match rest.find("\r\n") {
+            Some(p) => p,
+            None => break,
+        };
+        let size = usize::from_str_radix(
+            rest[..line_end].trim().split(';').next().unwrap_or("0"),
+            16,
+        )
+        .unwrap_or(0);
+        if size == 0 {
+            break;
+        }
+        let start = line_end + 2;
+        if rest.len() < start + size {
+            out.push_str(&rest[start..]);
+            break;
+        }
+        out.push_str(&rest[start..start + size]);
+        let next = start + size + 2;
+        if next >= rest.len() {
+            break;
+        }
+        rest = &rest[next..];
+    }
+    if out.is_empty() {
+        text.to_string()
+    } else {
+        out
+    }
+}
+
+/// 按 URL 猜测 MIME（元数据里的 protocolInfo；部分渲染器会校验它）。
+fn protocol_info_for(playback_url: &str) -> &'static str {
+    let lower = playback_url.to_ascii_lowercase();
+    let clean = lower.split(|c| c == '?' || c == '#').next().unwrap_or(&lower);
+    if clean.contains(".m3u8") {
+        "application/vnd.apple.mpegurl"
+    } else if clean.ends_with(".mp4") || clean.ends_with(".m4v") {
+        "video/mp4"
+    } else if clean.ends_with(".mkv") {
+        "video/x-matroska"
+    } else if clean.ends_with(".webm") {
+        "video/webm"
+    } else if clean.ends_with(".flv") {
+        "video/x-flv"
+    } else if clean.ends_with(".ts") {
+        "video/mp2t"
+    } else {
+        "application/vnd.apple.mpegurl" // 本应用以 m3u8 源为主
+    }
+}
+
+fn build_set_uri_body(playback_url: &str, title: Option<&str>, with_metadata: bool) -> String {
+    let safe_title = xml_escape(title.unwrap_or("LibreTV"));
+    let uri = xml_escape(playback_url);
+    if !with_metadata {
+        return format!(
+            "<u:SetAVTransportURI xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">\
+<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI>\
+<CurrentURIMetaData></CurrentURIMetaData></u:SetAVTransportURI>",
+            uri
+        );
+    }
+    let metadata = format!(
+        "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" \
+xmlns:dc=\"http://purl.org/dc/elements/1.1/\" \
+xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">\
+<item id=\"0\" parentID=\"0\" restricted=\"1\">\
+<dc:title>{}</dc:title><upnp:class>object.item.videoItem</upnp:class>\
+<res protocolInfo=\"http-get:*:{}:*\">{}</res>\
+</item></DIDL-Lite>",
+        safe_title,
+        protocol_info_for(playback_url),
+        uri
+    );
+    format!(
+        "<u:SetAVTransportURI xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">\
+<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI>\
+<CurrentURIMetaData>{}</CurrentURIMetaData></u:SetAVTransportURI>",
+        uri,
+        xml_escape(&metadata)
+    )
 }
 
 async fn dlna_set_av_transport(
@@ -338,26 +567,18 @@ async fn dlna_set_av_transport(
     playback_url: &str,
     title: Option<&str>,
 ) -> Result<(), String> {
-    let safe_title = xml_escape(title.unwrap_or("LibreTV"));
-    let metadata = format!(
-        "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" \
-xmlns:dc=\"http://purl.org/dc/elements/1.1/\" \
-xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">\
-<item id=\"0\" parentID=\"0\" restricted=\"1\">\
-<dc:title>{}</dc:title><upnp:class>object.item.videoItem</upnp:class>\
-</item></DIDL-Lite>",
-        safe_title
-    );
-    let body = format!(
-        "<u:SetAVTransportURI xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">\
-<InstanceID>0</InstanceID>\
-<CurrentURI>{}</CurrentURI>\
-<CurrentURIMetaData>{}</CurrentURIMetaData>\
-</u:SetAVTransportURI>",
-        xml_escape(playback_url),
-        xml_escape(&metadata)
-    );
-    dlna_soap_call(control_url, "SetAVTransportURI", &body).await
+    let with_meta = build_set_uri_body(playback_url, title, true);
+    match dlna_soap_call(control_url, "SetAVTransportURI", &with_meta).await {
+        Ok(()) => Ok(()),
+        Err(first_err) => {
+            // 少数设备对元数据内容挑剔（res/protocolInfo 不合口味）：退回空元数据重试一次
+            let fallback = build_set_uri_body(playback_url, title, false);
+            match dlna_soap_call(control_url, "SetAVTransportURI", &fallback).await {
+                Ok(()) => Ok(()),
+                Err(_) => Err(first_err),
+            }
+        }
+    }
 }
 
 async fn dlna_play(control_url: &str) -> Result<(), String> {
@@ -815,5 +1036,52 @@ mod tests {
         assert!(rewritten.contains("/s/")); // 分片与密钥都已改写
         assert!(rewritten.contains("#EXTINF:4,"));
         assert!(rewritten.starts_with("#EXTM3U"));
+    }
+
+    #[test]
+    fn parse_http_url_variants() {
+        assert_eq!(
+            parse_http_url("http://192.168.1.2:7676/smp_6-"),
+            Some(("192.168.1.2".to_string(), 7676, "/smp_6-".to_string()))
+        );
+        assert_eq!(
+            parse_http_url("http://192.168.1.2/desc.xml"),
+            Some(("192.168.1.2".to_string(), 80, "/desc.xml".to_string()))
+        );
+        assert_eq!(
+            parse_http_url("http://[fe80::1]:49152/ctl"),
+            Some(("fe80::1".to_string(), 49152, "/ctl".to_string()))
+        );
+        assert_eq!(parse_http_url("https://a.b/ctl"), None);
+    }
+
+    #[test]
+    fn dechunk_bodies() {
+        assert_eq!(dechunk("4\r\nwiki\r\n5\r\npedia\r\n0\r\n\r\n"), "wikipedia");
+        assert_eq!(dechunk("plain"), "plain");
+    }
+
+    #[test]
+    fn fault_desc_extracted() {
+        let fault = "<s:Envelope><s:Body><s:Fault><detail><UPnPError \
+xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>402</errorCode>\
+<errorDescription>Invalid Args</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>";
+        assert_eq!(
+            soap_fault_desc(fault).as_deref(),
+            Some("UPnP 错误 402: Invalid Args")
+        );
+        assert_eq!(soap_fault_desc("<ok/>"), None);
+    }
+
+    #[test]
+    fn set_uri_body_escapes_and_res() {
+        let body = build_set_uri_body("https://a.b/c.m3u8?x=1&y=2", Some("测试影片"), true);
+        // URL 的 & 已转义（设备端 XML 解析器必需），m3u8 的 protocolInfo 已带上
+        assert!(body.contains("&amp;y=2"));
+        assert!(body.contains("&lt;res protocolInfo="));
+        assert!(body.contains("application/vnd.apple.mpegurl"));
+        // 无元数据版本不含 res
+        let bare = build_set_uri_body("https://a.b/c.m3u8", None, false);
+        assert!(!bare.contains("DIDL-Lite"));
     }
 }
