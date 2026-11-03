@@ -198,25 +198,7 @@ static API_PATH_DEFAULTS: Lazy<ApiPathConfig> = Lazy::new(|| ApiPathConfig {
 // --- End API Configuration Structures ---
 
 // --- New Tauri Commands for API access ---
-
-#[derive(Serialize, Deserialize, Debug)]
-struct SearchResultItem {
-    // Define fields based on what the JS expects in the 'list' array
-    // e.g., vod_id, vod_name, vod_pic, type_name, vod_remarks, etc.
-    // For now, we'll assume the body from make_http_request is a JSON string
-    // that the frontend can parse directly. If we need to process it in Rust,
-    // we'd define more specific structs here.
-    // This command will return the raw JSON string body for now.
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct SearchResponse {
-    code: u16,
-    msg: Option<String>,
-    list: serde_json::Value, // Assuming list can be any array of objects
-                             // Or define a Vec<SearchResultItem> if item structure is fixed
-}
-
+// （原 SearchResultItem / SearchResponse 占位结构体从未被使用，已删除以消除 dead_code 警告）
 
 #[tauri::command]
 async fn search_videos(

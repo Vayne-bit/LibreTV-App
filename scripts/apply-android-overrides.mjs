@@ -37,11 +37,16 @@ if (!manifest.includes('android:resizeableActivity')) {
   manifest = manifest.replace('<application', '<application\n        android:resizeableActivity="true"');
 }
 // DLNA 投屏：SSDP 组播需要 CHANGE_WIFI_MULTICAST_STATE 权限（MainActivity 里 acquire MulticastLock）。
-if (!manifest.includes('CHANGE_WIFI_MULTICAST_STATE')) {
-  manifest = manifest.replace(
-    '<application',
-    '    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />\n    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />\n    <uses-permission android:name="android.permission.INTERNET" />\n    <application'
-  );
+// 逐项检查后追加，避免与 Tauri 生成的 Manifest 里已有权限重复（重复会触发 Gradle 警告）。
+const permissions = {
+  INTERNET: 'android.permission.INTERNET',
+  CHANGE_WIFI_MULTICAST_STATE: 'android.permission.CHANGE_WIFI_MULTICAST_STATE',
+  ACCESS_WIFI_STATE: 'android.permission.ACCESS_WIFI_STATE',
+};
+const missing = Object.values(permissions).filter((name) => !manifest.includes(name));
+if (missing.length > 0) {
+  const block = missing.map((name) => `    <uses-permission android:name="${name}" />`).join('\n');
+  manifest = manifest.replace('<application', `${block}\n    <application`);
 }
 writeFileSync(manifestPath, manifest);
 console.log('[android-overrides] patched AndroidManifest.xml');
