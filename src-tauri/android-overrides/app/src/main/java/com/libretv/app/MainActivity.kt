@@ -172,7 +172,9 @@ class MainActivity : TauriActivity() {
               android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "LibreTV:CastWifi"
             ).apply {
               setReferenceCounted(false)
-              acquire(2 * 60 * 60 * 1000L)
+              // WifiLock.acquire() 不支持超时参数（那是 WakeLock 的 API）；
+              // 防泄漏靠停止投屏时显式 release + 进程死亡自动释放
+              acquire()
             }
           }
         } else {
