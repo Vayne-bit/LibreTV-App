@@ -739,7 +739,8 @@ pub fn run() {
         probe_m3u8_resolution,
         dlna::search_dlna_devices,
         dlna::cast_to_device,
-        dlna::stop_dlna_cast
+        dlna::stop_dlna_cast,
+        dlna::dlna_diagnostics
     ])
     .setup(|app| {
       if let Ok(cache_dir) = app.path().app_cache_dir() {

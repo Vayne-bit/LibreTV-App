@@ -329,6 +329,17 @@ function buildPlayerSettings() {
                 return '投屏到电视';
             }
         });
+        // 诊断入口：投屏搜不到/投不上时一键出报告，复制全文即可排查
+        items.push({
+            name: 'cast-diagnostics',
+            html: '投屏诊断',
+            width: 200,
+            tooltip: '诊断',
+            onClick() {
+                PlayerCast.runDiagnostics(art);
+                return '投屏诊断';
+            }
+        });
     }
     return items;
 }

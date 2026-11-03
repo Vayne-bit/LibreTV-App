@@ -321,12 +321,107 @@
         tauriInvoke('stop_dlna_cast', { controlUrl: deviceControlUrl }).catch(() => { /* ignore */ });
     }
 
+    // ---------- 投屏诊断 ----------
+
+    // 一键诊断：网卡/SSDP 搜索/设备指令应答/视频源拉流测试全部跑一遍，
+    // 报告展示成弹窗，一键复制全文发给开发者，省去来回猜。
+    function runDiagnostics(art) {
+        activeArt = art || activeArt;
+        if (!isTauri() || typeof tauriInvoke !== 'function') {
+            notice(activeArt, '诊断仅限 App 内使用');
+            return;
+        }
+        const url = (activeArt && activeArt.url) || (activeArt && activeArt.video && activeArt.video.currentSrc) || '';
+        notice(activeArt, '正在诊断，约需 10 秒...');
+        tauriInvoke('dlna_diagnostics', { testUrl: url, referer: currentReferer() }).then(rustReport => {
+            showDiagnosticsDialog(buildDiagnosticsReport(rustReport));
+        }).catch(err => {
+            console.warn('DLNA diagnostics failed', err);
+            notice(activeArt, '诊断失败：' + errMsg(err));
+        });
+    }
+
+    function buildDiagnosticsReport(rustReport) {
+        const version = (typeof window.APP_VERSION !== 'undefined' && window.APP_VERSION) || '未知';
+        return '=== LibreTV 投屏环境诊断 ===\n' +
+            'App版本: ' + version + '\n' +
+            '平台: ' + navigator.userAgent + '\n' +
+            '时间: ' + new Date().toLocaleString() + '\n\n' +
+            (rustReport || '');
+    }
+
+    function showDiagnosticsDialog(text) {
+        removeDiagnosticsDialog();
+        const overlay = document.createElement('div');
+        overlay.id = 'dlna-diagnostics-dialog';
+        overlay.style.cssText = 'position:fixed;inset:0;z-index:100001;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;';
+        const panel = document.createElement('div');
+        panel.style.cssText = 'background:#1e1e1e;color:#eee;border-radius:12px;padding:16px;width:min(680px,92vw);height:min(560px,80vh);display:flex;flex-direction:column;gap:10px;';
+        const title = document.createElement('div');
+        title.textContent = '投屏诊断报告';
+        title.style.cssText = 'font-size:15px;font-weight:bold;flex:none;';
+        const pre = document.createElement('pre');
+        pre.textContent = text;
+        pre.style.cssText = 'margin:0;padding:10px;background:#111;border:1px solid #3a3a3a;border-radius:8px;overflow:auto;flex:1;font-family:monospace;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-all;color:#ddd;user-select:text;';
+        const btnRow = document.createElement('div');
+        btnRow.style.cssText = 'display:flex;gap:8px;flex:none;';
+        const copyBtn = document.createElement('button');
+        copyBtn.type = 'button';
+        copyBtn.textContent = '复制报告';
+        copyBtn.style.cssText = 'flex:1;padding:10px;background:#3b82f6;color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer;';
+        copyBtn.onclick = function () {
+            const done = function () {
+                copyBtn.textContent = '已复制';
+                setTimeout(function () { copyBtn.textContent = '复制报告'; }, 1500);
+            };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(done).catch(function () { fallbackCopy(text); done(); });
+            } else {
+                fallbackCopy(text);
+                done();
+            }
+        };
+        const closeBtn = document.createElement('button');
+        closeBtn.type = 'button';
+        closeBtn.textContent = '关闭';
+        closeBtn.style.cssText = 'flex:1;padding:10px;background:#2b2b2b;color:#bbb;border:none;border-radius:8px;font-size:14px;cursor:pointer;';
+        closeBtn.onclick = removeDiagnosticsDialog;
+        btnRow.appendChild(copyBtn);
+        btnRow.appendChild(closeBtn);
+        panel.appendChild(title);
+        panel.appendChild(pre);
+        panel.appendChild(btnRow);
+        overlay.appendChild(panel);
+        overlay.onclick = function (event) {
+            if (event.target === overlay) removeDiagnosticsDialog();
+        };
+        document.body.appendChild(overlay);
+    }
+
+    // 剪贴板 API 不可用时的兜底（老 WebView / 非安全上下文）
+    function fallbackCopy(text) {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.cssText = 'position:fixed;opacity:0;';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        try { document.execCommand('copy'); } catch (e) { /* ignore */ }
+        ta.remove();
+    }
+
+    function removeDiagnosticsDialog() {
+        const existing = document.getElementById('dlna-diagnostics-dialog');
+        if (existing) existing.remove();
+    }
+
     window.PlayerCast = {
         buttonConfig: buttonConfig,
         init: loadCastSdk,
         toggle: toggle,
         toggleDlna: toggleDlna,
         stopDlna: stopDlna,
+        runDiagnostics: runDiagnostics,
         icon: CAST_ICON,
         dlnaIcon: DLNA_ICON
     };

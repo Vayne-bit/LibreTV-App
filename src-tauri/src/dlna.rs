@@ -212,6 +212,129 @@ pub async fn stop_dlna_cast(control_url: String) -> Result<(), String> {
     dlna_stop(&control_url).await
 }
 
+/// 投屏环境诊断：把「靠猜」变成「看报告」。
+/// 一次性输出：本机网卡、SSDP 搜索结果、每台设备的描述解析与指令应答探测、
+/// 当前视频源的本机拉流测试、本地代理状态。每一步失败都记录进报告而不中断，
+/// 报告整体总是返回成功——用户复制全文给开发者即可定位问题在哪一环。
+#[tauri::command]
+pub async fn dlna_diagnostics(
+    test_url: Option<String>,
+    referer: Option<String>,
+) -> Result<String, String> {
+    let mut report = String::new();
+
+    // [1] 本机网卡：判断搜索发到了哪个网段、电视是否可达
+    report.push_str("[1] 本机网卡\n");
+    match if_addrs::get_if_addrs() {
+        Ok(list) => {
+            let mut shown = 0;
+            for iface in &list {
+                if let if_addrs::IfAddr::V4(v4) = &iface.addr {
+                    if v4.ip.is_loopback() {
+                        continue;
+                    }
+                    report.push_str(&format!("  - {} : {}\n", iface.name, v4.ip));
+                    shown += 1;
+                }
+            }
+            if shown == 0 {
+                report.push_str("  （没有发现可用的 IPv4 网卡）\n");
+            }
+        }
+        Err(e) => report.push_str(&format!("  网卡枚举失败: {}\n", e)),
+    }
+
+    // [2] SSDP 搜索 + 设备描述解析 + 指令应答探测
+    report.push_str("\n[2] SSDP 设备搜索（4 秒）\n");
+    let search = tauri::async_runtime::spawn_blocking(|| ssdp_search_locations(Duration::from_secs(4)))
+        .await
+        .map_err(|e| format!("SSDP 搜索任务失败: {}", e))?;
+    let locations = match search {
+        Ok(list) => list,
+        Err(e) => {
+            report.push_str(&format!("  搜索失败: {}\n", e));
+            Vec::new()
+        }
+    };
+    if locations.is_empty() {
+        report.push_str(
+            "  未发现任何设备应答。常见原因：电视与本机不在同一网段（路由器 AP 隔离/访客网络）、\n\
+             \x20 Windows 防火墙拦截入站应答（需允许本应用）、VPN/虚拟网卡分流（关掉再试）。\n",
+        );
+    }
+    for location in &locations {
+        match fetch_device_info(location).await {
+            Ok(dev) => {
+                report.push_str(&format!("  设备: {} (location: {})\n", dev.name, dev.location));
+                // 指令应答探测：GetTransportInfo 是只读查询，不改变播放状态。
+                // 它失败意味着「设备拒绝了指令」这类问题出在控制通道，与视频源无关。
+                match tokio::time::timeout(
+                    Duration::from_secs(6),
+                    dlna_get_transport_info(&dev.control_url),
+                )
+                .await
+                {
+                    Ok(Ok(())) => report.push_str("    控制指令应答: 正常\n"),
+                    Ok(Err(e)) => report.push_str(&format!("    控制指令应答: 失败 —— {}\n", e)),
+                    Err(_) => report.push_str("    控制指令应答: 超时（6 秒无响应，设备 HTTP 栈可能不稳定）\n"),
+                }
+            }
+            Err(e) => report.push_str(&format!("  设备: {} 描述解析失败 —— {}\n", location, e)),
+        }
+    }
+
+    // [3] 当前视频源的本机拉流测试
+    report.push_str("\n[3] 视频源拉流测试（本机视角）\n");
+    match test_url.filter(|s| !s.trim().is_empty()) {
+        None => report.push_str("  （当前没有播放中的视频，跳过）\n"),
+        Some(url) => {
+            report.push_str(&format!("  地址: {}\n", url));
+            let mut req = HTTP
+                .get(&url)
+                .timeout(Duration::from_secs(6))
+                .header("User-Agent", DEFAULT_UPSTREAM_UA)
+                .header("Range", "bytes=0-1023");
+            if let Some(ref_value) = referer.filter(|s| !s.trim().is_empty()) {
+                req = req.header("Referer", ref_value);
+            }
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let ctype = resp
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("(未声明)")
+                        .to_string();
+                    report.push_str(&format!("  结果: HTTP {}，Content-Type: {}\n", status, ctype));
+                    let hint = match status {
+                        200 | 206 => "本机可拉流。注意：这只代表手机/电脑能拉，电视直连模式还要求电视自己也能拉到",
+                        403 | 401 => "源站拒绝了本机请求（防盗链）。这类源必须走本地代理转发，投屏时会自动处理",
+                        404 | 410 => "地址已失效或已过期，换一集或换数据源再试",
+                        _ => "源站返回异常状态，可能是源站临时故障或限流",
+                    };
+                    report.push_str(&format!("  判读: {}\n", hint));
+                }
+                Err(e) => report.push_str(&format!("  结果: 本机拉流失败 —— {}（DNS/网络/证书问题，电视同样拉不到）\n", e)),
+            }
+        }
+    }
+
+    // [4] 本地代理状态
+    report.push_str("\n[4] 本地防盗链代理\n");
+    report.push_str(&format!("  累计已服务电视连接数: {}\n", proxy_connection_count()));
+
+    report.push_str("\n（以上全文复制发给开发者即可定位问题环节）\n");
+    Ok(report)
+}
+
+/// 只读的指令应答探测：查询当前传输状态，不改变播放。
+async fn dlna_get_transport_info(control_url: &str) -> Result<(), String> {
+    let body = "<u:GetTransportInfo xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">\
+<InstanceID>0</InstanceID></u:GetTransportInfo>";
+    dlna_soap_call(control_url, "GetTransportInfo", body).await
+}
+
 // ---------- SSDP 搜索 ----------
 
 const SSDP_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
