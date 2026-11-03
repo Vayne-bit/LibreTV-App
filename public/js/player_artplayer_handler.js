@@ -340,6 +340,28 @@ function buildPlayerSettings() {
                 return '投屏诊断';
             }
         });
+        // 本地视频投屏：系统文件选择器 → 选设备 → 起本地文件服务投屏
+        items.push({
+            name: 'local-video',
+            html: '本地视频投屏',
+            width: 200,
+            tooltip: '本地文件',
+            onClick() {
+                PlayerCast.pickAndCastLocalVideo(art);
+                return '本地视频投屏';
+            }
+        });
+        // VIP 解析投屏：粘贴视频页面 URL，用可配置解析接口取回可播地址后播放并投屏
+        items.push({
+            name: 'vip-resolve',
+            html: 'VIP 解析投屏',
+            width: 200,
+            tooltip: '解析',
+            onClick() {
+                PlayerCast.openResolveDialog(art);
+                return 'VIP 解析投屏';
+            }
+        });
     }
     // 人工标记广告片段：与长按画面同一面板，桌面端鼠标长按不便时的入口
     if (window.PlayerAdMarker) {

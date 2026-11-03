@@ -24,6 +24,7 @@ log = "0.4"
 once_cell = "1.19.0" # For lazy static initialization
 tauri = { version = "2", features = ["custom-protocol"] }
 tauri-runtime = { version = "2" }
+tauri-plugin-dialog = "2" # 本地视频文件选择（Android/桌面通用，Rust 侧 blocking_pick_file）
 urlencoding = "2.1.3"
 scraper = "0.19.0"
 # tauri-utils will be resolved by tauri and tauri-build
@@ -31,3 +32,4 @@ scraper = "0.19.0"
 reqwest = { version = "0.11.27", features = ["json", "rustls-tls"], default-features = false } # 使用较新的 reqwest 版本
 tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] } # 使用较新的 tokio 版本
 if-addrs = "0.13" # 枚举本机 IPv4 网卡：Windows 多网卡（WSL/VMware/VPN）下 SSDP 必须逐网卡发 M-SEARCH
+mdns-sd = "0.5" # AirPlay 发现（mDNS / Bonjour，_airplay._tcp）

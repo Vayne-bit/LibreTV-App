@@ -14,12 +14,16 @@
 // 并在 Manifest 声明 CHANGE_WIFI_MULTICAST_STATE（apply-android-overrides.mjs 注入）。
 
 use once_cell::sync::Lazy;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use mdns_sd::{ServiceDaemon, ServiceEvent};
+use tauri_plugin_dialog::DialogExt;
 
 // ---------- 数据结构 ----------
 
@@ -28,6 +32,8 @@ pub struct DlnaDevice {
     pub name: String,
     pub control_url: String,
     pub location: String,
+    /// 投屏协议：dlna（标准安卓/三星电视内置渲染端）| airplay（Apple TV / 支持 AirPlay 的电视）
+    pub protocol: String,
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +43,10 @@ struct Upstream {
     cookie: Option<String>,
     /// 会话令牌：代理路径必须携带，防止局域网内其他主机把本机当公开跳板用
     token: String,
+    /// 是否为三星 Tizen 渲染端。三星 DMR 固定用 9197 端口，且对 MPEG-TS 要求声明
+    /// video/vnd.dlna.mpeg-tts（标准 DLNA 专用 MIME）；标准安卓 DLNA 渲染端更认
+    /// video/mp2t。两者 DIDL 的 DLNA flags 与响应头一致，仅 TS 的 MIME 分流。
+    is_samsung: bool,
 }
 
 struct ProxyState {
@@ -153,12 +163,22 @@ pub async fn cast_to_device(
         .and_then(best_local_ip_for)
         .map(|(ip, _)| ip);
 
+    // 设备画像：三星 Tizen 用 9197 端口的 DMR，且 TS 要求 DLNA 专用 MIME；
+    // 标准安卓/其他 DLNA 渲染端更认 video/mp2t。两者仅 TS 的 MIME 分流，
+    // DIDL 的 DLNA flags 与代理响应头一致（都是 DLNA 1.5 标准）。
+    let is_samsung = is_samsung_renderer(&control_url);
+
     let mut attempts: Vec<String> = Vec::new();
     let mut proxy_reached_by_tv = false;
     for mode in &modes {
-        // TS 串流的内容就是 MPEG-TS，只能声明 video/mp2t；其余按 URL 自动猜测
+        // TS 串流的内容就是 MPEG-TS：三星声明 video/vnd.dlna.mpeg-tts，
+        // 标准安卓 DLNA 渲染端声明 video/mp2t（更通用）。按设备画像分流。
         let protos: Vec<Option<&str>> = if *mode == "proxy-ts" {
-            vec![Some("video/mp2t")]
+            vec![Some(if is_samsung {
+                "video/vnd.dlna.mpeg-tts"
+            } else {
+                "video/mp2t"
+            })]
         } else {
             vec![None]
         };
@@ -173,6 +193,7 @@ pub async fn cast_to_device(
                         user_agent.clone(),
                         cookie.clone(),
                         proxy_ip,
+                        is_samsung,
                     )
                     .await?;
                     ts_entry
@@ -186,6 +207,7 @@ pub async fn cast_to_device(
                         user_agent.clone(),
                         cookie.clone(),
                         proxy_ip,
+                        is_samsung,
                     )
                     .await?;
                     entry
@@ -201,7 +223,12 @@ pub async fn cast_to_device(
                 _ => "电视直连",
             };
             let proto_desc = proto.unwrap_or("自动");
-            match dlna_set_av_transport(&control_url, &playback_url, title.as_deref(), *proto).await {
+            // 下发新 URI 前先 Stop，清掉电视上可能处于锁定/播放中的传输态
+            // （baverrr/tv-remote 实证：三星在部分播放态下会拒收新 URI → 716/719）。
+            // 失败忽略：首次投屏本就没有可停的传输。
+            let _ = dlna_stop(&control_url).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            match dlna_set_av_transport(&control_url, &playback_url, title.as_deref(), *proto, is_samsung).await {
                 Ok(()) => {
                     dlna_play(&control_url).await?;
                     // 从当前进度续投；TS 串流是直播形态不支持 REL_TIME 续播；
@@ -308,14 +335,27 @@ pub async fn dlna_diagnostics(
             Ok(dev) => {
                 report.push_str(&format!("  设备: {} (location: {})\n", dev.name, dev.location));
                 // 指令应答探测：GetTransportInfo 是只读查询，不改变播放状态。
-                // 它失败意味着「设备拒绝了指令」这类问题出在控制通道，与视频源无关。
+                // 它不仅说明控制通道通不通，还能读出电视当前是否 ERROR_OCCURRED
+                // （= 拒收/无法解码当前媒体，正是 716 的真实原因，而非网络问题）。
                 match tokio::time::timeout(
                     Duration::from_secs(6),
                     dlna_get_transport_info(&dev.control_url),
                 )
                 .await
                 {
-                    Ok(Ok(())) => report.push_str("    控制指令应答: 正常\n"),
+                    Ok(Ok((state, ts))) => {
+                        if ts == "ERROR_OCCURRED" {
+                            report.push_str(&format!(
+                                "    控制指令应答: 正常，但传输状态异常（ERROR_OCCURRED={}）—— 电视拒收/无法解码当前媒体（编解码或容器格式问题）\n",
+                                state
+                            ));
+                        } else {
+                            report.push_str(&format!(
+                                "    控制指令应答: 正常（状态: {} / {}）\n",
+                                state, ts
+                            ));
+                        }
+                    }
                     Ok(Err(e)) => report.push_str(&format!("    控制指令应答: 失败 —— {}\n", e)),
                     Err(_) => report.push_str("    控制指令应答: 超时（6 秒无响应，设备 HTTP 栈可能不稳定）\n"),
                 }
@@ -381,11 +421,23 @@ pub async fn dlna_diagnostics(
     Ok(report)
 }
 
-/// 只读的指令应答探测：查询当前传输状态，不改变播放。
-async fn dlna_get_transport_info(control_url: &str) -> Result<(), String> {
-    let body = "<u:GetTransportInfo xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">\
-<InstanceID>0</InstanceID></u:GetTransportInfo>";
-    dlna_soap_call(control_url, "GetTransportInfo", body).await
+/// 只读查询传输状态，返回 (CurrentTransportState, CurrentTransportStatus)。
+/// CurrentTransportStatus == "ERROR_OCCURRED" 表示电视拒绝/无法播放当前媒体
+/// （编解码或容器格式不被支持）——这正是 716 之后的真实原因，用来诊断而非猜测。
+async fn dlna_get_transport_info(control_url: &str) -> Result<(String, String), String> {
+    let envelope = soap_envelope(
+        "<u:GetTransportInfo xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">\
+<InstanceID>0</InstanceID></u:GetTransportInfo>",
+    );
+    let soap_action = "urn:schemas-upnp-org:service:AVTransport:1#GetTransportInfo";
+    let (status, text) = soap_post(control_url, soap_action, &envelope).await?;
+    if !(200..300).contains(&status) {
+        let detail = soap_fault_desc(&text).unwrap_or_else(|| format!("HTTP {}", status));
+        return Err(format!("GetTransportInfo 被拒绝: HTTP {}，{}", status, detail));
+    }
+    let state = xml_text(&text, "CurrentTransportState").unwrap_or_default();
+    let ts = xml_text(&text, "CurrentTransportStatus").unwrap_or_default();
+    Ok((state, ts))
 }
 
 // ---------- SSDP 搜索 ----------
@@ -521,6 +573,7 @@ async fn fetch_device_info(location: &str) -> Result<DlnaDevice, String> {
                 name,
                 control_url: fallback,
                 location: location.to_string(),
+                protocol: "dlna".to_string(),
             });
         }
         return Err(format!(
@@ -532,6 +585,7 @@ async fn fetch_device_info(location: &str) -> Result<DlnaDevice, String> {
         name,
         control_url,
         location: location.to_string(),
+        protocol: "dlna".to_string(),
     })
 }
 
@@ -942,8 +996,18 @@ fn dechunk(text: &str) -> String {
     }
 }
 
-/// 按 URL 猜测 MIME（元数据里的 protocolInfo；部分渲染器会校验它）。
-fn protocol_info_for(playback_url: &str) -> &'static str {
+/// 三星 Tizen 内置 DLNA 渲染端对 MIME / DLNA 标志有硬性要求（参考可正常工作的
+/// baverrr/tv-remote：它按电视 GetProtocolInfo 实际广告的 MIME 声明，否则电视直接拒收）。
+/// DLNA.ORG_OP=01：支持字节范围（无时间 seek）；DLNA.ORG_CI=0：未转码；
+/// DLNA.ORG_FLAGS=0170...：流式传输模式、DLNA 1.5。三星会同时校验 DIDL 的 protocolInfo
+/// 与代理响应头里的 contentFeatures.dlna.org，二者必须对得上，否则 716。
+const SAMSUNG_DLNA_FLAGS: &str =
+    "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000";
+
+/// 按 URL 猜测 MIME（元数据里的 protocolInfo；三星等渲染器会严格校验它）。
+/// is_samsung：设备画像——三星对 TS 要求 video/vnd.dlna.mpeg-tts、对 mkv 认
+/// video/x-mkv；标准安卓/其他 DLNA 渲染端更认 video/mp2t / video/x-matroska。
+fn protocol_info_for(playback_url: &str, is_samsung: bool) -> &'static str {
     let lower = playback_url.to_ascii_lowercase();
     let clean = lower.split(|c| c == '?' || c == '#').next().unwrap_or(&lower);
     if clean.contains(".m3u8") {
@@ -951,13 +1015,21 @@ fn protocol_info_for(playback_url: &str) -> &'static str {
     } else if clean.ends_with(".mp4") || clean.ends_with(".m4v") {
         "video/mp4"
     } else if clean.ends_with(".mkv") {
-        "video/x-matroska"
+        if is_samsung {
+            "video/x-mkv" // 三星 GetProtocolInfo 广告的正是 video/x-mkv
+        } else {
+            "video/x-matroska"
+        }
     } else if clean.ends_with(".webm") {
         "video/webm"
     } else if clean.ends_with(".flv") {
         "video/x-flv"
     } else if clean.ends_with(".ts") {
-        "video/mp2t"
+        if is_samsung {
+            "video/vnd.dlna.mpeg-tts" // 三星 DLNA 专用 MIME，video/mp2t 不在其支持列表 → 716
+        } else {
+            "video/mp2t" // 标准安卓 DLNA 渲染端更通用
+        }
     } else {
         "application/vnd.apple.mpegurl" // 本应用以 m3u8 源为主
     }
@@ -968,6 +1040,7 @@ fn build_set_uri_body(
     title: Option<&str>,
     with_metadata: bool,
     protocol_override: Option<&str>,
+    is_samsung: bool,
 ) -> String {
     let safe_title = xml_escape(title.unwrap_or("LibreTV"));
     let uri = xml_escape(playback_url);
@@ -985,10 +1058,11 @@ xmlns:dc=\"http://purl.org/dc/elements/1.1/\" \
 xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">\
 <item id=\"0\" parentID=\"0\" restricted=\"1\">\
 <dc:title>{}</dc:title><upnp:class>object.item.videoItem</upnp:class>\
-<res protocolInfo=\"http-get:*:{}:*\">{}</res>\
+<res protocolInfo=\"http-get:*:{}:{}\">{}</res>\
 </item></DIDL-Lite>",
         safe_title,
-        protocol_override.unwrap_or_else(|| protocol_info_for(playback_url)),
+        protocol_override.unwrap_or_else(|| protocol_info_for(playback_url, is_samsung)),
+        SAMSUNG_DLNA_FLAGS,
         uri
     );
     format!(
@@ -1005,13 +1079,14 @@ async fn dlna_set_av_transport(
     playback_url: &str,
     title: Option<&str>,
     protocol_override: Option<&str>,
+    is_samsung: bool,
 ) -> Result<(), String> {
-    let with_meta = build_set_uri_body(playback_url, title, true, protocol_override);
+    let with_meta = build_set_uri_body(playback_url, title, true, protocol_override, is_samsung);
     match dlna_soap_call(control_url, "SetAVTransportURI", &with_meta).await {
         Ok(()) => Ok(()),
         Err(first_err) => {
             // 少数设备对元数据内容挑剔（res/protocolInfo 不合口味）：退回空元数据重试一次
-            let fallback = build_set_uri_body(playback_url, title, false, protocol_override);
+            let fallback = build_set_uri_body(playback_url, title, false, protocol_override, is_samsung);
             match dlna_soap_call(control_url, "SetAVTransportURI", &fallback).await {
                 Ok(()) => Ok(()),
                 Err(_) => Err(first_err),
@@ -1111,7 +1186,18 @@ fn local_lan_ip() -> Option<IpAddr> {
 /// - m3u8 入口：/s/<token>/<b64 目标>，分片/密钥/子列表在列表改写时指向代理；
 /// - TS 入口：/s/<token>/live.ts?u=<b64 目标>，把 HLS 拼成连续 MPEG-TS，
 ///   服务不支持 HLS 的渲染端（三星 Tizen 实测 m3u8 一律 716）。
+/// 从控制地址识别三星 Tizen 渲染端。三星 DMR 固定监听 9197 端口
+/// （SSDP LOCATION 形如 http://TV:9197/dmr，AVTransport 控制地址同端口），
+/// 这是可靠的设备画像信号；标准安卓/其他 DLNA 渲染端几乎不会用此端口。
+fn is_samsung_renderer(control_url: &str) -> bool {
+    match parse_http_url(control_url) {
+        Some((_, port, _)) => port == 9197,
+        None => false,
+    }
+}
+
 /// preferred_ip：与设备同网段的本机网卡 IP，优先于默认路由探测。
+/// samsung：设备画像（决定 TS 串流的 MIME 声明，见 Upstream.is_samsung）。
 async fn start_stream_proxy(
     target: String,
     token: String,
@@ -1119,6 +1205,7 @@ async fn start_stream_proxy(
     user_agent: Option<String>,
     cookie: Option<String>,
     preferred_ip: Option<IpAddr>,
+    samsung: bool,
 ) -> Result<(String, String), String> {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
         .await
@@ -1149,6 +1236,7 @@ async fn start_stream_proxy(
         user_agent,
         cookie,
         token: token.clone(),
+        is_samsung: samsung,
     });
     tauri::async_runtime::spawn(async move {
         loop {
@@ -1179,6 +1267,608 @@ fn stop_stream_proxy() {
     if let Ok(mut guard) = PROXY.lock() {
         *guard = None;
     }
+}
+
+// ---------- 本地视频文件服务（本地视频投屏用） ----------
+// 把本机视频文件通过 HTTP 暴露给局域网电视取流。URL 形如
+// http://<lan-ip>:<port>/l/<token>/<filename>，保留原始文件名以暴露扩展名，
+// 使投屏端的 protocol_info_for 能按扩展名正确声明 MIME。支持 Range（电视拖拽进度）。
+// 三星等渲染端在 SetAVTransportURI 前会做 HEAD 可达性 + contentFeatures 合规探测，
+// 因此 HEAD/GET 都补上 DLNA 头，避免被判 716。
+
+#[derive(Serialize)]
+pub struct LocalFileEntry {
+    /// 投屏用 LAN URL（与设备同网段，电视可达）
+    pub url: String,
+    /// 本机播放用回环地址（127.0.0.1，无需经局域网）
+    pub loopback_url: String,
+    pub token: String,
+}
+
+struct LocalFileState {
+    base: String,
+    files: HashMap<String, PathBuf>, // token -> 本机文件路径
+    port: u16,
+}
+
+static LOCAL_FILE: Lazy<Mutex<Option<LocalFileState>>> = Lazy::new(|| Mutex::new(None));
+
+/// 本机文件按扩展名给 MIME（投屏端校验 protocolInfo 用）。
+fn local_file_mime(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("mp4") | Some("m4v") | Some("mov") => "video/mp4",
+        Some("mkv") => "video/x-matroska",
+        Some("webm") => "video/webm",
+        Some("flv") => "video/x-flv",
+        Some("ts") | Some("m2ts") => "video/mp2t",
+        Some("m3u8") => "application/vnd.apple.mpegurl",
+        Some("mp3") => "audio/mpeg",
+        Some("aac") => "audio/aac",
+        Some("m4a") => "audio/mp4",
+        _ => "application/octet-stream",
+    }
+}
+
+#[tauri::command]
+pub async fn start_local_file_server(
+    path: String,
+    preferred_ip: Option<IpAddr>,
+) -> Result<LocalFileEntry, String> {
+    let p = PathBuf::from(&path);
+    if !p.is_file() {
+        return Err(format!("文件不存在或不是普通文件: {}", path));
+    }
+    // URL 中保留文件名，让扩展名可见（投屏端据此分类 MIME）
+    let fname = p
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("video.mp4")
+        .to_string();
+    ensure_local_file_server(preferred_ip).await?;
+    let token = generate_session_token();
+    let (url, loopback_url) = {
+        let mut guard = LOCAL_FILE.lock().unwrap();
+        match guard.as_mut() {
+            Some(state) => {
+                state.files.insert(token.clone(), p.clone());
+                (
+                    format!("{}/l/{}/{}", state.base, token, fname),
+                    format!("http://127.0.0.1:{}/l/{}/{}", state.port, token, fname),
+                )
+            }
+            None => return Err("本地文件服务未启动".into()),
+        }
+    };
+    Ok(LocalFileEntry {
+        url,
+        loopback_url,
+        token,
+    })
+}
+
+#[tauri::command]
+pub fn stop_local_file_server() {
+    if let Ok(mut guard) = LOCAL_FILE.lock() {
+        *guard = None; // 清空后下次投屏重新建 listener
+    }
+}
+
+/// 调起系统文件选择器，返回用户选中的本地视频文件真实路径（前端据此起本地文件服务投屏）。
+/// 用官方 dialog 插件，Android/桌面通用。
+#[tauri::command]
+pub async fn pick_local_video(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    let path = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .add_filter(
+                "视频/音频文件",
+                &["mp4", "mkv", "m3u8", "ts", "m2ts", "webm", "mov", "flv", "mp3", "m4a"],
+            )
+            .blocking_pick_file()
+    })
+    .await
+    .map_err(|e| format!("文件选择任务失败: {}", e))?;
+    Ok(path.map(|p| p.to_string_lossy().to_string()))
+}
+
+// ---------- 可配置 VIP 解析 ----------
+// 把爱奇艺/腾讯/优酷等页面 URL 交给用户可配置的第三方解析站，取回真实可播 m3u8/mp4。
+// 解析站地址不硬编码，由前端设置传入（默认示例 jx.xmflv.com）。
+// 提取策略：①最终响应本身就是媒体（直接返回）；②从 HTML/JS 中扫出媒体链接；
+// ③解析站返回 JSON 的 url 字段。多策略兜底第三方站改版。
+
+#[derive(Serialize)]
+pub struct ResolveResult {
+    pub url: String,
+    pub title: Option<String>,
+}
+
+#[tauri::command]
+pub async fn resolve_vip_url(page_url: String, api_base: String) -> Result<ResolveResult, String> {
+    let api_base = api_base.trim();
+    if api_base.is_empty() {
+        return Err("解析站地址为空，请在设置中配置解析接口".into());
+    }
+    // 组装解析请求地址：<api_base> 可能带或不带 http(s):// 与结尾斜杠
+    let base = if api_base.contains("://") {
+        api_base.to_string()
+    } else {
+        format!("https://{}", api_base)
+    };
+    let api_url = if base.ends_with('/') {
+        format!("{}?url={}", base, urlencode(&page_url))
+    } else {
+        format!("{}/?url={}", base, urlencode(&page_url))
+    };
+
+    let resp = HTTP
+        .get(&api_url)
+        .header(
+            reqwest::header::USER_AGENT,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        )
+        .header(reqwest::header::REFERER, base.as_str())
+        .send()
+        .await
+        .map_err(|e| format!("解析请求失败（网络/解析站不可达）: {}", e))?;
+    let status = resp.status();
+    let final_url = resp.url().to_string();
+    let ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("解析响应读取失败: {}", e))?;
+
+    // ① 最终响应本身就是媒体（重定向到直链，或 content-type 是视频/播放列表）
+    if is_media_url(&final_url)
+        || ct.starts_with("video/")
+        || ct.contains("mpegurl")
+        || ct.contains("application/vnd.apple")
+    {
+        return Ok(ResolveResult {
+            url: final_url,
+            title: extract_title(&body),
+        });
+    }
+    // ② 从 HTML/JS 中扫出第一个媒体链接
+    if let Some(found) = extract_media_url(&body, &base) {
+        return Ok(ResolveResult {
+            url: found,
+            title: extract_title(&body),
+        });
+    }
+    // ③ 解析站返回 JSON（常见于 {url:"...",title:"..."}）
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+        if let Some(u) = json.get("url").and_then(|v| v.as_str()) {
+            if is_media_url(u) {
+                return Ok(ResolveResult {
+                    url: u.to_string(),
+                    title: json
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                });
+            }
+        }
+    }
+    Err(format!(
+        "未能从解析站响应中提取可播地址（状态码 {}）。解析站可能改版/失效，请在设置中更换解析接口。",
+        status
+    ))
+}
+
+/// 仅编码 URL 中的保留字符（保持可读性，解析站普遍接受）
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+fn is_media_url(u: &str) -> bool {
+    let lower = u.to_ascii_lowercase();
+    lower.contains(".m3u8")
+        || lower.contains(".mp4")
+        || lower.contains(".mkv")
+        || lower.contains(".ts")
+        || lower.contains(".webm")
+        || lower.contains(".flv")
+}
+
+/// 在 HTML/JS 文本中找出第一个媒体直链；优先排除解析站自身域名，优先 https。
+fn extract_media_url(html: &str, self_base: &str) -> Option<String> {
+    let self_host = self_base
+        .split("://")
+        .nth(1)
+        .and_then(|r| r.split('/').next())
+        .unwrap_or("");
+    let mut candidates: Vec<(bool, String)> = Vec::new();
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    while i < bytes.len().saturating_sub(4) {
+        if (bytes[i] == b'h' && bytes[i + 1] == b't' && bytes[i + 2] == b't' && bytes[i + 3] == b'p')
+            || (bytes[i] == b'H' && bytes[i + 1] == b'T' && bytes[i + 2] == b'T' && bytes[i + 3] == b'P')
+        {
+            // 扩展 token 到引号/空白/结束
+            let mut j = i;
+            while j < bytes.len() {
+                let c = bytes[j];
+                if c == b'"' || c == b'\'' || c == b' ' || c == b'<' || c == b'\\' || c == b')' {
+                    break;
+                }
+                j += 1;
+            }
+            let tok = String::from_utf8_lossy(&bytes[i..j]).to_string();
+            let lower = tok.to_ascii_lowercase();
+            if is_media_url(&lower) {
+                let is_self = !self_host.is_empty() && lower.contains(&self_host.to_ascii_lowercase());
+                candidates.push((is_self, tok));
+            }
+            i = j.max(i + 4);
+        } else {
+            i += 1;
+        }
+    }
+    // 优先返回非解析站自身域名的链接；都没有再退而求其次
+    candidates
+        .iter()
+        .find(|(is_self, _)| !is_self)
+        .or_else(|| candidates.first())
+        .map(|(_, u)| u.clone())
+}
+
+fn extract_title(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let start = lower.find("<title>")? + 7;
+    let end = lower[start..].find("</title>")?;
+    let t = html[start..start + end].trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+// ---------- AirPlay 发端（投 Apple TV / 支持 AirPlay 的电视） ----------
+// 参考 MiracastReceiver 的 AirPlay 接收端实现：URL 投屏只需 mDNS 发现（_airplay._tcp）
+// + 一个 POST /play（Content-Location 带视频 URL、Start-Position 从头播），无需 RTSP 镜像加密。
+// 三星/安卓 DLNA 走 cast_to_device；Apple TV 等走 cast_to_airplay。
+
+static MDNS: Lazy<Mutex<Option<ServiceDaemon>>> = Lazy::new(|| Mutex::new(None));
+
+/// 搜索局域网内的 AirPlay 接收端。返回的设备 control_url 即 http://<ip>:<port>，protocol=airplay。
+#[tauri::command]
+pub async fn search_airplay_devices(timeout_ms: Option<u64>) -> Result<Vec<DlnaDevice>, String> {
+    let timeout = Duration::from_millis(timeout_ms.unwrap_or(3000).clamp(500, 8000));
+    // 取/建 mDNS 守护进程（绑定 5353，单例复用，避免重复占用多播端口）
+    let daemon = {
+        let mut g = MDNS.lock().unwrap();
+        if g.is_none() {
+            match ServiceDaemon::new() {
+                Ok(d) => *g = Some(d),
+                Err(e) => {
+                    return Err(format!(
+                        "AirPlay 发现初始化失败（mDNS 多播权限？）: {}",
+                        e
+                    ))
+                }
+            }
+        }
+        g.as_ref().unwrap().clone()
+    };
+    // browse() 直接返回 mpsc 接收端（无 get_event_receiver 一说）。
+    // 把整个收集过程放到阻塞任务里：recv_timeout 区分「正常空等超时」与
+    // 「通道断开」，前者继续等、后者（守护进程已停）停止收集，不会提前收尾。
+    let receiver = daemon
+        .browse("_airplay._tcp.local.")
+        .map_err(|e| format!("AirPlay 浏览失败: {}", e))?;
+    let devices = tauri::async_runtime::spawn_blocking(move || {
+        let mut map: HashMap<String, DlnaDevice> = HashMap::new();
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match receiver.recv_timeout(Duration::from_millis(250)) {
+                Ok(ServiceEvent::ServiceResolved(info)) => {
+                    // get_addresses() 返回 IPv4 集合，元素即 Ipv4Addr，无需再 is_ipv4
+                    let fullname = info.get_fullname();
+                    let name = fullname.split('.').next().unwrap_or(fullname).to_string();
+                    let addr = info.get_addresses().iter().next().copied();
+                    let port = info.get_port();
+                    if let Some(a) = addr {
+                        if port > 0 {
+                            // Ipv4Addr 直接 Display，不需要 .ip()
+                            let base = format!("http://{}:{}", a, port);
+                            let key = format!("{}:{}", a, port);
+                            map.insert(
+                                key,
+                                DlnaDevice {
+                                    name,
+                                    control_url: base.clone(),
+                                    location: base,
+                                    protocol: "airplay".to_string(),
+                                },
+                            );
+                        }
+                    }
+                }
+                // 其它事件（服务移除/更新）：忽略
+                Ok(_) => continue,
+                // 超时：正常空等，直到 deadline
+                Err(e) if e.is_timeout() => continue,
+                // 通道断开（守护进程已停）：停止收集
+                Err(_) => break,
+            }
+        }
+        map
+    })
+    .await
+    .map_err(|e| format!("AirPlay 设备收集任务失败: {}", e))?;
+    Ok(devices.into_values().collect())
+}
+
+/// AirPlay 视频投屏：POST /play，Content-Location 带视频 URL，Start-Position 从头播放。
+#[tauri::command]
+pub async fn cast_to_airplay(base_url: String, video_url: String) -> Result<(), String> {
+    let url = format!("{}/play", base_url.trim_end_matches('/'));
+    // text/parameters：每行 Key: Value，CRLF 结尾
+    let body = format!("Content-Location: {}\r\nStart-Position: 0.000000\r\n\r\n", video_url);
+    let resp = HTTP
+        .post(&url)
+        .header(reqwest::header::CONTENT_TYPE, "text/parameters")
+        .header("User-Agent", "LibreTV/1.0")
+        .header("X-Apple-Client-Name", "LibreTV")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("AirPlay /play 请求失败（设备不可达？）: {}", e))?;
+    let status = resp.status();
+    if status.is_success() || status.as_u16() == 200 {
+        Ok(())
+    } else {
+        Err(format!(
+            "AirPlay 投屏被拒绝（状态码 {}）。Apple TV 需在电视上允许本机 AirPlay 连接。",
+            status
+        ))
+    }
+}
+
+async fn ensure_local_file_server(preferred_ip: Option<IpAddr>) -> Result<(), String> {
+    if LOCAL_FILE.lock().unwrap().is_some() {
+        return Ok(());
+    }
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
+        .await
+        .map_err(|e| format!("本地文件服务端口绑定失败: {}", e))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("本地文件地址读取失败: {}", e))?
+        .port();
+    // 优先用与设备同网段的本机网卡 IP，保证电视可达（多网卡/VPN 下尤其关键）
+    let ip = match preferred_ip {
+        Some(dev) => best_local_ip_for(dev)
+            .map(|(ip, _)| ip)
+            .or(Some(dev))
+            .or_else(local_lan_ip)
+            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        None => local_lan_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+    };
+    let base = format!("http://{}:{}", ip, port);
+    {
+        let mut guard = LOCAL_FILE.lock().unwrap();
+        *guard = Some(LocalFileState {
+            base: base.clone(),
+            files: HashMap::new(),
+            port,
+        });
+    }
+    tauri::async_runtime::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    tauri::async_runtime::spawn(async move {
+                        let _ = handle_local_file_conn(stream).await;
+                    });
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    });
+    Ok(())
+}
+
+async fn handle_local_file_conn(mut stream: tokio::net::TcpStream) -> Result<(), String> {
+    // 读请求头（最多 16KB），与代理连接同范式
+    let mut buffer = vec![0u8; 16384];
+    let mut received = 0usize;
+    loop {
+        if received >= buffer.len() {
+            return Err("请求头过大".to_string());
+        }
+        let n = stream
+            .read(&mut buffer[received..])
+            .await
+            .map_err(|e| format!("读取请求失败: {}", e))?;
+        if n == 0 {
+            break;
+        }
+        received += n;
+        if buffer[..received].windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let head = String::from_utf8_lossy(&buffer[..received]).to_string();
+    let request_line = head.lines().next().unwrap_or_default();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let req_path = parts.next().unwrap_or_default().to_string();
+    let path_only = req_path.split('?').next().unwrap_or("").to_string();
+    let segs: Vec<&str> = path_only.split('/').filter(|s| !s.is_empty()).collect();
+
+    // 非 /l 路径：健康检查
+    if segs.first().copied() != Some("l") || segs.len() < 2 {
+        let body = b"LibreTV local file server";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.write_all(body).await;
+        let _ = stream.flush().await;
+        return Ok(());
+    }
+    let token = segs[1];
+    let file_path: Option<PathBuf> = {
+        let guard = LOCAL_FILE.lock().unwrap();
+        guard.as_ref().and_then(|s| s.files.get(token)).cloned()
+    };
+    let file_path = match file_path {
+        Some(p) => p,
+        None => {
+            write_status(&mut stream, "404 Not Found", b"not found").await;
+            return Ok(());
+        }
+    };
+    let meta = match tokio::fs::metadata(&file_path).await {
+        Ok(m) => m,
+        Err(_) => {
+            write_status(&mut stream, "404 Not Found", b"not found").await;
+            return Ok(());
+        }
+    };
+    if meta.is_dir() {
+        write_status(&mut stream, "404 Not Found", b"not found").await;
+        return Ok(());
+    }
+    let total = meta.len();
+    let mime = local_file_mime(&file_path);
+
+    // 渲染端可达性 + DLNA 合规探测：HEAD 也需要正确的 DLNA 头
+    if method == "HEAD" {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\n\
+transferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nConnection: close\r\n\r\n",
+            mime, total, SAMSUNG_DLNA_FLAGS
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+        return Ok(());
+    }
+    if method != "GET" {
+        let response = "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+        return Ok(());
+    }
+
+    // Range 解析：单一 bytes 区间（电视拖拽进度足够）
+    let range = head
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("range:"))
+        .and_then(|line| line.split_once(':'))
+        .map(|(_, v)| v.trim().to_string());
+    let (start, end, status_line, content_range) = match range {
+        Some(r) if r.to_ascii_lowercase().starts_with("bytes=") => {
+            let spec = &r[6..];
+            let (s, e) = match spec.split_once('-') {
+                Some((s, e)) => (s.trim(), e.trim()),
+                None => ("0", ""),
+            };
+            let start = s.parse::<u64>().unwrap_or(0);
+            let end = if e.is_empty() {
+                total.saturating_sub(1)
+            } else {
+                e.parse::<u64>()
+                    .unwrap_or(total.saturating_sub(1))
+                    .min(total.saturating_sub(1))
+            };
+            if start > end || start >= total {
+                write_status(&mut stream, "416 Range Not Satisfiable", b"out of range").await;
+                return Ok(());
+            }
+            (
+                start,
+                end,
+                "206 Partial Content",
+                format!("bytes {}-{}/{}", start, end, total),
+            )
+        }
+        _ => (0, total.saturating_sub(1), "200 OK", String::new()),
+    };
+    let len = end - start + 1;
+    let mut file = match tokio::fs::File::open(&file_path).await {
+        Ok(f) => f,
+        Err(_) => {
+            write_status(&mut stream, "404 Not Found", b"not found").await;
+            return Ok(());
+        }
+    };
+    if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        write_status(&mut stream, "500 Internal Server Error", b"seek failed").await;
+        return Ok(());
+    }
+    let header = if status_line.starts_with("206") {
+        format!(
+            "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nContent-Range: {}\r\nAccept-Ranges: bytes\r\n\
+transferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nConnection: close\r\n\r\n",
+            status_line, mime, len, content_range, SAMSUNG_DLNA_FLAGS
+        )
+    } else {
+        format!(
+            "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\n\
+transferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nConnection: close\r\n\r\n",
+            status_line, mime, len, SAMSUNG_DLNA_FLAGS
+        )
+    };
+    if stream.write_all(header.as_bytes()).await.is_err() {
+        return Ok(());
+    }
+    // 分块转发 body，避免大文件一次性读入内存
+    let mut remaining = len;
+    let mut buf = vec![0u8; 65536];
+    while remaining > 0 {
+        let to_read = remaining.min(buf.len() as u64) as usize;
+        match file.read(&mut buf[..to_read]).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if stream.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+                remaining -= n as u64;
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = stream.flush().await;
+    Ok(())
+}
+
+async fn write_status(stream: &mut tokio::net::TcpStream, status: &str, body: &[u8]) {
+    let response = format!(
+        "HTTP/1.1 {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        status,
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.write_all(body).await;
+    let _ = stream.flush().await;
 }
 
 async fn handle_proxy_conn(mut stream: tokio::net::TcpStream, upstream: Arc<Upstream>) -> Result<(), String> {
@@ -1261,22 +1951,29 @@ async fn handle_proxy_conn(mut stream: tokio::net::TcpStream, upstream: Arc<Upst
         None => (encoded, None),
     };
     if method == "HEAD" {
-        // 渲染端探测资源可达性：回 200 + 真实 MIME，无 body（HEAD 语义）。
-        // 此前直接断连，三星把 SetAVTransportURI 判成 716 Resource not found。
+        // 渲染端（三星等）在 SetAVTransportURI 前用 HEAD 探测资源可达性与 DLNA 合规：
+        // 不仅看状态码，还要看 contentFeatures.dlna.org / transferMode.dlna.org 头，
+        // 缺了就会被判 716 Resource not found（此前只回 200+Content-Type 仍 716 的根因）。
         let ctype = if encoded == "live.ts" {
-            "video/mp2t"
+            // 三星要求 DLNA 专用 MIME video/vnd.dlna.mpeg-tts；标准安卓 DLNA 渲染端
+            // 更认 video/mp2t。两者 DIDL 的 DLNA flags 与下方响应头一致，仅 MIME 分流。
+            if upstream.is_samsung {
+                "video/vnd.dlna.mpeg-tts"
+            } else {
+                "video/mp2t"
+            }
         } else {
             match b64url_decode(encoded)
-                .ok()
                 .and_then(|b| String::from_utf8(b).ok())
             {
-                Some(target) => protocol_info_for(&target),
+                Some(target) => protocol_info_for(&target, upstream.is_samsung),
                 None => "application/octet-stream",
             }
         };
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nAccept-Ranges: none\r\nConnection: close\r\n\r\n",
-            ctype
+            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nAccept-Ranges: none\r\n\
+transferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nConnection: close\r\n\r\n",
+            ctype, SAMSUNG_DLNA_FLAGS
         );
         let _ = stream.write_all(response.as_bytes()).await;
         let _ = stream.flush().await;
@@ -1610,7 +2307,16 @@ async fn serve_live_ts(
         return Err("媒体清单里没有可用分片".to_string());
     }
 
-    let head = "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
+    let ts_mime = if upstream.is_samsung {
+        "video/vnd.dlna.mpeg-tts"
+    } else {
+        "video/mp2t"
+    };
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nCache-Control: no-store\r\n\
+transferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nConnection: close\r\n\r\n",
+        ts_mime, SAMSUNG_DLNA_FLAGS
+    );
     stream
         .write_all(head.as_bytes())
         .await
@@ -1922,17 +2628,19 @@ xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>402</errorCode>\
 
     #[test]
     fn set_uri_body_escapes_and_res() {
-        let body = build_set_uri_body("https://a.b/c.m3u8?x=1&y=2", Some("测试影片"), true, None);
+        let body = build_set_uri_body("https://a.b/c.m3u8?x=1&y=2", Some("测试影片"), true, None, true);
         // URL 的 & 已转义（设备端 XML 解析器必需），m3u8 的 protocolInfo 已带上
         assert!(body.contains("&amp;y=2"));
         assert!(body.contains("&lt;res protocolInfo="));
         assert!(body.contains("application/vnd.apple.mpegurl"));
-        // 协议声明覆盖：三星对 HLS 不在官方支持列表，重试梯度会改报 video/mp2t
-        let mp2t = build_set_uri_body("https://a.b/c.m3u8", None, true, Some("video/mp2t"));
-        assert!(mp2t.contains("video/mp2t"));
-        assert!(!mp2t.contains("apple.mpegurl"));
+        // 协议声明覆盖：TS 串流梯度必须声明三星 DLNA 专用 MIME（video/vnd.dlna.mpeg-tts），
+        // 且 DIDL protocolInfo 第 4 段携带 DLNA flags（不再是无意义的 "*"）
+        let ts = build_set_uri_body("https://a.b/c.m3u8", None, true, Some("video/vnd.dlna.mpeg-tts"), true);
+        assert!(ts.contains("video/vnd.dlna.mpeg-tts"));
+        assert!(ts.contains(SAMSUNG_DLNA_FLAGS));
+        assert!(!ts.contains("apple.mpegurl"));
         // 无元数据版本不含 res
-        let bare = build_set_uri_body("https://a.b/c.m3u8", None, false, None);
+        let bare = build_set_uri_body("https://a.b/c.m3u8", None, false, None, true);
         assert!(!bare.contains("DIDL-Lite"));
     }
 

@@ -216,12 +216,28 @@
         startCast(activeArt);
     }
 
-    // ---------- DLNA（Tauri 壳） ----------
+    // ---------- 投屏（Tauri 壳：DLNA + AirPlay） ----------
+
+    // 待投屏状态：选择设备后使用
+    let pendingUrl = null;
+    let pendingReferer = null;
+    let pendingPauseSelf = false;
+    let pendingLocalPath = null;     // 非空表示投本地视频文件
+    let pendingResolveReferer = null;
+
+    // 从 http://ip:port/... 取主机（IP），用于让本地服务按设备网段选 LAN 地址
+    function hostOf(url) {
+        try {
+            return new URL(url).hostname;
+        } catch (e) {
+            return (url || '').replace(/^https?:\/\//, '').split('/')[0].split(':')[0];
+        }
+    }
 
     function toggleDlna(art) {
         activeArt = art || activeArt;
         if (!isTauri() || typeof tauriInvoke !== 'function') {
-            notice(activeArt, 'DLNA 投屏仅限 App 内使用');
+            notice(activeArt, '投屏仅限 App 内使用');
             return;
         }
         // 已在投屏：再次点击即停止
@@ -232,19 +248,43 @@
             notice(activeArt, '已停止投屏');
             return;
         }
+        const url = currentSourceUrl(activeArt);
+        if (!url) {
+            notice(activeArt, '当前没有可投屏的视频源');
+            return;
+        }
+        chooseDeviceThenCast(url, currentReferer(), true, null);
+    }
+
+    // 同时搜索 DLNA 与 AirPlay 设备并合并（任一失败不影响另一个）
+    async function searchAllCastDevices(timeoutMs) {
+        const dl = tauriInvoke('search_dlna_devices', { timeoutMs: timeoutMs }).catch(function () { return []; });
+        const ap = tauriInvoke('search_airplay_devices', { timeoutMs: timeoutMs }).catch(function () { return []; });
+        const results = await Promise.all([dl, ap]);
+        const merged = [];
+        results.forEach(function (list) { if (Array.isArray(list)) merged.push.apply(merged, list); });
+        return merged;
+    }
+
+    // 搜索设备 → 弹窗选择 → 按协议投屏。localPath 非空时表示先起本地文件服务再投。
+    function chooseDeviceThenCast(url, referer, pauseSelf, localPath) {
         if (dlnaSearching) return;
         dlnaSearching = true;
         notice(activeArt, '正在搜索局域网内的电视/盒子...');
-        tauriInvoke('search_dlna_devices', { timeoutMs: 3500 }).then(devices => {
+        searchAllCastDevices(3500).then(function (devices) {
             dlnaSearching = false;
             if (!devices || !devices.length) {
                 notice(activeArt, noDeviceHint());
                 return;
             }
+            pendingUrl = url;
+            pendingReferer = referer;
+            pendingPauseSelf = pauseSelf;
+            pendingLocalPath = localPath || null;
             showDeviceChooser(devices);
-        }).catch(err => {
+        }).catch(function (err) {
             dlnaSearching = false;
-            console.warn('DLNA search failed', err);
+            console.warn('device search failed', err);
             notice(activeArt, '搜索设备失败：' + errMsg(err));
         });
     }
@@ -267,16 +307,17 @@
         const panel = document.createElement('div');
         panel.style.cssText = 'background:#1e1e1e;color:#eee;border-radius:12px;padding:20px;min-width:260px;max-width:85vw;max-height:70vh;overflow:auto;';
         panel.innerHTML = '<div style="font-size:15px;margin-bottom:12px;">选择投屏设备</div>';
-        devices.forEach(device => {
+        devices.forEach(function (device) {
+            const protocol = device.protocol === 'airplay' ? 'AirPlay' : 'DLNA';
             const button = document.createElement('button');
             button.type = 'button';
-            button.textContent = device.name || device.control_url;
+            button.textContent = (device.name || device.control_url) + '  〔' + protocol + '〕';
             button.style.cssText = 'display:block;width:100%;text-align:left;padding:10px 12px;margin:4px 0;background:#2b2b2b;color:#eee;border:1px solid #3a3a3a;border-radius:8px;font-size:14px;cursor:pointer;word-break:break-all;';
             button.onmouseenter = function () { button.style.background = '#3a3a3a'; };
             button.onmouseleave = function () { button.style.background = '#2b2b2b'; };
             button.onclick = function () {
                 removeDeviceChooser();
-                castToDlnaDevice(device);
+                onDeviceChosen(device);
             };
             panel.appendChild(button);
         });
@@ -293,46 +334,144 @@
         document.body.appendChild(overlay);
     }
 
+    // 设备选定：本地视频先起服务，再统一路由投屏
+    function onDeviceChosen(device) {
+        if (pendingLocalPath) {
+            const deviceIp = hostOf(device.control_url);
+            tauriInvoke('start_local_file_server', { path: pendingLocalPath, preferredIp: deviceIp }).then(function (entry) {
+                // 本机用回环地址播放，电视用 LAN 地址（按设备网段选，多网卡/VPN 下可达）
+                if (activeArt && activeArt.switchUrl) {
+                    try { activeArt.switchUrl(entry.loopback_url); } catch (e) { /* 不支持切换则忽略 */ }
+                }
+                castUrlToDevice(device, entry.url, null, false);
+            }).catch(function (e) {
+                notice(activeArt, '本地视频服务失败：' + errMsg(e));
+            });
+        } else {
+            castUrlToDevice(device, pendingUrl, pendingReferer, pendingPauseSelf);
+        }
+    }
+
     function removeDeviceChooser() {
         const existing = document.getElementById('dlna-device-chooser');
         if (existing) existing.remove();
     }
 
-    function castToDlnaDevice(device) {
+    // 按协议把视频地址投到指定设备：DLNA 走 cast_to_device，AirPlay 走 cast_to_airplay
+    function castUrlToDevice(device, url, referer, pauseSelf) {
         const art = activeArt;
-        // MSE 播放下 currentSrc 是 blob:，必须取 hls 实例上的原始 m3u8 地址
-        const url = currentSourceUrl(art);
         if (!url || !art) {
-            notice(art, '未拿到可投屏的原始视频地址（当前播放可能不支持投屏）');
+            notice(art, '未拿到可投屏的视频地址');
             return;
         }
-        notice(art, '正在投屏到「' + (device.name || '设备') + '」...');
-        tauriInvoke('cast_to_device', {
-            controlUrl: device.control_url,
-            url: url,
-            title: (typeof currentVideoTitle === 'string' && currentVideoTitle) ? currentVideoTitle : 'LibreTV',
-            position: (art.video && art.video.currentTime) || 0,
-            referer: currentReferer()
-        }).then(playbackUrl => {
+        const isAirPlay = device.protocol === 'airplay';
+        notice(art, '正在投屏到「' + (device.name || '设备') + '」(' + (isAirPlay ? 'AirPlay' : 'DLNA') + ')...');
+        const onOk = function () {
             dlnaActiveControlUrl = device.control_url;
-            if (art.pause) art.pause();
+            if (pauseSelf && art.pause) art.pause();
             setCastingUi(art, true);
             setCastKeepAwake(true);
-            // 防盗链源走本地代理时，提示电视端实际播放的地址，便于排查
-            const viaProxy = playbackUrl && playbackUrl.indexOf(location.hostname) === -1 &&
-                /http:\/\/\d+\.\d+\.\d+\.\d+:\d+\//.test(playbackUrl);
-            let msg = viaProxy ? '已投屏（经本机代理转发，防盗链源已处理）' : '已投屏到电视';
-            // Windows 的最后一种失败形态：指令全通但防火墙拦掉电视对本机代理端口的
-            // 入站连接，表现为电视一直转圈。提前把放行路径告诉用户省一轮来回。
-            if (/Windows/i.test(navigator.userAgent)) {
+            let msg = isAirPlay ? '已投屏到电视（AirPlay）' : '已投屏到电视';
+            if (/Windows/i.test(navigator.userAgent) && !isAirPlay) {
                 msg += '；若电视一直加载不出，通常是防火墙拦了电视访问本机，请在防火墙「允许应用通过防火墙」中勾选本应用后重试';
             }
             notice(art, msg);
-        }).catch(err => {
-            console.warn('DLNA cast failed', err);
+        };
+        const onErr = function (err) {
             setCastKeepAwake(false);
+            console.warn('cast failed', err);
             notice(art, '投屏失败：' + errMsg(err));
-        });
+        };
+        if (isAirPlay) {
+            tauriInvoke('cast_to_airplay', { baseUrl: device.control_url, videoUrl: url })
+                .then(onOk).catch(onErr);
+        } else {
+            tauriInvoke('cast_to_device', {
+                controlUrl: device.control_url,
+                url: url,
+                title: (typeof currentVideoTitle === 'string' && currentVideoTitle) ? currentVideoTitle : 'LibreTV',
+                position: (art.video && art.video.currentTime) || 0,
+                referer: referer || null
+            }).then(onOk).catch(onErr);
+        }
+    }
+
+    // 本地视频：系统文件选择器 → 选设备 → 起本地文件服务投屏
+    async function pickAndCastLocalVideo(art) {
+        activeArt = art || activeArt;
+        if (!isTauri() || typeof tauriInvoke !== 'function') {
+            notice(activeArt, '本地视频仅限 App 内使用');
+            return;
+        }
+        let path = null;
+        try {
+            path = await tauriInvoke('pick_local_video', {});
+        } catch (e) {
+            notice(activeArt, '文件选择失败：' + errMsg(e));
+            return;
+        }
+        if (!path) return; // 用户取消
+        notice(activeArt, '已选择本地文件，正在搜索可投屏设备...');
+        chooseDeviceThenCast(null, null, false, path);
+    }
+
+    // 可配置 VIP 解析：粘贴页面 URL → 解析站取回可播 m3u8/mp4 → 本机播放并投屏
+    function openResolveDialog(art) {
+        activeArt = art || activeArt;
+        if (!isTauri() || typeof tauriInvoke !== 'function') {
+            notice(activeArt, '解析仅限 App 内使用');
+            return;
+        }
+        removeResolveDialog();
+        let savedApi = '';
+        try { savedApi = localStorage.getItem('vipApiBase') || ''; } catch (e) {}
+        if (!savedApi) savedApi = 'jx.xmflv.com';
+        const overlay = document.createElement('div');
+        overlay.id = 'vip-resolve-dialog';
+        overlay.style.cssText = 'position:fixed;inset:0;z-index:100001;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;';
+        overlay.innerHTML =
+            '<div style="background:#1e1e1e;color:#eee;border-radius:12px;padding:18px;width:min(420px,90vw);">' +
+            '<div style="font-size:15px;margin-bottom:12px;">VIP 视频解析</div>' +
+            '<div style="font-size:12px;opacity:.6;margin-bottom:4px;">视频页面 URL（爱奇艺/腾讯/优酷等）</div>' +
+            '<input id="vip-page-url" style="width:100%;box-sizing:border-box;padding:8px;margin-bottom:10px;background:#2b2b2b;color:#eee;border:1px solid #3a3a3a;border-radius:8px;font-size:13px;" placeholder="https://..." />' +
+            '<div style="font-size:12px;opacity:.6;margin-bottom:4px;">解析接口（可配置，建议自建/可信源）</div>' +
+            '<input id="vip-api-base" value="' + savedApi + '" style="width:100%;box-sizing:border-box;padding:8px;margin-bottom:14px;background:#2b2b2b;color:#eee;border:1px solid #3a3a3a;border-radius:8px;font-size:13px;" placeholder="jx.xmflv.com" />' +
+            '<div style="display:flex;gap:8px;">' +
+            '<button id="vip-resolve-go" style="flex:1;padding:9px;background:#2563eb;color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer;">解析并投屏</button>' +
+            '<button id="vip-resolve-cancel" style="padding:9px;background:transparent;color:#999;border:none;font-size:13px;cursor:pointer;">取消</button>' +
+            '</div></div>';
+        overlay.onclick = function (event) { if (event.target === overlay) removeResolveDialog(); };
+        document.body.appendChild(overlay);
+        const goBtn = overlay.querySelector('#vip-resolve-go');
+        const cancelBtn = overlay.querySelector('#vip-resolve-cancel');
+        const pageInput = overlay.querySelector('#vip-page-url');
+        const apiInput = overlay.querySelector('#vip-api-base');
+        if (cancelBtn) cancelBtn.onclick = removeResolveDialog;
+        if (goBtn) goBtn.onclick = function () {
+            const pageUrl = (pageInput && pageInput.value || '').trim();
+            const apiBase = (apiInput && apiInput.value || '').trim();
+            if (!pageUrl) { notice(activeArt, '请先粘贴视频页面 URL'); return; }
+            if (!apiBase) { notice(activeArt, '请填写解析接口'); return; }
+            try { localStorage.setItem('vipApiBase', apiBase); } catch (e) {}
+            removeResolveDialog();
+            notice(activeArt, '正在解析「' + pageUrl + '」...');
+            tauriInvoke('resolve_vip_url', { pageUrl: pageUrl, apiBase: apiBase }).then(function (res) {
+                if (!res || !res.url) { notice(activeArt, '解析未返回可播地址'); return; }
+                // 本机先用解析地址播放，再直接投屏（解析站作为 referer 便于电视端代理取流）
+                if (activeArt && activeArt.switchUrl) {
+                    try { activeArt.switchUrl(res.url); } catch (e) {}
+                }
+                notice(activeArt, '解析成功，已本机播放；正在搜索可投屏设备...');
+                chooseDeviceThenCast(res.url, hostOf(apiBase), false, null);
+            }).catch(function (e) {
+                notice(activeArt, '解析失败：' + errMsg(e));
+            });
+        };
+    }
+
+    function removeResolveDialog() {
+        const existing = document.getElementById('vip-resolve-dialog');
+        if (existing) existing.remove();
     }
 
     // 投屏期间保活：本地代理在 App 进程里，系统休眠冻结网络会导致电视端卡断
@@ -452,6 +591,8 @@
         init: loadCastSdk,
         toggle: toggle,
         toggleDlna: toggleDlna,
+        pickAndCastLocalVideo: pickAndCastLocalVideo,
+        openResolveDialog: openResolveDialog,
         stopDlna: stopDlna,
         runDiagnostics: runDiagnostics,
         icon: CAST_ICON,

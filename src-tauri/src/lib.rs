@@ -720,6 +720,7 @@ pub fn run() {
   // }
   
   tauri::Builder::default()
+    .plugin(tauri_plugin_dialog::init())
     // .plugin( // Temporarily commented out
         // log_builder
             // .level(log::LevelFilter::Debug) 
@@ -740,7 +741,13 @@ pub fn run() {
         dlna::search_dlna_devices,
         dlna::cast_to_device,
         dlna::stop_dlna_cast,
-        dlna::dlna_diagnostics
+        dlna::dlna_diagnostics,
+        dlna::start_local_file_server,
+        dlna::stop_local_file_server,
+        dlna::pick_local_video,
+        dlna::resolve_vip_url,
+        dlna::search_airplay_devices,
+        dlna::cast_to_airplay
     ])
     .setup(|app| {
       if let Ok(cache_dir) = app.path().app_cache_dir() {
