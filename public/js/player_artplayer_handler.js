@@ -341,6 +341,19 @@ function buildPlayerSettings() {
             }
         });
     }
+    // 人工标记广告片段：与长按画面同一面板，桌面端鼠标长按不便时的入口
+    if (window.PlayerAdMarker) {
+        items.push({
+            name: 'ad-mark',
+            html: '标记广告片段',
+            width: 200,
+            tooltip: '手动跳过',
+            onClick() {
+                PlayerAdMarker.open(art);
+                return '标记广告片段';
+            }
+        });
+    }
     return items;
 }
 
@@ -496,6 +509,8 @@ function initPlayer(videoUrl) {
         if (typeof setupPlayerBuffer === 'function') setupPlayerBuffer(art);
         if (typeof setupFullscreenOverlay === 'function') setupFullscreenOverlay(art);
         if (typeof setupSeekPill === 'function') setupSeekPill(art);
+        // 人工标记广告：长按画面弹出标记面板（自动规则漏掉的切片广告由用户兜底）
+        if (window.PlayerAdMarker) PlayerAdMarker.attach(art);
     });
 
     art.on('video:loadedmetadata', () => {
