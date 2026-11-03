@@ -42,6 +42,7 @@ const permissions = {
   INTERNET: 'android.permission.INTERNET',
   CHANGE_WIFI_MULTICAST_STATE: 'android.permission.CHANGE_WIFI_MULTICAST_STATE',
   ACCESS_WIFI_STATE: 'android.permission.ACCESS_WIFI_STATE',
+  WAKE_LOCK: 'android.permission.WAKE_LOCK',
 };
 const missing = Object.values(permissions).filter((name) => !manifest.includes(name));
 if (missing.length > 0) {

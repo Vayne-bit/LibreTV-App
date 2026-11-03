@@ -45,6 +45,17 @@ struct ProxyState {
 
 static PROXY: Lazy<Mutex<Option<ProxyState>>> = Lazy::new(|| Mutex::new(None));
 static PROXY_SEQ: AtomicU64 = AtomicU64::new(0);
+/// 代理收到的连接数（含电视的取流请求）。用于投屏失败诊断：
+/// 计数为 0 = 电视根本没连上手机（AP 隔离/不同网段）；>0 = 电视可达但取流被拒。
+static PROXY_CONN_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn proxy_connection_count() -> u64 {
+    PROXY_CONN_COUNT.load(Ordering::Relaxed)
+}
+
+/// 无自定义 UA 时给上游请求补的默认 UA：部分 CDN 对空 UA / 电视 UA 返回 403。
+const DEFAULT_UPSTREAM_UA: &str =
+    "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
 
 /// 生成投屏会话令牌。RandomState 每次实例化使用随机种子（标准库自带熵源），
 /// 再混入纳秒时间与会话序号，无需引入随机数 crate。
@@ -92,7 +103,9 @@ pub async fn search_dlna_devices(timeout_ms: Option<u64>) -> Result<Vec<DlnaDevi
 }
 
 /// 投屏到指定设备。
-/// 源需要 Referer/User-Agent/Cookie 时自动经本地代理中转，返回电视实际播放的地址。
+/// 采用自适应梯度：拉流模式（本地代理/电视直连）× 协议声明（按 URL 猜测/按三星支持列表），
+/// 依次尝试直到设备接受；全部失败时给出带诊断线索的错误（实测三星 Tizen 返回
+/// 716 Resource not found 的两类根因：电视拉不到流 / protocolInfo 不被接受）。
 #[tauri::command]
 pub async fn cast_to_device(
     control_url: String,
@@ -104,29 +117,92 @@ pub async fn cast_to_device(
     cookie: Option<String>,
 ) -> Result<String, String> {
     let has_header = |v: &Option<String>| v.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
-    let playback_url = if has_header(&referer) || has_header(&user_agent) || has_header(&cookie) {
-        start_stream_proxy(
-            url.clone(),
-            generate_session_token(),
-            referer.filter(|s| !s.trim().is_empty()),
-            user_agent.filter(|s| !s.trim().is_empty()),
-            cookie.filter(|s| !s.trim().is_empty()),
-        )
-        .await?
-    } else {
-        stop_stream_proxy();
-        url.clone()
-    };
+    let referer = referer.filter(|s| !s.trim().is_empty());
+    let user_agent = user_agent.filter(|s| !s.trim().is_empty());
+    let cookie = cookie.filter(|s| !s.trim().is_empty());
+    let custom_headers = referer.is_some() || user_agent.is_some() || cookie.is_some();
 
-    dlna_set_av_transport(&control_url, &playback_url, title.as_deref()).await?;
-    dlna_play(&control_url).await?;
-    // 从当前进度续投；部分电视不支持 REL_TIME Seek，失败不影响投屏本身
-    if let Some(pos) = position {
-        if pos > 1.0 {
-            let _ = dlna_seek(&control_url, pos).await;
+    // 协议声明候选：HLS 源先报官方 MIME，被拒后改报三星官方支持的 video/mp2t
+    // （三星文档：支持容器 AVI/MKV/ASF/MP4/3GPP/PS/TS，HLS 不在列表内）
+    let is_hls = {
+        let lower = url.to_ascii_lowercase();
+        let clean = lower.split(|c| c == '?' || c == '#').next().unwrap_or(&lower);
+        !clean.ends_with(".mp4")
+            && !clean.ends_with(".mkv")
+            && !clean.ends_with(".avi")
+            && !clean.ends_with(".ts")
+            && !clean.ends_with(".flv")
+            && !clean.ends_with(".webm")
+    };
+    let mut protocols: Vec<Option<&'static str>> = vec![None]; // None = 按 URL 自动猜测
+    if is_hls {
+        protocols.push(Some("video/mp2t"));
+    }
+
+    // 拉流模式候选：有自定义头的源代理优先（直连必被防盗链拒）；
+    // 无自定义头的源也先试代理（补浏览器 UA、HTTPS 转 HTTP、隐去电视指纹），失败退直连。
+    let mut modes: Vec<&str> = vec!["proxy", "direct"];
+    if custom_headers {
+        modes.reverse();
+    }
+
+    let mut attempts: Vec<String> = Vec::new();
+    let mut proxy_reached_by_tv = false;
+    for mode in &modes {
+        for proto in &protocols {
+            let playback_url = match *mode {
+                "proxy" => {
+                    stop_stream_proxy();
+                    start_stream_proxy(
+                        url.clone(),
+                        generate_session_token(),
+                        referer.clone(),
+                        user_agent.clone(),
+                        cookie.clone(),
+                    )
+                    .await?
+                }
+                _ => {
+                    stop_stream_proxy();
+                    url.clone()
+                }
+            };
+            let mode_desc = if *mode == "proxy" { "本机代理" } else { "电视直连" };
+            let proto_desc = proto.unwrap_or("自动");
+            match dlna_set_av_transport(&control_url, &playback_url, title.as_deref(), *proto).await {
+                Ok(()) => {
+                    dlna_play(&control_url).await?;
+                    // 从当前进度续投；部分电视不支持 REL_TIME Seek，失败不影响投屏本身
+                    if let Some(pos) = position {
+                        if pos > 1.0 {
+                            let _ = dlna_seek(&control_url, pos).await;
+                        }
+                    }
+                    return Ok(playback_url);
+                }
+                Err(e) => {
+                    if *mode == "proxy" && proxy_connection_count() > 0 {
+                        proxy_reached_by_tv = true;
+                    }
+                    attempts.push(format!("[{}/{}] {}", mode_desc, proto_desc, e));
+                }
+            }
         }
     }
-    Ok(playback_url)
+
+    // 全部失败：拼装带诊断线索的错误
+    let mut detail = attempts.join("；");
+    if modes.contains(&"proxy") && !proxy_reached_by_tv {
+        detail.push_str(
+            "。诊断：电视始终未能连接到手机上的代理（请确认电视与手机连的是同一个路由器，\
+             且路由器未开启「AP 隔离/设备隔离/访客网络」），若路由器开启了隔离，电视将无法访问手机",
+        );
+    } else if proxy_reached_by_tv {
+        detail.push_str(
+            "。诊断：电视能连上手机代理但取流失败，多为视频源限制了非浏览器访问或地址已过期，可换一集或换数据源再试",
+        );
+    }
+    Err(detail)
 }
 
 /// 停止投屏。
@@ -662,7 +738,12 @@ fn protocol_info_for(playback_url: &str) -> &'static str {
     }
 }
 
-fn build_set_uri_body(playback_url: &str, title: Option<&str>, with_metadata: bool) -> String {
+fn build_set_uri_body(
+    playback_url: &str,
+    title: Option<&str>,
+    with_metadata: bool,
+    protocol_override: Option<&str>,
+) -> String {
     let safe_title = xml_escape(title.unwrap_or("LibreTV"));
     let uri = xml_escape(playback_url);
     if !with_metadata {
@@ -682,7 +763,7 @@ xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">\
 <res protocolInfo=\"http-get:*:{}:*\">{}</res>\
 </item></DIDL-Lite>",
         safe_title,
-        protocol_info_for(playback_url),
+        protocol_override.unwrap_or_else(|| protocol_info_for(playback_url)),
         uri
     );
     format!(
@@ -698,13 +779,14 @@ async fn dlna_set_av_transport(
     control_url: &str,
     playback_url: &str,
     title: Option<&str>,
+    protocol_override: Option<&str>,
 ) -> Result<(), String> {
-    let with_meta = build_set_uri_body(playback_url, title, true);
+    let with_meta = build_set_uri_body(playback_url, title, true, protocol_override);
     match dlna_soap_call(control_url, "SetAVTransportURI", &with_meta).await {
         Ok(()) => Ok(()),
         Err(first_err) => {
             // 少数设备对元数据内容挑剔（res/protocolInfo 不合口味）：退回空元数据重试一次
-            let fallback = build_set_uri_body(playback_url, title, false);
+            let fallback = build_set_uri_body(playback_url, title, false, protocol_override);
             match dlna_soap_call(control_url, "SetAVTransportURI", &fallback).await {
                 Ok(()) => Ok(()),
                 Err(_) => Err(first_err),
@@ -795,6 +877,7 @@ async fn start_stream_proxy(
         *guard = Some(ProxyState { base: base.clone(), token });
     }
     let _ = PROXY_SEQ.fetch_add(1, Ordering::Relaxed);
+    PROXY_CONN_COUNT.store(0, Ordering::Relaxed); // 新会话重置诊断计数
     Ok(entry)
 }
 
@@ -842,7 +925,9 @@ async fn handle_proxy_conn(mut stream: tokio::net::TcpStream, upstream: Arc<Upst
         .and_then(|line| line.split_once(':'))
         .map(|(_, value)| value.trim().to_string());
 
-    // 路径形如 /s/<token>/<b64url(目标地址)>，健康检查路径直接放行
+    // 路径形如 /s/<token>/<b64url(目标地址)>，健康检查路径直接放行。
+    // 任何到达代理的请求都说明「电视/客户端能连上本机」——计数用于失败诊断。
+    PROXY_CONN_COUNT.fetch_add(1, Ordering::Relaxed);
     if !path.contains("/s/") {
         let body = b"LibreTV DLNA proxy";
         let response = format!(
@@ -879,14 +964,15 @@ async fn handle_proxy_conn(mut stream: tokio::net::TcpStream, upstream: Arc<Upst
     let target_bytes = b64url_decode(encoded).ok_or("代理地址解码失败")?;
     let target = String::from_utf8(target_bytes).map_err(|_| "代理地址不是合法 UTF-8")?;
 
-    // 构造上游请求：带鉴权头 + Range 透传
+    // 构造上游请求：带鉴权头 + Range 透传；未提供 UA 时补默认浏览器 UA
     let mut request = HTTP.get(&target);
     if let Some(referer) = &upstream.referer {
         request = request.header(reqwest::header::REFERER, referer);
     }
-    if let Some(user_agent) = &upstream.user_agent {
-        request = request.header(reqwest::header::USER_AGENT, user_agent);
-    }
+    request = request.header(
+        reqwest::header::USER_AGENT,
+        upstream.user_agent.as_deref().unwrap_or(DEFAULT_UPSTREAM_UA),
+    );
     if let Some(cookie) = &upstream.cookie {
         request = request.header(reqwest::header::COOKIE, cookie);
     }
@@ -1260,13 +1346,35 @@ xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>402</errorCode>\
 
     #[test]
     fn set_uri_body_escapes_and_res() {
-        let body = build_set_uri_body("https://a.b/c.m3u8?x=1&y=2", Some("测试影片"), true);
+        let body = build_set_uri_body("https://a.b/c.m3u8?x=1&y=2", Some("测试影片"), true, None);
         // URL 的 & 已转义（设备端 XML 解析器必需），m3u8 的 protocolInfo 已带上
         assert!(body.contains("&amp;y=2"));
         assert!(body.contains("&lt;res protocolInfo="));
         assert!(body.contains("application/vnd.apple.mpegurl"));
+        // 协议声明覆盖：三星对 HLS 不在官方支持列表，重试梯度会改报 video/mp2t
+        let mp2t = build_set_uri_body("https://a.b/c.m3u8", None, true, Some("video/mp2t"));
+        assert!(mp2t.contains("video/mp2t"));
+        assert!(!mp2t.contains("apple.mpegurl"));
         // 无元数据版本不含 res
-        let bare = build_set_uri_body("https://a.b/c.m3u8", None, false);
+        let bare = build_set_uri_body("https://a.b/c.m3u8", None, false, None);
         assert!(!bare.contains("DIDL-Lite"));
+    }
+
+    #[test]
+    fn cast_ladder_candidates() {
+        // m3u8 源应产生「自动 + mp2t」两个协议候选；直链只产生自动
+        let is_hls = |url: &str| {
+            let lower = url.to_ascii_lowercase();
+            let clean = lower.split(|c| c == '?' || c == '#').next().unwrap_or(&lower);
+            !clean.ends_with(".mp4")
+                && !clean.ends_with(".mkv")
+                && !clean.ends_with(".avi")
+                && !clean.ends_with(".ts")
+                && !clean.ends_with(".flv")
+                && !clean.ends_with(".webm")
+        };
+        assert!(is_hls("https://a.b/vod/index.m3u8?token=x"));
+        assert!(!is_hls("https://a.b/vod/movie.mp4"));
+        assert!(!is_hls("https://a.b/vod/movie.MP4?sign=1"));
     }
 }

@@ -26,6 +26,11 @@ class MainActivity : TauriActivity() {
   // Android WiFi 默认过滤组播，必须持有 MulticastLock 才能收到设备应答。
   private var multicastLock: android.net.wifi.WifiManager.MulticastLock? = null
 
+  // 投屏期间保活：本地代理跑在 App 进程里，电视持续从手机拉流，
+  // 系统休眠/省电会冻结网络导致电视端卡断，需持有 WakeLock + WifiLock。
+  private var castWakeLock: android.os.PowerManager.WakeLock? = null
+  private var castWifiLock: android.net.wifi.WifiManager.WifiLock? = null
+
   override fun onCreate(savedInstanceState: Bundle?) {
     WindowCompat.setDecorFitsSystemWindows(window, false)
     super.onCreate(savedInstanceState)
@@ -142,6 +147,42 @@ class MainActivity : TauriActivity() {
         } else {
           window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
+      }
+    }
+
+    // DLNA 投屏期间保活：电视持续从手机本地代理拉流，
+    // 系统休眠/省电冻结网络会让电视端卡断。持 WakeLock（CPU）+ WifiLock（高性能 WiFi）。
+    @JavascriptInterface
+    fun keepAwake(enabled: Boolean) {
+      try {
+        if (enabled) {
+          if (castWakeLock == null) {
+            val pm = getSystemService(POWER_SERVICE) as android.os.PowerManager
+            castWakeLock = pm.newWakeLock(
+              android.os.PowerManager.PARTIAL_WAKE_LOCK, "LibreTV:CastKeepAlive"
+            ).apply {
+              setReferenceCounted(false)
+              acquire(2 * 60 * 60 * 1000L) // 最长 2 小时，防泄漏兜底
+            }
+          }
+          if (castWifiLock == null) {
+            val wifi = applicationContext.getSystemService(WIFI_SERVICE) as android.net.wifi.WifiManager
+            @Suppress("DEPRECATION")
+            castWifiLock = wifi.createWifiLock(
+              android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "LibreTV:CastWifi"
+            ).apply {
+              setReferenceCounted(false)
+              acquire(2 * 60 * 60 * 1000L)
+            }
+          }
+        } else {
+          castWakeLock?.let { if (it.isHeld) it.release() }
+          castWakeLock = null
+          castWifiLock?.let { if (it.isHeld) it.release() }
+          castWifiLock = null
+        }
+      } catch (e: Exception) {
+        // 权限缺失等场景静默失败：投屏可能因省电中断，但不崩溃
       }
     }
 

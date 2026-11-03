@@ -285,18 +285,29 @@
             dlnaActiveControlUrl = device.control_url;
             if (art.pause) art.pause();
             setCastingUi(art, true);
+            setCastKeepAwake(true);
             // 防盗链源走本地代理时，提示电视端实际播放的地址，便于排查
             const viaProxy = playbackUrl && playbackUrl.indexOf(location.hostname) === -1 &&
                 /http:\/\/\d+\.\d+\.\d+\.\d+:\d+\//.test(playbackUrl);
             notice(art, viaProxy ? '已投屏（经本机代理转发，防盗链源已处理）' : '已投屏到电视');
         }).catch(err => {
             console.warn('DLNA cast failed', err);
+            setCastKeepAwake(false);
             notice(art, '投屏失败：' + errMsg(err));
         });
     }
 
+    // 投屏期间保活：本地代理在 App 进程里，系统休眠冻结网络会导致电视端卡断
+    function setCastKeepAwake(enabled) {
+        try {
+            const bridge = typeof getAndroidBridge === 'function' ? getAndroidBridge() : null;
+            if (bridge && typeof bridge.keepAwake === 'function') bridge.keepAwake(!!enabled);
+        } catch (e) { /* 非安卓环境忽略 */ }
+    }
+
     function stopDlna(deviceControlUrl) {
         if (!isTauri() || typeof tauriInvoke !== 'function') return;
+        setCastKeepAwake(false);
         tauriInvoke('stop_dlna_cast', { controlUrl: deviceControlUrl }).catch(() => { /* ignore */ });
     }
 
