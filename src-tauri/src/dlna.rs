@@ -149,7 +149,9 @@ pub async fn cast_to_device(
 
     // 代理地址必须从电视可达的网卡出：设备 IP 来自 SSDP（电视真实网段），
     // 据此选同网段本机网卡；选不出再回退默认路由探测
-    let proxy_ip = url_host_ip(&control_url).and_then(best_local_ip_for);
+    let proxy_ip = url_host_ip(&control_url)
+        .and_then(best_local_ip_for)
+        .map(|(ip, _)| ip);
 
     let mut attempts: Vec<String> = Vec::new();
     let mut proxy_reached_by_tv = false;
@@ -318,12 +320,14 @@ pub async fn dlna_diagnostics(
                     Err(_) => report.push_str("    控制指令应答: 超时（6 秒无响应，设备 HTTP 栈可能不稳定）\n"),
                 }
                 // 投屏时本地代理会用哪块网卡的地址下发给电视：必须与设备同网段才可达。
-                // 这里直接算出来，报告里一眼验证「代理地址发错网卡」类问题（如 VPN 抢默认路由）。
+                // 这里直接算出来，报告里一眼验证「代理地址发错网卡」类问题
+                // （如 VPN/蜂窝网卡抢匹配）。
                 match url_host_ip(&dev.control_url).and_then(best_local_ip_for) {
-                    Some(ip) => report.push_str(&format!(
-                        "    投屏代理拟用本机网卡: {}（与设备 {} 同网段）\n",
+                    Some((ip, bits)) => report.push_str(&format!(
+                        "    投屏代理拟用本机网卡: {}（与设备 {} 前缀匹配 {} 位）\n",
                         ip,
-                        url_host_ip(&dev.control_url).map(|i| i.to_string()).unwrap_or_default()
+                        url_host_ip(&dev.control_url).map(|i| i.to_string()).unwrap_or_default(),
+                        bits
                     )),
                     None => report.push_str("    投屏代理拟用本机网卡: 未能确定（将回退默认路由探测，多网卡下可能不可达）\n"),
                 }
@@ -1049,12 +1053,26 @@ fn url_host_ip(url: &str) -> Option<IpAddr> {
     host.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>().ok()
 }
 
-/// 选出与设备同一网段的本机网卡 IP（按相同前缀位数最长匹配）。
-/// 设备 IP 来自 SSDP 应答，是电视真实可达的网段；代理地址必须从这张网卡出。
-/// 实测教训：Windows 多网卡下默认路由探测会返回虚拟网卡 IP（如 WSL/共享网络
-/// 的 82.x），电视完全不可达——表现为四路全 716 且代理连接数恒为 0，
+/// 计算两个 IPv4 地址相同的前导位数（纯逻辑，供单测）。
+/// 惯用法是 (!(a ^ b)).leading_zeros()：异或结果里 1 表示位不同，
+/// 取反后 1 表示位相同，前导零个数即「相同前缀位数」。
+/// 真实教训：写成 (!a) ^ b 是完全不同的运算——取反只作用在 a 上，
+/// 实测导致安卓上 wlan0(188.223，与设备同网段，匹配 24 位) 算出 0，
+/// 反而输给了蜂窝网卡 rmnet(10.30.x，匹配 2 位)，代理地址发到了
+/// 电视不可达的移动网络上。
+fn same_prefix_bits(a: Ipv4Addr, b: Ipv4Addr) -> u32 {
+    (!(u32::from(a) ^ u32::from(b))).leading_zeros()
+}
+
+/// 选出与设备同一网段的本机网卡，返回（网卡 IP, 与设备 IP 的前缀匹配位数）。
+/// 按匹配位数最长者胜；设备 IP 来自 SSDP 应答，是电视真实可达的网段，
+/// 代理地址必须从这张网卡出。
+/// 实测教训一：Windows 多网卡下默认路由探测会返回虚拟网卡 IP（如 WSL/共享
+/// 网络的 82.x），电视完全不可达——表现为四路全 716 且代理连接数恒为 0，
 /// 防火墙放行也无效。
-fn best_local_ip_for(device: IpAddr) -> Option<IpAddr> {
+/// 实测教训二：前缀位数算错（见 same_prefix_bits 注释）会让同网段网卡
+/// 输给蜂窝/虚拟网卡。
+fn best_local_ip_for(device: IpAddr) -> Option<(IpAddr, u32)> {
     let dev_v4 = match device {
         IpAddr::V4(v) => v,
         // 局域网 DLNA 设备几乎全是 IPv4，V6 场景回退默认路由探测
@@ -1070,13 +1088,13 @@ fn best_local_ip_for(device: IpAddr) -> Option<IpAddr> {
             if ip.is_loopback() || ip.is_unspecified() || ip.is_link_local() {
                 continue;
             }
-            let same_prefix_bits = (!u32::from(dev_v4) ^ u32::from(ip)).leading_zeros();
-            if best.map_or(true, |(bits, _)| same_prefix_bits > bits) {
-                best = Some((same_prefix_bits, ip));
+            let bits = same_prefix_bits(dev_v4, ip);
+            if best.map_or(true, |(prev, _)| bits > prev) {
+                best = Some((bits, ip));
             }
         }
     }
-    best.map(|(_, ip)| IpAddr::V4(ip))
+    best.map(|(bits, ip)| (IpAddr::V4(ip), bits))
 }
 
 /// 确定本机局域网 IP（用于拼出电视可访问的代理地址）。
@@ -1985,5 +2003,22 @@ xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>402</errorCode>\
             classify_playlist("<html>not a playlist</html>", "https://a.b/x"),
             Ok(PlaylistKind::Unknown)
         ));
+    }
+
+    #[test]
+    fn prefix_bits_regression() {
+        // 回归：同网段网卡必须胜过蜂窝/虚拟网卡（真实案例 2026-11-03 安卓报告）
+        let dev: Ipv4Addr = "192.168.188.211".parse().unwrap();
+        let wlan: Ipv4Addr = "192.168.188.223".parse().unwrap();
+        let rmnet: Ipv4Addr = "10.30.79.247".parse().unwrap();
+        let vpn: Ipv4Addr = "192.168.82.2".parse().unwrap();
+        assert_eq!(same_prefix_bits(dev, wlan), 24, "同 /24 网段应匹配 24 位");
+        assert_eq!(same_prefix_bits(dev, rmnet), 2, "十进制首位 10 vs 192 仅 2 位相同");
+        assert!(same_prefix_bits(dev, wlan) > same_prefix_bits(dev, rmnet));
+        assert!(same_prefix_bits(dev, wlan) > same_prefix_bits(dev, vpn));
+        assert_eq!(same_prefix_bits(dev, dev), 32);
+        // 错误公式 (!a)^b 的对照：它会把 wlan 算成 0、rmnet 算成 2（正好选反）
+        let wrong = |a: Ipv4Addr, b: Ipv4Addr| (!u32::from(a) ^ u32::from(b)).leading_zeros();
+        assert_ne!(wrong(dev, wlan), 24);
     }
 }
