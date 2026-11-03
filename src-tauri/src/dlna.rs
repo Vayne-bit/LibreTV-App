@@ -8,13 +8,14 @@
 //    m3u8 播放列表会被改写：分片/密钥/子列表地址全部指向本地代理，整条链路
 //    （列表 -> 分片 -> 密钥）都经过代理，防盗链源可完整投屏。
 //
-// 依赖刻意收敛在仓库已有 crate（tokio / reqwest / serde / once_cell），不引入新依赖。
-// SSDP 用 std UdpSocket 组播；Android 侧需要多播锁（MainActivity.kt 启动时 acquire），
+// 依赖刻意收敛在仓库已有 crate（tokio / reqwest / serde / once_cell）加极小的 if-addrs，
+// 不引入重型依赖。SSDP 用 std UdpSocket 组播（逐网卡发搜索，兼容 Windows 多网卡）；
+// Android 侧需要多播锁（MainActivity.kt 启动时 acquire），
 // 并在 Manifest 声明 CHANGE_WIFI_MULTICAST_STATE（apply-android-overrides.mjs 注入）。
 
 use once_cell::sync::Lazy;
 use serde::Serialize;
-use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -214,12 +215,50 @@ pub async fn stop_dlna_cast(control_url: String) -> Result<(), String> {
 
 // ---------- SSDP 搜索 ----------
 
+const SSDP_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
+const SSDP_MULTICAST_PORT: u16 = 1900;
+
 fn ssdp_search_locations(timeout: Duration) -> Result<Vec<String>, String> {
-    let socket = UdpSocket::bind(("0.0.0.0", 0)).map_err(|e| format!("SSDP 绑定失败: {}", e))?;
-    socket
-        .set_read_timeout(Some(Duration::from_millis(250)))
-        .map_err(|e| format!("SSDP 设置超时失败: {}", e))?;
-    let _ = socket.join_multicast_v4(&Ipv4Addr::new(239, 255, 255, 250), &Ipv4Addr::UNSPECIFIED);
+    // Windows 桌面机普遍有 WSL/VMware/VPN 等虚拟网卡：只绑 0.0.0.0 时
+    // M-SEARCH 从默认路由网卡发出，电视若在另一张网卡所在网段就收不到。
+    // 这里枚举全部 IPv4 网卡，每张各开一个 socket（bind 网卡 IP + 显式指定
+    // 组播出口），同一组 M-SEARCH 从所有网卡并行发出，任一路收到应答都算发现。
+    let mut iface_ips: Vec<Ipv4Addr> = if_addrs::get_if_addrs()
+        .map(|list| {
+            list.into_iter()
+                .filter_map(|iface| match iface.addr {
+                    if_addrs::IfAddr::V4(v4) => Some(v4.ip),
+                    if_addrs::IfAddr::V6(_) => None,
+                })
+                .filter(|ip| !ip.is_loopback() && !ip.is_unspecified() && !ip.is_link_local())
+                .collect()
+        })
+        .unwrap_or_default();
+    iface_ips.sort();
+    iface_ips.dedup();
+    if iface_ips.is_empty() {
+        // 网卡枚举失败（极少见）：退回 0.0.0.0 由系统选默认路由
+        iface_ips.push(Ipv4Addr::UNSPECIFIED);
+    }
+
+    let mut sockets: Vec<UdpSocket> = Vec::new();
+    for ip in &iface_ips {
+        let Ok(socket) = UdpSocket::bind(SocketAddr::new(IpAddr::V4(*ip), 0)) else {
+            continue;
+        };
+        let _ = socket.set_read_timeout(Some(Duration::from_millis(200)));
+        let _ = socket.set_multicast_ttl_v4(2);
+        if ip.is_unspecified() {
+            let _ = socket.join_multicast_v4(&SSDP_MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED);
+        } else {
+            let _ = socket.set_multicast_if_v4(ip);
+            let _ = socket.join_multicast_v4(&SSDP_MULTICAST_ADDR, ip);
+        }
+        sockets.push(socket);
+    }
+    if sockets.is_empty() {
+        return Err("没有可用的网络接口，请检查网络连接后重试".to_string());
+    }
 
     // AVTransport 是渲染设备必须的服务；MediaRenderer 与 ssdp:all 兜底
     // 只对泛型 ST 应答的设备（描述 XML 里再确认 AVTransport）。
@@ -233,7 +272,12 @@ fn ssdp_search_locations(timeout: Duration) -> Result<Vec<String>, String> {
             "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: {}\r\n\r\n",
             st
         );
-        let _ = socket.send_to(message.as_bytes(), "239.255.255.250:1900");
+        for socket in &sockets {
+            let _ = socket.send_to(
+                message.as_bytes(),
+                SocketAddr::new(IpAddr::V4(SSDP_MULTICAST_ADDR), SSDP_MULTICAST_PORT),
+            );
+        }
         std::thread::sleep(Duration::from_millis(60));
     }
 
@@ -241,27 +285,30 @@ fn ssdp_search_locations(timeout: Duration) -> Result<Vec<String>, String> {
     let mut buffer = [0u8; 8192];
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        match socket.recv_from(&mut buffer) {
-            Ok((n, _peer)) => {
-                // 头名用小写副本定位（ASCII 小写化字节长度不变，切片安全），
-                // 值必须取自原文：LOCATION 的大小写与端口是设备真实身份，
-                // 整体转小写会让部分固件的大小写敏感路径失效
-                let original = String::from_utf8_lossy(&buffer[..n]).to_string();
-                let lower = original.to_ascii_lowercase();
-                if let Some(pos) = lower.find("location:") {
-                    let rest = original[pos + "location:".len()..].trim_start();
-                    let end = rest.find('\r').or_else(|| rest.find('\n')).unwrap_or(rest.len());
-                    let location = rest[..end].trim().to_string();
-                    let scheme_ok = location
-                        .get(..4)
-                        .map(|s| s.eq_ignore_ascii_case("http"))
-                        .unwrap_or(false);
-                    if scheme_ok && !locations.contains(&location) {
-                        locations.push(location);
+        for socket in &sockets {
+            match socket.recv_from(&mut buffer) {
+                Ok((n, _peer)) => {
+                    // 头名用小写副本定位（ASCII 小写化字节长度不变，切片安全），
+                    // 值必须取自原文：LOCATION 的大小写与端口是设备真实身份，
+                    // 整体转小写会让部分固件的大小写敏感路径失效
+                    let original = String::from_utf8_lossy(&buffer[..n]).to_string();
+                    let lower = original.to_ascii_lowercase();
+                    if let Some(pos) = lower.find("location:") {
+                        let rest = original[pos + "location:".len()..].trim_start();
+                        let end =
+                            rest.find('\r').or_else(|| rest.find('\n')).unwrap_or(rest.len());
+                        let location = rest[..end].trim().to_string();
+                        let scheme_ok = location
+                            .get(..4)
+                            .map(|s| s.eq_ignore_ascii_case("http"))
+                            .unwrap_or(false);
+                        if scheme_ok && !locations.contains(&location) {
+                            locations.push(location);
+                        }
                     }
                 }
+                Err(_) => continue, // 读超时，轮询下一张网卡的 socket 直到截止时间
             }
-            Err(_) => continue, // 读超时，等下一个应答直到截止时间
         }
     }
     Ok(locations)

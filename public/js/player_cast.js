@@ -220,7 +220,7 @@
         tauriInvoke('search_dlna_devices', { timeoutMs: 3500 }).then(devices => {
             dlnaSearching = false;
             if (!devices || !devices.length) {
-                notice(activeArt, '未发现可投屏设备，请确认电视与手机在同一网络');
+                notice(activeArt, noDeviceHint());
                 return;
             }
             showDeviceChooser(devices);
@@ -229,6 +229,16 @@
             console.warn('DLNA search failed', err);
             notice(activeArt, '搜索设备失败：' + errMsg(err));
         });
+    }
+
+    // 搜不到设备时的提示按平台区分：Windows 端两大主因是防火墙拦应答
+    // （首次弹窗点过「取消」会生成阻止规则）与网络被归为「公用网络」，
+    // 只提示同一网络对 Windows 用户不够用。
+    function noDeviceHint() {
+        if (/Windows/i.test(navigator.userAgent)) {
+            return '未发现可投屏设备：请确认电视与电脑在同一网络；Windows 请到防火墙「允许应用通过防火墙」勾选本应用（首次弹窗点过「取消」会被持续阻止），并把当前网络设为「专用网络」';
+        }
+        return '未发现可投屏设备，请确认电视与手机在同一网络';
     }
 
     function showDeviceChooser(devices) {

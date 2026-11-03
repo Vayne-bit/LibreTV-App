@@ -30,3 +30,4 @@ scraper = "0.19.0"
 # tauri-plugin-log = { version = "2.0.0-rc.1", features = ["colored"] } # Temporarily commented out to ensure compilation
 reqwest = { version = "0.11.27", features = ["json", "rustls-tls"], default-features = false } # 使用较新的 reqwest 版本
 tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] } # 使用较新的 tokio 版本
+if-addrs = "0.13" # 枚举本机 IPv4 网卡：Windows 多网卡（WSL/VMware/VPN）下 SSDP 必须逐网卡发 M-SEARCH
