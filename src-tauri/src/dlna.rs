@@ -1053,15 +1053,17 @@ fn url_host_ip(url: &str) -> Option<IpAddr> {
     host.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>().ok()
 }
 
-/// 计算两个 IPv4 地址相同的前导位数（纯逻辑，供单测）。
-/// 惯用法是 (!(a ^ b)).leading_zeros()：异或结果里 1 表示位不同，
-/// 取反后 1 表示位相同，前导零个数即「相同前缀位数」。
-/// 真实教训：写成 (!a) ^ b 是完全不同的运算——取反只作用在 a 上，
-/// 实测导致安卓上 wlan0(188.223，与设备同网段，匹配 24 位) 算出 0，
-/// 反而输给了蜂窝网卡 rmnet(10.30.x，匹配 2 位)，代理地址发到了
-/// 电视不可达的移动网络上。
+/// 计算两个 IPv4 地址相同的二进制前缀位数（纯逻辑，供单测）。
+/// 惯用法是 (a ^ b).leading_zeros()：异或结果里 1 表示该位不同，
+/// 前导零个数即「从最高位起连续相同的位数」；完全相同为 32。
+/// 两次实测教训（都是安卓诊断报告抓出来的）：
+/// ①写成 (!a) ^ b——取反只作用在 a 上，wlan0(188.223，与设备同网段)
+/// 被蜂窝网卡 rmnet(10.30.x) 反超，代理地址发到移动网络；
+/// ②写成 (!(a ^ b)).leading_zeros()——取反后前导零变成「不同前缀位数」，
+/// 同网段 28 位被算成 0（诊断报告显示「前缀匹配 0 位」即此错），
+/// 当时选对网卡纯属只剩单候选的侥幸。位运算惯用法必须带具体数值验算。
 fn same_prefix_bits(a: Ipv4Addr, b: Ipv4Addr) -> u32 {
-    (!(u32::from(a) ^ u32::from(b))).leading_zeros()
+    (u32::from(a) ^ u32::from(b)).leading_zeros()
 }
 
 /// 选出与设备同一网段的本机网卡，返回（网卡 IP, 与设备 IP 的前缀匹配位数）。
@@ -1204,10 +1206,19 @@ async fn handle_proxy_conn(mut stream: tokio::net::TcpStream, upstream: Arc<Upst
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
     let path = parts.next().unwrap_or_default().to_string();
-    if method != "GET" {
-        return Err("仅支持 GET".to_string());
+    // 任何到达代理的请求（含 HEAD 探测）都说明「电视/客户端能连上本机」——计数用于失败诊断。
+    // 计数必须在方法过滤之前：渲染端（三星等）常在 SetAVTransportURI 时用 HEAD
+    // 探测资源可达性，此前 HEAD 直接断连且不计数，表现为 716 + 诊断连接数恒 0。
+    PROXY_CONN_COUNT.fetch_add(1, Ordering::Relaxed);
+    if method != "GET" && method != "HEAD" {
+        // 其他方法也回标准响应而不是直接断连——渲染端探测被掐会被判为资源不存在（716）
+        let response =
+            "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+        return Ok(());
     }
-    // 透传 Range（电视拖进度条时发出）
+    // 透传 Range（电视拖进度条时发出；HEAD 用不到，解析无害）
     let range = head
         .lines()
         .find(|line| line.to_ascii_lowercase().starts_with("range:"))
@@ -1215,8 +1226,6 @@ async fn handle_proxy_conn(mut stream: tokio::net::TcpStream, upstream: Arc<Upst
         .map(|(_, value)| value.trim().to_string());
 
     // 路径形如 /s/<token>/<b64url(目标地址)>，健康检查路径直接放行。
-    // 任何到达代理的请求都说明「电视/客户端能连上本机」——计数用于失败诊断。
-    PROXY_CONN_COUNT.fetch_add(1, Ordering::Relaxed);
     if !path.contains("/s/") {
         let body = b"LibreTV DLNA proxy";
         let response = format!(
@@ -1251,6 +1260,28 @@ async fn handle_proxy_conn(mut stream: tokio::net::TcpStream, upstream: Arc<Upst
         Some((e, q)) => (e, Some(q)),
         None => (encoded, None),
     };
+    if method == "HEAD" {
+        // 渲染端探测资源可达性：回 200 + 真实 MIME，无 body（HEAD 语义）。
+        // 此前直接断连，三星把 SetAVTransportURI 判成 716 Resource not found。
+        let ctype = if encoded == "live.ts" {
+            "video/mp2t"
+        } else {
+            match b64url_decode(encoded)
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+            {
+                Some(target) => protocol_info_for(&target),
+                None => "application/octet-stream",
+            }
+        };
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nAccept-Ranges: none\r\nConnection: close\r\n\r\n",
+            ctype
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+        return Ok(());
+    }
     if encoded == "live.ts" {
         let u = query
             .and_then(|q| {
@@ -2013,13 +2044,17 @@ xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>402</errorCode>\
         let wlan: Ipv4Addr = "192.168.188.223".parse().unwrap();
         let rmnet: Ipv4Addr = "10.30.79.247".parse().unwrap();
         let vpn: Ipv4Addr = "192.168.82.2".parse().unwrap();
-        assert_eq!(same_prefix_bits(dev, wlan), 24, "同 /24 网段应匹配 24 位");
-        assert_eq!(same_prefix_bits(dev, rmnet), 2, "十进制首位 10 vs 192 仅 2 位相同");
+        // 211=11010011 vs 223=11011111：末字节第 3 位（值 8）起不同 → 相同前缀 28 位
+        assert_eq!(same_prefix_bits(dev, wlan), 28, "同网段应匹配 28 位");
+        // 188=10111100 vs 10=00001010：最高位即不同 → 0 位
+        assert_eq!(same_prefix_bits(dev, rmnet), 0, "跨网段首位即不同");
         assert!(same_prefix_bits(dev, wlan) > same_prefix_bits(dev, rmnet));
         assert!(same_prefix_bits(dev, wlan) > same_prefix_bits(dev, vpn));
         assert_eq!(same_prefix_bits(dev, dev), 32);
-        // 错误公式 (!a)^b 的对照：它会把 wlan 算成 0、rmnet 算成 2（正好选反）
-        let wrong = |a: Ipv4Addr, b: Ipv4Addr| (!u32::from(a) ^ u32::from(b)).leading_zeros();
-        assert_ne!(wrong(dev, wlan), 24);
+        // 两个历史错误公式的对照（安卓实测各翻过一次车）：都把同网段算成 0
+        let wrong1 = |a: Ipv4Addr, b: Ipv4Addr| (!u32::from(a) ^ u32::from(b)).leading_zeros();
+        let wrong2 = |a: Ipv4Addr, b: Ipv4Addr| (!(u32::from(a) ^ u32::from(b))).leading_zeros();
+        assert_ne!(wrong1(dev, wlan), same_prefix_bits(dev, wlan));
+        assert_ne!(wrong2(dev, wlan), same_prefix_bits(dev, wlan));
     }
 }
