@@ -8,6 +8,6 @@
   "permissions": [
     "core:default",
     "core:window:allow-set-fullscreen",
-    "tauri-plugin-dialog:default"
+    "dialog:default"
   ]
 }
