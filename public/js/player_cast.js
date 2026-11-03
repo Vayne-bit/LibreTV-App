@@ -321,7 +321,13 @@
             // 防盗链源走本地代理时，提示电视端实际播放的地址，便于排查
             const viaProxy = playbackUrl && playbackUrl.indexOf(location.hostname) === -1 &&
                 /http:\/\/\d+\.\d+\.\d+\.\d+:\d+\//.test(playbackUrl);
-            notice(art, viaProxy ? '已投屏（经本机代理转发，防盗链源已处理）' : '已投屏到电视');
+            let msg = viaProxy ? '已投屏（经本机代理转发，防盗链源已处理）' : '已投屏到电视';
+            // Windows 的最后一种失败形态：指令全通但防火墙拦掉电视对本机代理端口的
+            // 入站连接，表现为电视一直转圈。提前把放行路径告诉用户省一轮来回。
+            if (/Windows/i.test(navigator.userAgent)) {
+                msg += '；若电视一直加载不出，通常是防火墙拦了电视访问本机，请在防火墙「允许应用通过防火墙」中勾选本应用后重试';
+            }
+            notice(art, msg);
         }).catch(err => {
             console.warn('DLNA cast failed', err);
             setCastKeepAwake(false);
