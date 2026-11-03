@@ -252,7 +252,7 @@ fn find_avtransport_control_url(xml: &str) -> Option<String> {
                 // 索引在小写副本与原文之间一一对应（ASCII 小写化不改字节长度），
                 // 值从原文取出，保留大小写并解码实体
                 let raw_value = &xml[start + value_start..start + value_end];
-                return Some(xml_unescape(sanitize_url_text(raw_value)));
+                return Some(xml_unescape(&sanitize_url_text(raw_value)));
             }
         }
         cursor = end + "</service>".len();
@@ -266,7 +266,7 @@ fn xml_text(xml: &str, tag: &str) -> Option<String> {
     let lower = xml.to_ascii_lowercase();
     let start = lower.find(&open)? + open.len();
     let end = lower[start..].find(&close)? + start;
-    Some(xml_unescape(sanitize_url_text(&xml[start..end])))
+    Some(xml_unescape(&sanitize_url_text(&xml[start..end])))
 }
 
 fn xml_unescape(value: &str) -> String {
@@ -351,7 +351,7 @@ fn resolve_control_url(base: &str, target: &str) -> String {
         format!("{}://{}{}", scheme, authority, target)
     } else {
         // 实测部分设备 controlURL 少了前导 '/'（swyh-rs normalize_url 同款处理）
-        format!("{}://{}{}", scheme, authority, normalize_control_path(target))
+        format!("{}://{}{}", scheme, authority, normalize_control_path(&target))
     }
 }
 
