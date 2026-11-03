@@ -167,13 +167,20 @@ fn ssdp_search_locations(timeout: Duration) -> Result<Vec<String>, String> {
     while Instant::now() < deadline {
         match socket.recv_from(&mut buffer) {
             Ok((n, _peer)) => {
-                // 只用 ASCII 小写化（字节长度不变，切片安全）
-                let text = String::from_utf8_lossy(&buffer[..n]).to_ascii_lowercase();
-                if let Some(pos) = text.find("location:") {
-                    let rest = text[pos + "location:".len()..].trim_start();
+                // 头名用小写副本定位（ASCII 小写化字节长度不变，切片安全），
+                // 值必须取自原文：LOCATION 的大小写与端口是设备真实身份，
+                // 整体转小写会让部分固件的大小写敏感路径失效
+                let original = String::from_utf8_lossy(&buffer[..n]).to_string();
+                let lower = original.to_ascii_lowercase();
+                if let Some(pos) = lower.find("location:") {
+                    let rest = original[pos + "location:".len()..].trim_start();
                     let end = rest.find('\r').or_else(|| rest.find('\n')).unwrap_or(rest.len());
                     let location = rest[..end].trim().to_string();
-                    if location.starts_with("http") && !locations.contains(&location) {
+                    let scheme_ok = location
+                        .get(..4)
+                        .map(|s| s.eq_ignore_ascii_case("http"))
+                        .unwrap_or(false);
+                    if scheme_ok && !locations.contains(&location) {
                         locations.push(location);
                     }
                 }
@@ -197,12 +204,28 @@ async fn fetch_device_info(location: &str) -> Result<DlnaDevice, String> {
         .map_err(|e| format!("设备描述读取失败: {}", e))?;
 
     let name = xml_text(&xml, "friendlyName").unwrap_or_else(|| "未知设备".to_string());
-    // controlURL 可能是相对路径，先看 URLBase 再回落到 location
-    let base = xml_text(&xml, "URLBase").unwrap_or_else(|| location.to_string());
     let control_path = find_avtransport_control_url(&xml).ok_or("设备不支持 AVTransport 服务")?;
-    let control_url = resolve_url(&base, &control_path);
-    if control_url.is_empty() {
-        return Err("controlURL 解析失败".to_string());
+    // URLBase 不可盲信：部分固件会把 URLBase 的端口写错（真实案例：Yamaha
+    // WXAD-10，swyh-rs issue 同款；部分国产盒子/乐播亦有）。参照 swyh-rs 的
+    // 做法：URLBase 缺失或与 SSDP location 对不上时，一律用 location 重建。
+    let url_base = xml_text(&xml, "URLBase").unwrap_or_default();
+    let base = effective_base(location, &url_base);
+    let control_url = resolve_control_url(&base, &control_path);
+    // 最终自检：拼出的地址解析不出合法端口时，先用 location 的 authority
+    // 做最后兜底；仍失败则把原始数据放进错误信息，便于定位设备端问题
+    if parse_http_url(&control_url).is_none() {
+        let fallback = resolve_control_url(&authority_root(location), &control_path);
+        if parse_http_url(&fallback).is_some() {
+            return Ok(DlnaDevice {
+                name,
+                control_url: fallback,
+                location: location.to_string(),
+            });
+        }
+        return Err(format!(
+            "controlURL 解析异常（设备描述不规范）: controlURL='{}', URLBase='{}', location='{}'",
+            control_path, url_base, location
+        ));
     }
     Ok(DlnaDevice {
         name,
@@ -229,7 +252,7 @@ fn find_avtransport_control_url(xml: &str) -> Option<String> {
                 // 索引在小写副本与原文之间一一对应（ASCII 小写化不改字节长度），
                 // 值从原文取出，保留大小写并解码实体
                 let raw_value = &xml[start + value_start..start + value_end];
-                return Some(xml_unescape(raw_value.trim()).to_string());
+                return Some(xml_unescape(sanitize_url_text(raw_value)));
             }
         }
         cursor = end + "</service>".len();
@@ -243,7 +266,7 @@ fn xml_text(xml: &str, tag: &str) -> Option<String> {
     let lower = xml.to_ascii_lowercase();
     let start = lower.find(&open)? + open.len();
     let end = lower[start..].find(&close)? + start;
-    Some(xml_unescape(xml[start..end].trim()).to_string())
+    Some(xml_unescape(sanitize_url_text(&xml[start..end])))
 }
 
 fn xml_unescape(value: &str) -> String {
@@ -264,10 +287,15 @@ fn xml_escape(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// 极简相对地址解析：只处理 controlURL 常见的两种形态（绝对地址 / 根相对路径）。
+/// 极简相对地址解析（目录相对语义，服务 m3u8 播放列表改写——HLS 分片大多是
+/// 相对当前播放列表目录的路径）。绝对地址判断大小写不敏感，并剔除不可见字符。
 fn resolve_url(base: &str, target: &str) -> String {
-    let target = target.trim();
-    if target.starts_with("http://") || target.starts_with("https://") {
+    let target = sanitize_url_text(target);
+    if target.is_empty() {
+        return String::new();
+    }
+    let lower = target.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
         return target.to_string();
     }
     let (scheme, rest) = match base.split_once("://") {
@@ -276,6 +304,10 @@ fn resolve_url(base: &str, target: &str) -> String {
     };
     let authority_end = rest.find('/').unwrap_or(rest.len());
     let authority = &rest[..authority_end];
+    if lower.starts_with("//") {
+        // scheme 相对形态（"//host/path"）
+        return format!("{}:{}", scheme, target);
+    }
     if target.starts_with('/') {
         return format!("{}://{}{}", scheme, authority, target);
     }
@@ -292,6 +324,81 @@ fn resolve_url(base: &str, target: &str) -> String {
         &rest[authority_end..dir_end],
         target
     )
+}
+
+/// controlURL 拼接（swyh-rs 同款语义，只服务设备控制地址，与 m3u8 改写的
+/// resolve_url 区分开）：UPnP 生态里 controlURL 实际都是根相对路径，
+/// 少数设备还漏掉前导 '/'。绝对地址（大小写不敏感）原样保留。
+fn resolve_control_url(base: &str, target: &str) -> String {
+    let target = sanitize_url_text(target);
+    if target.is_empty() {
+        return String::new();
+    }
+    let lower = target.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return target.to_string();
+    }
+    let (scheme, rest) = match base.split_once("://") {
+        Some(pair) => pair,
+        None => return String::new(),
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if lower.starts_with("//") {
+        return format!("{}:{}", scheme, target);
+    }
+    if target.starts_with('/') {
+        format!("{}://{}{}", scheme, authority, target)
+    } else {
+        // 实测部分设备 controlURL 少了前导 '/'（swyh-rs normalize_url 同款处理）
+        format!("{}://{}{}", scheme, authority, normalize_control_path(target))
+    }
+}
+
+/// 设备描述的基准地址：URLBase 仅在非空且被 SSDP location 包含时采信。
+/// 端口错报/内容对不上视为固件 bug，回退到 SSDP location 的 authority
+/// （swyh-rs set_location 同款规则，真实案例 Yamaha WXAD-10）。
+fn effective_base(location: &str, url_base: &str) -> String {
+    let url_base = sanitize_url_text(url_base);
+    if !url_base.is_empty() && location.contains(url_base.as_str()) {
+        url_base
+    } else {
+        authority_root(location)
+    }
+}
+
+/// scheme://authority（不含路径）。
+fn authority_root(url: &str) -> String {
+    match url.find("://") {
+        Some(i) => {
+            let rest = &url[i + 3..];
+            let end = rest.find('/').unwrap_or(rest.len());
+            format!("{}://{}", &url[..i], &rest[..end])
+        }
+        None => String::new(),
+    }
+}
+
+/// controlURL 统一为根相对形态：无前导 '/' 时补上。
+fn normalize_control_path(path: &str) -> String {
+    let p = path.trim();
+    if p.is_empty() {
+        "/".to_string()
+    } else if p.starts_with('/') {
+        p.to_string()
+    } else {
+        format!("/{}", p)
+    }
+}
+
+/// 剔除 XML 文本里可能混入的 BOM/零宽字符与首尾空白（这类不可见字符
+/// 会让 URL 端口校验以「invalid port number」失败）。
+fn sanitize_url_text(value: &str) -> String {
+    value
+        .trim_matches(|c: char| {
+            c.is_whitespace() || c == '\u{feff}' || c == '\u{200b}' || c == '\u{200c}' || c == '\u{200d}'
+        })
+        .to_string()
 }
 
 // ---------- AVTransport SOAP ----------
@@ -341,8 +448,10 @@ async fn soap_post(control_url: &str, soap_action: &str, envelope: &str) -> Resu
 }
 
 async fn soap_post_raw(control_url: &str, soap_action: &str, envelope: &str) -> Result<(u16, String), String> {
-    let (host, port, path) = parse_http_url(control_url)
-        .ok_or_else(|| "控制地址不是合法的 http URL".to_string())?;
+    let (host, port, path) = parse_http_url(control_url).ok_or_else(|| {
+        // 携带原始地址便于定位设备端描述不规范的问题
+        format!("控制地址无法解析: '{}'", control_url)
+    })?;
     let mut stream = tokio::time::timeout(
         Duration::from_secs(8),
         tokio::net::TcpStream::connect((host.as_str(), port)),
@@ -436,8 +545,14 @@ fn extract_tag_value(lower: &str, original: &str, tag: &str) -> Option<String> {
 }
 
 /// 极简 http URL 解析（控制地址都是局域网 http），返回 (host 无括号, port, path)。
+/// scheme 大小写不敏感（部分固件发 HTTP://），先剔除不可见字符。
 fn parse_http_url(url: &str) -> Option<(String, u16, String)> {
-    let rest = url.strip_prefix("http://")?;
+    let url = sanitize_url_text(url);
+    let lower = url.to_ascii_lowercase();
+    if !lower.starts_with("http://") {
+        return None;
+    }
+    let rest = &url[7..];
     let (authority, path) = match rest.find('/') {
         Some(pos) => (&rest[..pos], &rest[pos..]),
         None => (rest, "/"),
@@ -451,15 +566,32 @@ fn parse_http_url(url: &str) -> Option<(String, u16, String)> {
         let host = stripped[..close].to_string();
         let after = &stripped[close + 1..];
         let port = match after.strip_prefix(':') {
-            Some(p) => p.parse().ok()?,
+            Some(p) => {
+                let p = p.trim();
+                if p.is_empty() {
+                    80
+                } else {
+                    p.parse().ok()?
+                }
+            }
             None => 80,
         };
         return Some((host, port, path.to_string()));
     }
     let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse().ok()?),
+        Some((h, p)) => {
+            let p = p.trim();
+            if p.is_empty() {
+                (h.to_string(), 80)
+            } else {
+                (h.to_string(), p.parse().ok()?)
+            }
+        }
         None => (authority.to_string(), 80),
     };
+    if host.is_empty() {
+        return None;
+    }
     Some((host, port, path.to_string()))
 }
 
@@ -1007,6 +1139,7 @@ mod tests {
 
     #[test]
     fn resolve_url_variants() {
+        // m3u8 改写语义：目录相对
         assert_eq!(
             resolve_url("http://a.b/c/d.m3u8", "e/f.ts"),
             "http://a.b/c/e/f.ts"
@@ -1019,10 +1152,51 @@ mod tests {
             resolve_url("http://a.b/c/d.m3u8", "https://z.w/k.ts"),
             "https://z.w/k.ts"
         );
+        // 大写 scheme 的绝对地址原样保留
         assert_eq!(
-            resolve_url("http://a.b/c/d.m3u8", "../up.ts"),
-            "http://a.b/c../up.ts"
-        ); // 简化实现的已知局限：.. 不归一化（实际源站极少用）
+            resolve_url("http://a.b/x", "HTTP://z.w/k.ts"),
+            "HTTP://z.w/k.ts"
+        );
+    }
+
+    #[test]
+    fn resolve_control_url_variants() {
+        // swyh-rs 同款语义：根相对 + 补前导 '/'
+        assert_eq!(
+            resolve_control_url("http://192.168.1.2:7676/smp_6-", "/smp_9-"),
+            "http://192.168.1.2:7676/smp_9-"
+        );
+        assert_eq!(
+            resolve_control_url("http://192.168.1.2:7676", "dev/ctl"),
+            "http://192.168.1.2:7676/dev/ctl"
+        );
+        assert_eq!(
+            resolve_control_url("http://192.168.1.2:7676", "HTTP://192.168.1.2:49152/ctl"),
+            "HTTP://192.168.1.2:49152/ctl"
+        );
+        assert_eq!(
+            resolve_control_url("http://a.b/x", "//192.168.1.2:7676/ctl"),
+            "http://192.168.1.2:7676/ctl"
+        );
+    }
+
+    #[test]
+    fn effective_base_validates_urlbase() {
+        // URLBase 与 location 一致 → 采信
+        assert_eq!(
+            effective_base("http://192.168.1.2:7676/smp_6-", "http://192.168.1.2:7676"),
+            "http://192.168.1.2:7676"
+        );
+        // URLBase 端口错报（Yamaha WXAD-10 类真实固件 bug）→ 回退 location
+        assert_eq!(
+            effective_base("http://192.168.1.50:80/desc.xml", "http://192.168.1.50:49152/"),
+            "http://192.168.1.50:80"
+        );
+        // URLBase 缺失 → 回退 location
+        assert_eq!(
+            effective_base("http://192.168.1.2:7676/smp_6-", ""),
+            "http://192.168.1.2:7676"
+        );
     }
 
     #[test]
@@ -1053,6 +1227,17 @@ mod tests {
             Some(("fe80::1".to_string(), 49152, "/ctl".to_string()))
         );
         assert_eq!(parse_http_url("https://a.b/ctl"), None);
+        // 大写 scheme 与空端口
+        assert_eq!(
+            parse_http_url("HTTP://192.168.1.2:7676/ctl"),
+            Some(("192.168.1.2".to_string(), 7676, "/ctl".to_string()))
+        );
+        assert_eq!(
+            parse_http_url("http://192.168.1.2:/ctl"),
+            Some(("192.168.1.2".to_string(), 80, "/ctl".to_string()))
+        );
+        // 非法端口（超 u16 范围）必须被拒绝——这正是本次线上故障的表象
+        assert_eq!(parse_http_url("http://192.168.1.2:99999/ctl"), None);
     }
 
     #[test]
