@@ -1392,7 +1392,8 @@ async fn handle_proxy_conn(mut stream: tokio::net::TcpStream, upstream: Arc<Upst
 // 由本机补齐，电视拿到的只是一个普通 TS 直播地址。
 
 /// 带会话鉴权头的上游 GET（TS 串流专用；直取通道的 Range 透传逻辑不同，不复用）。
-async fn upstream_get(url: &str, upstream: &Upstream) -> reqwest::RequestBuilder {
+/// 同步构建 RequestBuilder（非 async——构建器不涉及 IO）。
+fn upstream_get(url: &str, upstream: &Upstream) -> reqwest::RequestBuilder {
     let mut request = HTTP.get(url);
     if let Some(referer) = &upstream.referer {
         request = request.header(reqwest::header::REFERER, referer);
@@ -1471,7 +1472,7 @@ async fn resolve_media_playlist(url: &str, upstream: &Upstream) -> Result<String
     for _ in 0..3 {
         let text = upstream_text(&current, upstream).await?;
         match classify_playlist(&text, &current)? {
-            PlaylistKind::Media(_) => return Ok(current),
+            PlaylistKind::Media(..) => return Ok(current),
             PlaylistKind::Master(variant) => current = variant,
             PlaylistKind::Unknown => {
                 return Err(if text.contains("#EXT-X-STREAM-INF") {
