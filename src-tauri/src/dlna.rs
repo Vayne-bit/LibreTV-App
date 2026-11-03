@@ -117,7 +117,6 @@ pub async fn cast_to_device(
     user_agent: Option<String>,
     cookie: Option<String>,
 ) -> Result<String, String> {
-    let has_header = |v: &Option<String>| v.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
     let referer = referer.filter(|s| !s.trim().is_empty());
     let user_agent = user_agent.filter(|s| !s.trim().is_empty());
     let cookie = cookie.filter(|s| !s.trim().is_empty());
@@ -248,10 +247,13 @@ fn ssdp_search_locations(timeout: Duration) -> Result<Vec<String>, String> {
         };
         let _ = socket.set_read_timeout(Some(Duration::from_millis(200)));
         let _ = socket.set_multicast_ttl_v4(2);
+        // 注：std 的 set_multicast_if_v4（IP_MULTICAST_IF）还是 unstable API，
+        // stable 工具链不可用。socket 已 bind 到网卡 IP，配合下面按网卡 join，
+        // 组播出口即锁定为该网卡（Linux/Windows 对源绑定组播均按所属网卡出），
+        // 不需要再显式设置 IP_MULTICAST_IF。
         if ip.is_unspecified() {
             let _ = socket.join_multicast_v4(&SSDP_MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED);
         } else {
-            let _ = socket.set_multicast_if_v4(ip);
             let _ = socket.join_multicast_v4(&SSDP_MULTICAST_ADDR, ip);
         }
         sockets.push(socket);
