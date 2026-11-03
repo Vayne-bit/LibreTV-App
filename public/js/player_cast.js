@@ -45,6 +45,24 @@
         }
     }
 
+    // 取「原始」视频地址给投屏/诊断用。hls.js 走 MSE 后 video.currentSrc 是
+    // blob: 内存地址（电视无法访问），真正的 m3u8 清单地址在 hls 实例上；
+    // blob: 一律视为无效地址，逐级回退直到找到 http(s) 开头的真实地址。
+    function currentSourceUrl(art) {
+        if (!art) return '';
+        const candidates = [
+            art.hls && art.hls.url,
+            art.flv && art.flv.url,
+            art.url,
+            art.video && art.video.currentSrc
+        ];
+        for (let i = 0; i < candidates.length; i++) {
+            const u = candidates[i];
+            if (typeof u === 'string' && /^https?:\/\//i.test(u)) return u;
+        }
+        return '';
+    }
+
     // 控制栏按钮配置：Tauri 壳里出 DLNA 按钮，网页里出 Chromecast 按钮（桌面 Chrome/Edge）
     // click 里的 art 是 player_artplayer_handler.js 的全局变量（经典脚本共享全局词法作用域），
     // 点击时 initPlayer 已执行完毕，引用安全。
@@ -282,8 +300,12 @@
 
     function castToDlnaDevice(device) {
         const art = activeArt;
-        const url = (art && art.url) || (art && art.video && art.video.currentSrc) || '';
-        if (!url || !art) return;
+        // MSE 播放下 currentSrc 是 blob:，必须取 hls 实例上的原始 m3u8 地址
+        const url = currentSourceUrl(art);
+        if (!url || !art) {
+            notice(art, '未拿到可投屏的原始视频地址（当前播放可能不支持投屏）');
+            return;
+        }
         notice(art, '正在投屏到「' + (device.name || '设备') + '」...');
         tauriInvoke('cast_to_device', {
             controlUrl: device.control_url,
@@ -325,24 +347,28 @@
 
     // 一键诊断：网卡/SSDP 搜索/设备指令应答/视频源拉流测试全部跑一遍，
     // 报告展示成弹窗，一键复制全文发给开发者，省去来回猜。
-    function runDiagnostics(art) {
+    async function runDiagnostics(art) {
         activeArt = art || activeArt;
         if (!isTauri() || typeof tauriInvoke !== 'function') {
             notice(activeArt, '诊断仅限 App 内使用');
             return;
         }
-        const url = (activeArt && activeArt.url) || (activeArt && activeArt.video && activeArt.video.currentSrc) || '';
+        const url = currentSourceUrl(activeArt);
         notice(activeArt, '正在诊断，约需 10 秒...');
+        // 版本号取 Tauri 内置 app 插件的 version 命令（version_data.js 未被页面加载）
+        let appVersion = '';
+        try { appVersion = await tauriInvoke('plugin:app|version') || ''; } catch (e) { /* 退回 APP_VERSION */ }
         tauriInvoke('dlna_diagnostics', { testUrl: url, referer: currentReferer() }).then(rustReport => {
-            showDiagnosticsDialog(buildDiagnosticsReport(rustReport));
+            showDiagnosticsDialog(buildDiagnosticsReport(rustReport, appVersion));
         }).catch(err => {
             console.warn('DLNA diagnostics failed', err);
             notice(activeArt, '诊断失败：' + errMsg(err));
         });
     }
 
-    function buildDiagnosticsReport(rustReport) {
-        const version = (typeof window.APP_VERSION !== 'undefined' && window.APP_VERSION) || '未知';
+    function buildDiagnosticsReport(rustReport, appVersion) {
+        const version = appVersion ||
+            (typeof window.APP_VERSION !== 'undefined' && window.APP_VERSION) || '未知';
         return '=== LibreTV 投屏环境诊断 ===\n' +
             'App版本: ' + version + '\n' +
             '平台: ' + navigator.userAgent + '\n' +
