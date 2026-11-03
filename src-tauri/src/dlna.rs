@@ -291,6 +291,16 @@ pub async fn dlna_diagnostics(
                     Ok(Err(e)) => report.push_str(&format!("    控制指令应答: 失败 —— {}\n", e)),
                     Err(_) => report.push_str("    控制指令应答: 超时（6 秒无响应，设备 HTTP 栈可能不稳定）\n"),
                 }
+                // 投屏时本地代理会用哪块网卡的地址下发给电视：必须与设备同网段才可达。
+                // 这里直接算出来，报告里一眼验证「代理地址发错网卡」类问题（如 VPN 抢默认路由）。
+                match url_host_ip(&dev.control_url).and_then(best_local_ip_for) {
+                    Some(ip) => report.push_str(&format!(
+                        "    投屏代理拟用本机网卡: {}（与设备 {} 同网段）\n",
+                        ip,
+                        url_host_ip(&dev.control_url).map(|i| i.to_string()).unwrap_or_default()
+                    )),
+                    None => report.push_str("    投屏代理拟用本机网卡: 未能确定（将回退默认路由探测，多网卡下可能不可达）\n"),
+                }
             }
             Err(e) => report.push_str(&format!("  设备: {} 描述解析失败 —— {}\n", location, e)),
         }
