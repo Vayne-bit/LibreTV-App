@@ -1065,12 +1065,14 @@ xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">\
         SAMSUNG_DLNA_FLAGS,
         uri
     );
+    // 注意：metadata 内部（title/res@protocolInfo/uri）已在各自插入处单独转义，
+    // 这里必须原样嵌入，绝不能再整体 xml_escape——否则 <DIDL-Lite> 标签会被转义成
+    // &lt;DIDL-Lite&gt; 文本，三星等从 CurrentURIMetaData 取播放地址的电视将解析失败。
     format!(
         "<u:SetAVTransportURI xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">\
 <InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI>\
 <CurrentURIMetaData>{}</CurrentURIMetaData></u:SetAVTransportURI>",
-        uri,
-        xml_escape(&metadata)
+        uri, metadata
     )
 }
 
@@ -2629,9 +2631,14 @@ xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>402</errorCode>\
     #[test]
     fn set_uri_body_escapes_and_res() {
         let body = build_set_uri_body("https://a.b/c.m3u8?x=1&y=2", Some("测试影片"), true, None, true);
-        // URL 的 & 已转义（设备端 XML 解析器必需），m3u8 的 protocolInfo 已带上
+        // URL 的 & 已在各自插入处单独转义（设备端 XML 解析器必需）
         assert!(body.contains("&amp;y=2"));
-        assert!(body.contains("&lt;res protocolInfo="));
+        // DIDL 元数据必须原样嵌入真实标签：三星等从 CurrentURIMetaData 取播放地址，
+        // 绝不能被整体再次转义成 &lt;DIDL-Lite&gt;（否则元数据解析失败、投屏黑屏）
+        assert!(body.contains("<DIDL-Lite"));
+        assert!(body.contains("<res protocolInfo="));
+        assert!(!body.contains("&lt;DIDL-Lite"));
+        assert!(!body.contains("&lt;res"));
         assert!(body.contains("application/vnd.apple.mpegurl"));
         // 协议声明覆盖：TS 串流梯度必须声明三星 DLNA 专用 MIME（video/vnd.dlna.mpeg-tts），
         // 且 DIDL protocolInfo 第 4 段携带 DLNA flags（不再是无意义的 "*"）
