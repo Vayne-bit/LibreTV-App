@@ -146,6 +146,10 @@ pub async fn cast_to_device(
         modes.reverse();
     }
 
+    // 代理地址必须从电视可达的网卡出：设备 IP 来自 SSDP（电视真实网段），
+    // 据此选同网段本机网卡；选不出再回退默认路由探测
+    let proxy_ip = url_host_ip(&control_url).and_then(best_local_ip_for);
+
     let mut attempts: Vec<String> = Vec::new();
     let mut proxy_reached_by_tv = false;
     for mode in &modes {
@@ -159,6 +163,7 @@ pub async fn cast_to_device(
                         referer.clone(),
                         user_agent.clone(),
                         cookie.clone(),
+                        proxy_ip,
                     )
                     .await?
                 }
@@ -184,7 +189,15 @@ pub async fn cast_to_device(
                     if *mode == "proxy" && proxy_connection_count() > 0 {
                         proxy_reached_by_tv = true;
                     }
-                    attempts.push(format!("[{}/{}] {}", mode_desc, proto_desc, e));
+                    // 错误带上实际下发给电视的地址（只留 host:port），
+                    // 一眼能看出代理 IP 是否是电视可达网段
+                    let addr_desc = parse_http_url(&playback_url)
+                        .map(|(h, p, _)| format!("{}:{}", h, p))
+                        .unwrap_or_else(|| playback_url.chars().take(60).collect());
+                    attempts.push(format!(
+                        "[{}/{}] {}（下发地址: {}）",
+                        mode_desc, proto_desc, e, addr_desc
+                    ));
                 }
             }
         }
@@ -992,6 +1005,44 @@ async fn dlna_seek(control_url: &str, position_seconds: f64) -> Result<(), Strin
 
 // ---------- 本地防盗链代理 ----------
 
+/// 从 URL 里取主机 IP（control_url/location 均为 http://ip:port 形式）。
+fn url_host_ip(url: &str) -> Option<IpAddr> {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let hostport = rest.split('/').next().unwrap_or(rest);
+    let host = hostport.rsplit_once(':').map(|(h, _)| h).unwrap_or(hostport);
+    host.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>().ok()
+}
+
+/// 选出与设备同一网段的本机网卡 IP（按相同前缀位数最长匹配）。
+/// 设备 IP 来自 SSDP 应答，是电视真实可达的网段；代理地址必须从这张网卡出。
+/// 实测教训：Windows 多网卡下默认路由探测会返回虚拟网卡 IP（如 WSL/共享网络
+/// 的 82.x），电视完全不可达——表现为四路全 716 且代理连接数恒为 0，
+/// 防火墙放行也无效。
+fn best_local_ip_for(device: IpAddr) -> Option<IpAddr> {
+    let dev_v4 = match device {
+        IpAddr::V4(v) => v,
+        // 局域网 DLNA 设备几乎全是 IPv4，V6 场景回退默认路由探测
+        IpAddr::V6(_) => return None,
+    };
+    let mut best: Option<(u32, Ipv4Addr)> = None;
+    if let Ok(list) = if_addrs::get_if_addrs() {
+        for iface in list {
+            let ip = match iface.addr {
+                if_addrs::IfAddr::V4(v4) => v4.ip,
+                if_addrs::IfAddr::V6(_) => continue,
+            };
+            if ip.is_loopback() || ip.is_unspecified() || ip.is_link_local() {
+                continue;
+            }
+            let same_prefix_bits = (!u32::from(dev_v4) ^ u32::from(ip)).leading_zeros();
+            if best.map_or(true, |(bits, _)| same_prefix_bits > bits) {
+                best = Some((same_prefix_bits, ip));
+            }
+        }
+    }
+    best.map(|(_, ip)| IpAddr::V4(ip))
+}
+
 /// 确定本机局域网 IP（用于拼出电视可访问的代理地址）。
 /// 用 UDP connect 的方式探测默认路由出口，不真正发包。
 fn local_lan_ip() -> Option<IpAddr> {
@@ -1002,12 +1053,14 @@ fn local_lan_ip() -> Option<IpAddr> {
 
 /// 启动本地流代理（每次投屏新建），返回电视可拉流的代理入口地址
 /// （入口为 /s/<token>/<b64 目标>；分片/密钥/子列表会在列表改写时陆续指向代理）。
+/// preferred_ip：与设备同网段的本机网卡 IP，优先于默认路由探测。
 async fn start_stream_proxy(
     target: String,
     token: String,
     referer: Option<String>,
     user_agent: Option<String>,
     cookie: Option<String>,
+    preferred_ip: Option<IpAddr>,
 ) -> Result<String, String> {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
         .await
@@ -1016,7 +1069,9 @@ async fn start_stream_proxy(
         .local_addr()
         .map_err(|e| format!("本地代理地址读取失败: {}", e))?
         .port();
-    let ip = local_lan_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let ip = preferred_ip
+        .or_else(local_lan_ip)
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
     let base = format!("http://{}:{}", ip, port);
     let entry = format!(
         "{}/s/{}/{}",
@@ -1468,6 +1523,20 @@ mod tests {
         assert!(rewritten.contains("/s/")); // 分片与密钥都已改写
         assert!(rewritten.contains("#EXTINF:4,"));
         assert!(rewritten.starts_with("#EXTM3U"));
+    }
+
+    #[test]
+    fn url_host_ip_variants() {
+        assert_eq!(
+            url_host_ip("http://192.168.188.211:9197/dmr"),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 188, 211)))
+        );
+        assert_eq!(
+            url_host_ip("http://192.168.1.2/desc.xml"),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)))
+        );
+        // 域名主机不解析成 IP，返回 None 走回退
+        assert_eq!(url_host_ip("http://example.com:8080/x"), None);
     }
 
     #[test]
