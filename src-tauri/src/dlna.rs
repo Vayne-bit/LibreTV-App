@@ -120,10 +120,10 @@ pub async fn cast_to_device(
     let referer = referer.filter(|s| !s.trim().is_empty());
     let user_agent = user_agent.filter(|s| !s.trim().is_empty());
     let cookie = cookie.filter(|s| !s.trim().is_empty());
-    let custom_headers = referer.is_some() || user_agent.is_some() || cookie.is_some();
 
-    // 协议声明候选：HLS 源先报官方 MIME，被拒后改报三星官方支持的 video/mp2t
-    // （三星文档：支持容器 AVI/MKV/ASF/MP4/3GPP/PS/TS，HLS 不在列表内）
+    // HLS 判定：非直连容器扩展名（mp4/mkv/avi/ts/flv/webm）即按 HLS 处理，
+    // 无扩展名清单地址也覆盖。三星官方支持容器不含 HLS——m3u8 无论代理还是
+    // 直连下发都会被 716 拒绝，必须走 TS 串流梯度。
     let is_hls = {
         let lower = url.to_ascii_lowercase();
         let clean = lower.split(|c| c == '?' || c == '#').next().unwrap_or(&lower);
@@ -134,17 +134,18 @@ pub async fn cast_to_device(
             && !clean.ends_with(".flv")
             && !clean.ends_with(".webm")
     };
-    let mut protocols: Vec<Option<&'static str>> = vec![None]; // None = 按 URL 自动猜测
-    if is_hls {
-        protocols.push(Some("video/mp2t"));
-    }
 
-    // 拉流模式候选：有自定义头的源代理优先（直连必被防盗链拒）；
-    // 无自定义头的源也先试代理（补浏览器 UA、HTTPS 转 HTTP、隐去电视指纹），失败退直连。
-    let mut modes: Vec<&str> = vec!["proxy", "direct"];
-    if custom_headers {
-        modes.reverse();
-    }
+    // 拉流模式候选（按序尝试）：
+    // - HLS 源：① TS 串流——代理在本地把分片拼成连续 MPEG-TS（实测三星 Tizen
+    //   对 m3u8 一律 716 Resource not found，无论代理/直连/协议声明；TS 是其
+    //   官方支持容器，这是唯一可行路径）；② 原样代理 m3u8（本身支持 HLS 的
+    //   渲染端）；③ 电视直连
+    // - 非 HLS 源：代理（补鉴权头、HTTPS 转 HTTP）→ 直连
+    let modes: Vec<&str> = if is_hls {
+        vec!["proxy-ts", "proxy", "direct"]
+    } else {
+        vec!["proxy", "direct"]
+    };
 
     // 代理地址必须从电视可达的网卡出：设备 IP 来自 SSDP（电视真实网段），
     // 据此选同网段本机网卡；选不出再回退默认路由探测
@@ -153,11 +154,17 @@ pub async fn cast_to_device(
     let mut attempts: Vec<String> = Vec::new();
     let mut proxy_reached_by_tv = false;
     for mode in &modes {
-        for proto in &protocols {
+        // TS 串流的内容就是 MPEG-TS，只能声明 video/mp2t；其余按 URL 自动猜测
+        let protos: Vec<Option<&str>> = if *mode == "proxy-ts" {
+            vec![Some("video/mp2t")]
+        } else {
+            vec![None]
+        };
+        for proto in &protos {
             let playback_url = match *mode {
-                "proxy" => {
+                "proxy-ts" => {
                     stop_stream_proxy();
-                    start_stream_proxy(
+                    let (_, ts_entry) = start_stream_proxy(
                         url.clone(),
                         generate_session_token(),
                         referer.clone(),
@@ -165,28 +172,47 @@ pub async fn cast_to_device(
                         cookie.clone(),
                         proxy_ip,
                     )
-                    .await?
+                    .await?;
+                    ts_entry
+                }
+                "proxy" => {
+                    stop_stream_proxy();
+                    let (entry, _) = start_stream_proxy(
+                        url.clone(),
+                        generate_session_token(),
+                        referer.clone(),
+                        user_agent.clone(),
+                        cookie.clone(),
+                        proxy_ip,
+                    )
+                    .await?;
+                    entry
                 }
                 _ => {
                     stop_stream_proxy();
                     url.clone()
                 }
             };
-            let mode_desc = if *mode == "proxy" { "本机代理" } else { "电视直连" };
+            let mode_desc = match *mode {
+                "proxy-ts" => "本机代理/TS串流",
+                "proxy" => "本机代理",
+                _ => "电视直连",
+            };
             let proto_desc = proto.unwrap_or("自动");
             match dlna_set_av_transport(&control_url, &playback_url, title.as_deref(), *proto).await {
                 Ok(()) => {
                     dlna_play(&control_url).await?;
-                    // 从当前进度续投；部分电视不支持 REL_TIME Seek，失败不影响投屏本身
+                    // 从当前进度续投；TS 串流是直播形态不支持 REL_TIME 续播；
+                    // 部分电视不支持 REL_TIME Seek，失败不影响投屏本身
                     if let Some(pos) = position {
-                        if pos > 1.0 {
+                        if pos > 1.0 && *mode != "proxy-ts" {
                             let _ = dlna_seek(&control_url, pos).await;
                         }
                     }
                     return Ok(playback_url);
                 }
                 Err(e) => {
-                    if *mode == "proxy" && proxy_connection_count() > 0 {
+                    if mode.starts_with("proxy") && proxy_connection_count() > 0 {
                         proxy_reached_by_tv = true;
                     }
                     // 错误带上实际下发给电视的地址（只留 host:port），
@@ -1061,8 +1087,10 @@ fn local_lan_ip() -> Option<IpAddr> {
     Some(socket.local_addr().ok()?.ip())
 }
 
-/// 启动本地流代理（每次投屏新建），返回电视可拉流的代理入口地址
-/// （入口为 /s/<token>/<b64 目标>；分片/密钥/子列表会在列表改写时陆续指向代理）。
+/// 启动本地流代理（每次投屏新建），返回 (m3u8 直取入口, TS 串流入口)。
+/// - m3u8 入口：/s/<token>/<b64 目标>，分片/密钥/子列表在列表改写时指向代理；
+/// - TS 入口：/s/<token>/live.ts?u=<b64 目标>，把 HLS 拼成连续 MPEG-TS，
+///   服务不支持 HLS 的渲染端（三星 Tizen 实测 m3u8 一律 716）。
 /// preferred_ip：与设备同网段的本机网卡 IP，优先于默认路由探测。
 async fn start_stream_proxy(
     target: String,
@@ -1071,7 +1099,7 @@ async fn start_stream_proxy(
     user_agent: Option<String>,
     cookie: Option<String>,
     preferred_ip: Option<IpAddr>,
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
         .await
         .map_err(|e| format!("本地代理端口绑定失败: {}", e))?;
@@ -1085,6 +1113,12 @@ async fn start_stream_proxy(
     let base = format!("http://{}:{}", ip, port);
     let entry = format!(
         "{}/s/{}/{}",
+        base,
+        token,
+        b64url_encode(target.as_bytes())
+    );
+    let ts_entry = format!(
+        "{}/s/{}/live.ts?u={}",
         base,
         token,
         b64url_encode(target.as_bytes())
@@ -1115,7 +1149,7 @@ async fn start_stream_proxy(
     }
     let _ = PROXY_SEQ.fetch_add(1, Ordering::Relaxed);
     PROXY_CONN_COUNT.store(0, Ordering::Relaxed); // 新会话重置诊断计数
-    Ok(entry)
+    Ok((entry, ts_entry))
 }
 
 fn stop_stream_proxy() {
@@ -1194,7 +1228,23 @@ async fn handle_proxy_conn(mut stream: tokio::net::TcpStream, upstream: Arc<Upst
         let _ = stream.flush().await;
         return Ok(());
     }
-    let encoded = encoded.split('?').next().unwrap_or_default();
+    // live.ts 是会话级 TS 串流端点（?u=<b64 目标>），不是 b64 编码的直取地址
+    let (encoded, query) = match encoded.split_once('?') {
+        Some((e, q)) => (e, Some(q)),
+        None => (encoded, None),
+    };
+    if encoded == "live.ts" {
+        let u = query
+            .and_then(|q| {
+                q.split('&')
+                    .find(|kv| kv.starts_with("u="))
+                    .and_then(|kv| kv.get(2..))
+            })
+            .unwrap_or_default();
+        let ts_target_bytes = b64url_decode(u).ok_or("TS 串流地址解码失败")?;
+        let ts_target = String::from_utf8(ts_target_bytes).map_err(|_| "TS 串流地址不是合法 UTF-8")?;
+        return serve_live_ts(stream, ts_target, upstream).await;
+    }
     if encoded.is_empty() {
         return Err("代理路径缺少目标地址".to_string());
     }
@@ -1313,6 +1363,231 @@ async fn handle_proxy_conn(mut stream: tokio::net::TcpStream, upstream: Arc<Upst
         }
     }
     stream.flush().await.map_err(|e| format!("刷新失败: {}", e))?;
+    Ok(())
+}
+
+// ---------- TS 串流（HLS → 连续 MPEG-TS） ----------
+// 背景：三星 Tizen 官方支持容器（AVI/MKV/ASF/MP4/3GPP/PS/TS）不含 HLS，
+// 实测 SetAVTransportURI 下发 m3u8 一律 716 Resource not found，代理/直连/
+// 改协议声明都一样。做法：代理在本地顺序拉取分片，原样拼接成无限 TS 字节流
+// 喂给电视——TS 分片自带 PAT/PMT，拼接即可播。防盗链头（Referer/UA/Cookie）
+// 由本机补齐，电视拿到的只是一个普通 TS 直播地址。
+
+/// 带会话鉴权头的上游 GET（TS 串流专用；直取通道的 Range 透传逻辑不同，不复用）。
+async fn upstream_get(url: &str, upstream: &Upstream) -> reqwest::RequestBuilder {
+    let mut request = HTTP.get(url);
+    if let Some(referer) = &upstream.referer {
+        request = request.header(reqwest::header::REFERER, referer);
+    }
+    request = request.header(
+        reqwest::header::USER_AGENT,
+        upstream.user_agent.as_deref().unwrap_or(DEFAULT_UPSTREAM_UA),
+    );
+    if let Some(cookie) = &upstream.cookie {
+        request = request.header(reqwest::header::COOKIE, cookie);
+    }
+    request
+}
+
+/// 拉取文本资源（清单），非 2xx 报错。
+async fn upstream_text(url: &str, upstream: &Upstream) -> Result<String, String> {
+    let response = upstream_get(url, upstream)
+        .send()
+        .await
+        .map_err(|e| format!("请求清单失败: {}", e))?;
+    if !response.status().is_success() {
+        return Err(format!("清单请求失败: HTTP {}", response.status().as_u16()));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("读取清单失败: {}", e))?;
+    Ok(String::from_utf8_lossy(&bytes).to_string())
+}
+
+/// master 清单变体选择（纯逻辑，供单测）：取第一个 STREAM-INF 的变体 URI（绝对地址）。
+fn pick_variant(text: &str, base_url: &str) -> Option<String> {
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        if line.trim_start().starts_with("#EXT-X-STREAM-INF") {
+            for candidate in lines.by_ref() {
+                let c = candidate.trim();
+                if c.is_empty() || c.starts_with('#') {
+                    continue;
+                }
+                return Some(resolve_url(base_url, c));
+            }
+            return None;
+        }
+    }
+    None
+}
+
+/// 清单分类（纯逻辑，供单测）：resolve_media_playlist 按结果决定继续跟变体
+/// 还是到达媒体清单。媒体清单解析错误（加密/fMP4）原样透传。
+enum PlaylistKind {
+    /// 媒体清单：分片绝对地址 + 是否 VOD（有 ENDLIST）
+    Media(Vec<String>, bool),
+    /// master 清单：第一个变体的绝对地址
+    Master(String),
+    Unknown,
+}
+
+fn classify_playlist(text: &str, base_url: &str) -> Result<PlaylistKind, String> {
+    // 媒体清单特征：分片时长标记或目标时长声明
+    if text.contains("#EXTINF") || text.contains("#EXT-X-TARGETDURATION") {
+        return parse_media_playlist(text, base_url).map(|(s, e)| PlaylistKind::Media(s, e));
+    }
+    if text.contains("#EXT-X-STREAM-INF") {
+        return Ok(match pick_variant(text, base_url) {
+            Some(v) => PlaylistKind::Master(v),
+            None => PlaylistKind::Unknown,
+        });
+    }
+    Ok(PlaylistKind::Unknown)
+}
+
+/// 跟随 master 清单找到媒体清单（最多 3 层嵌套）。
+async fn resolve_media_playlist(url: &str, upstream: &Upstream) -> Result<String, String> {
+    let mut current = url.to_string();
+    for _ in 0..3 {
+        let text = upstream_text(&current, upstream).await?;
+        match classify_playlist(&text, &current)? {
+            PlaylistKind::Media(_) => return Ok(current),
+            PlaylistKind::Master(variant) => current = variant,
+            PlaylistKind::Unknown => {
+                return Err(if text.contains("#EXT-X-STREAM-INF") {
+                    "master 清单里没有可用的变体".to_string()
+                } else {
+                    "地址不是 HLS 播放清单".to_string()
+                });
+            }
+        }
+    }
+    Err("清单嵌套层级过深".to_string())
+}
+
+/// 解析媒体清单（纯逻辑，供单测）：返回（分片绝对地址列表, 是否 VOD/有 ENDLIST）。
+/// 加密（AES-128/SAMPLE-AES）与 fMP4（EXT-X-MAP）无法靠拼接转 TS，直接报错
+/// 让投屏梯度落到下一个模式。
+fn parse_media_playlist(text: &str, base_url: &str) -> Result<(Vec<String>, bool), String> {
+    let mut segments = Vec::new();
+    let mut endlist = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("#EXT-X-KEY:") {
+            let method = rest
+                .split(',')
+                .find_map(|kv| kv.strip_prefix("METHOD="))
+                .unwrap_or("NONE");
+            if !method.eq_ignore_ascii_case("NONE") {
+                return Err(format!("源分片已加密（{}），TS 串流暂不支持", method));
+            }
+            continue;
+        }
+        if line.starts_with("#EXT-X-MAP") {
+            return Err("源为 fMP4 封装（EXT-X-MAP），TS 串流暂不支持".to_string());
+        }
+        if line.starts_with("#EXT-X-ENDLIST") {
+            endlist = true;
+            continue;
+        }
+        if line.starts_with('#') {
+            continue; // 其余标签不影响拼接
+        }
+        // 非注释非空行即分片 URI（HLS 规范），解析为绝对地址
+        segments.push(resolve_url(base_url, line));
+    }
+    Ok((segments, endlist))
+}
+
+/// 拉取并解析媒体清单。
+async fn fetch_media_playlist(
+    url: &str,
+    upstream: &Upstream,
+) -> Result<(Vec<String>, bool), String> {
+    let text = upstream_text(url, upstream).await?;
+    parse_media_playlist(&text, url)
+}
+
+/// 拉取单个分片并流式写给电视；写失败（电视断开）即终止整条流。
+async fn stream_segment(
+    url: &str,
+    upstream: &Upstream,
+    stream: &mut tokio::net::TcpStream,
+) -> Result<(), String> {
+    let response = upstream_get(url, upstream)
+        .send()
+        .await
+        .map_err(|e| format!("拉取分片失败: {}", e))?;
+    if !response.status().is_success() {
+        return Err(format!("分片拉取失败: HTTP {}", response.status().as_u16()));
+    }
+    let mut upstream_stream = response;
+    loop {
+        match upstream_stream.chunk().await {
+            Ok(Some(chunk)) => {
+                stream
+                    .write_all(&chunk)
+                    .await
+                    .map_err(|_| "电视中断了连接".to_string())?;
+            }
+            Ok(None) => break,
+            Err(e) => return Err(format!("读取分片数据失败: {}", e)),
+        }
+    }
+    stream
+        .flush()
+        .await
+        .map_err(|_| "电视中断了连接".to_string())?;
+    Ok(())
+}
+
+/// live.ts 端点：HLS → 连续 MPEG-TS 字节流。
+/// 响应头在清单探测成功之后才发——探测失败时电视拿到明确的 502，
+/// 投屏梯度的报错才有意义。直播清单（无 ENDLIST）轮询追加分片直到电视断开。
+async fn serve_live_ts(
+    mut stream: tokio::net::TcpStream,
+    target: String,
+    upstream: Arc<Upstream>,
+) -> Result<(), String> {
+    let media_url = resolve_media_playlist(&target, &upstream).await?;
+    let (mut pending, mut endlist) = fetch_media_playlist(&media_url, &upstream).await?;
+    if pending.is_empty() {
+        return Err("媒体清单里没有可用分片".to_string());
+    }
+
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .map_err(|e| format!("写出响应头失败: {}", e))?;
+    stream.flush().await.ok();
+
+    let mut served: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        for seg in std::mem::take(&mut pending) {
+            if !served.insert(seg.clone()) {
+                continue; // 直播轮询时跳过已服务的分片
+            }
+            stream_segment(&seg, &upstream, &mut stream).await?;
+        }
+        if endlist {
+            break; // VOD：整部播完
+        }
+        // 直播清单：隔 2 秒重取，把新分片继续喂给电视
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        match fetch_media_playlist(&media_url, &upstream).await {
+            Ok((next, e)) => {
+                pending = next;
+                endlist = e;
+            }
+            Err(_) => continue, // 单次刷新失败不打断整条流
+        }
+    }
     Ok(())
 }
 
@@ -1627,5 +1902,88 @@ xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>402</errorCode>\
         assert!(is_hls("https://a.b/vod/index.m3u8?token=x"));
         assert!(!is_hls("https://a.b/vod/movie.mp4"));
         assert!(!is_hls("https://a.b/vod/movie.MP4?sign=1"));
+    }
+
+    #[test]
+    fn parse_media_playlist_vod() {
+        let text = "#EXTM3U\n\
+                    #EXT-X-TARGETDURATION:10\n\
+                    #EXT-X-KEY:METHOD=NONE\n\
+                    #EXTINF:10,\n\
+                    seg001.ts\n\
+                    #EXTINF:10,\n\
+                    /abs/dir/seg002.ts\n\
+                    #EXTINF:10,\n\
+                    https://other.cdn/seg003.ts\n\
+                    #EXT-X-ENDLIST\n";
+        let (segments, endlist) =
+            parse_media_playlist(text, "https://a.b/vod/index.m3u8").expect("parse ok");
+        assert!(endlist);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0], "https://a.b/vod/seg001.ts"); // 目录相对
+        assert_eq!(segments[1], "https://a.b/abs/dir/seg002.ts"); // 根相对
+        assert_eq!(segments[2], "https://other.cdn/seg003.ts"); // 绝对地址
+    }
+
+    #[test]
+    fn parse_media_playlist_live_has_no_endlist() {
+        let text = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nlive.ts\n";
+        let (segments, endlist) =
+            parse_media_playlist(text, "http://a.b/live.m3u8").expect("parse ok");
+        assert!(!endlist);
+        assert_eq!(segments, vec!["http://a.b/live.ts".to_string()]);
+    }
+
+    #[test]
+    fn parse_media_playlist_rejects_encryption() {
+        let text = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:10,\nseg.ts\n";
+        let err = parse_media_playlist(text, "https://a.b/v.m3u8").unwrap_err();
+        assert!(err.contains("AES-128"), "报错应带加密方法: {}", err);
+    }
+
+    #[test]
+    fn parse_media_playlist_rejects_fmp4() {
+        let text = "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:10,\nseg.m4s\n";
+        let err = parse_media_playlist(text, "https://a.b/v.m3u8").unwrap_err();
+        assert!(err.contains("fMP4"), "报错应说明 fMP4: {}", err);
+    }
+
+    #[test]
+    fn pick_variant_first_stream_inf() {
+        let master = "#EXTM3U\n\
+                      #EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360\n\
+                      360p/index.m3u8\n\
+                      #EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1920x1080\n\
+                      1080p/index.m3u8\n";
+        assert_eq!(
+            pick_variant(master, "https://a.b/hls/master.m3u8").as_deref(),
+            Some("https://a.b/hls/360p/index.m3u8")
+        );
+        // STREAM-INF 后跟注释行应跳过，直到取到 URI 行
+        let master2 = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n## comment\n\nhi/index.m3u8\n";
+        assert_eq!(
+            pick_variant(master2, "https://a.b/hls/master.m3u8").as_deref(),
+            Some("https://a.b/hls/hi/index.m3u8")
+        );
+        assert_eq!(pick_variant("#EXTM3U\n", "https://a.b/m.m3u8"), None);
+    }
+
+    #[test]
+    fn classify_playlist_kinds() {
+        let media = "#EXTM3U\n#EXTINF:10,\nseg.ts\n#EXT-X-ENDLIST\n";
+        assert!(matches!(
+            classify_playlist(media, "https://a.b/v.m3u8"),
+            Ok(PlaylistKind::Media(_, true))
+        ));
+        let master = "#EXT-X-STREAM-INF:BANDWIDTH=1\nsub/index.m3u8\n";
+        assert!(matches!(
+            classify_playlist(master, "https://a.b/m.m3u8"),
+            Ok(PlaylistKind::Master(_))
+        ));
+        // 非 HLS 内容 → Unknown
+        assert!(matches!(
+            classify_playlist("<html>not a playlist</html>", "https://a.b/x"),
+            Ok(PlaylistKind::Unknown)
+        ));
     }
 }
