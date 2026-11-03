@@ -14,7 +14,7 @@
 // 并在 Manifest 声明 CHANGE_WIFI_MULTICAST_STATE（apply-android-overrides.mjs 注入）。
 
 use once_cell::sync::Lazy;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -1374,7 +1374,11 @@ pub async fn pick_local_video(app: tauri::AppHandle) -> Result<Option<String>, S
     })
     .await
     .map_err(|e| format!("文件选择任务失败: {}", e))?;
-    Ok(path.map(|p| p.to_string_lossy().to_string()))
+    // FilePath 可能是 Path(PathBuf) 或 Url(file:// 等)；用 into_path() 统一转为
+    // 真实 PathBuf（Url 走 Url::to_file_path），再转字符串供本地文件服务打开。
+    Ok(path
+        .and_then(|p| p.into_path().ok())
+        .map(|pb| pb.to_string_lossy().to_string()))
 }
 
 // ---------- 可配置 VIP 解析 ----------
@@ -1573,9 +1577,9 @@ pub async fn search_airplay_devices(timeout_ms: Option<u64>) -> Result<Vec<DlnaD
         }
         g.as_ref().unwrap().clone()
     };
-    // browse() 直接返回 mpsc 接收端（无 get_event_receiver 一说）。
-    // 把整个收集过程放到阻塞任务里：recv_timeout 区分「正常空等超时」与
-    // 「通道断开」，前者继续等、后者（守护进程已停）停止收集，不会提前收尾。
+    // browse() 直接返回 flume 接收端（无 get_event_receiver 一说）。flume 的
+    // RecvTimeoutError 变体无法在代码里直接命名，故在阻塞任务里按 deadline 轮询：
+    // 短超时 recv_timeout 无论「超时」还是「通道断开」都继续轮询，直到 deadline 才收尾。
     let receiver = daemon
         .browse("_airplay._tcp.local.")
         .map_err(|e| format!("AirPlay 浏览失败: {}", e))?;
@@ -1583,8 +1587,10 @@ pub async fn search_airplay_devices(timeout_ms: Option<u64>) -> Result<Vec<DlnaD
         let mut map: HashMap<String, DlnaDevice> = HashMap::new();
         let deadline = Instant::now() + timeout;
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            // 按 deadline 轮询：短超时 recv_timeout 无论「超时」还是「通道断开」
+            // 都继续轮询，直到到达 deadline 才收尾（flume 的 RecvTimeoutError 无法
+            // 在代码里直接命名其变体，故用 deadline 统一兜底，避免依赖 flume 类型）。
+            if Instant::now() >= deadline {
                 break;
             }
             match receiver.recv_timeout(Duration::from_millis(250)) {
@@ -1611,12 +1617,8 @@ pub async fn search_airplay_devices(timeout_ms: Option<u64>) -> Result<Vec<DlnaD
                         }
                     }
                 }
-                // 其它事件（服务移除/更新）：忽略
-                Ok(_) => continue,
-                // 超时：正常空等，直到 deadline
-                Err(e) if e.is_timeout() => continue,
-                // 通道断开（守护进程已停）：停止收集
-                Err(_) => break,
+                // 其它事件（服务移除/更新）或任意 recv 错误：继续轮询直到 deadline
+                _ => continue,
             }
         }
         map
