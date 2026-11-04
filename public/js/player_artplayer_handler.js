@@ -751,12 +751,83 @@ function recordPlaylistMarkers(raw, removedSegments, aborted, mode, adBlocks) {
     try { localStorage.setItem(PLAYLIST_MARKER_STATS_KEY, JSON.stringify(payload)); } catch (e) { /* 存不下就算了 */ }
 }
 
+// ============ M3U8 广告过滤（标记法 + 结构法 + 主机特征法 + 学习型黑名单）============
 // 采集站 SSAI 插播广告的结构特征：广告是一整块被 #EXT-X-DISCONTINUITY 夹住的分片，
 // 分片全部指向另一个域名（广告商的 CDN），块内还常带一句 #EXT-X-KEY:METHOD=NONE。
 // 这类源不会给 CUE-OUT/CUE-IN，所以只能靠结构认。
-const AD_BLOCK_MAX_SECONDS = 180;
+// 块长上限放宽到 300s：180s 会放过 3~5 分钟的广告组；
+// 误伤风险由「广告域名必须没在正片出现过」+ 30% 兜底比例挡住。
+const AD_BLOCK_MAX_SECONDS = 300;
 // 删掉的分片超过总量这个比例，说明判定规则在误伤正片，宁可放弃
 const AD_REMOVE_MAX_RATIO = 0.3;
+
+// ---- 主机特征法：按分片 URL 特征认广告，与断点结构无关 ----
+// 现状弱点：很多采集站开始把广告分片放在与正片相同的 CDN 上（结构法的
+// 「异域名」判据失效），或者干脆不打断点标记（结构法「一律不动」）。
+// 这两种情况只能靠分片 URL 自身的特征认。关键词刻意收窄到
+// 「路径里整段是广告词」的形态，避免 download/upload/header 这类误伤。
+const AD_HOST_PATTERNS = [
+    'doubleclick.net', 'googlesyndication', 'googleadservices', 'admob',
+    'adnxs.com', 'pubmatic.com', 'rubiconproject.com', 'criteo.com',
+    'adcolony', 'vungle.com', 'applovin', 'mopub.com', 'unityads', 'inmobi.com',
+    'taboola.com', 'outbrain.com', 'moatads.com', 'amazon-adsystem',
+    'tanx.com', 'mediav.com', 'miaozhen.com', 'ipinyou.com', 'adsame',
+    'admaster', 'adview.cn', 'allyes.com', 'adchina.com'
+];
+const AD_PATH_PATTERN = /(^|\/)(ads?|adverts?|advertising|adcreative|adplayer|adframe|bannerads?|popunder|interstitial|preroll|midroll|postroll)(\/|$)/i;
+
+function isAdSegmentUri(uri) {
+    try {
+        const resolved = new URL(uri, 'https://placeholder.invalid/');
+        const host = (resolved.host || '').toLowerCase();
+        for (let i = 0; i < AD_HOST_PATTERNS.length; i++) {
+            if (host.indexOf(AD_HOST_PATTERNS[i]) >= 0) return true;
+        }
+        return AD_PATH_PATTERN.test(resolved.pathname);
+    } catch (e) {
+        return false;
+    }
+}
+
+// ---- 学习型广告域名：结构法/标记法确认过的广告块域名记下来 ----
+// 之后即使某站不打断点标记、广告直接拼进正片，只要域名是曾经确认过的
+// 广告域名，也能删掉。过滤能力随使用越来越强。
+const LEARNED_AD_HOSTS_KEY = 'learnedAdHosts';
+
+function getLearnedAdHosts() {
+    try {
+        const raw = JSON.parse(localStorage.getItem(LEARNED_AD_HOSTS_KEY) || '[]');
+        return Array.isArray(raw) ? raw.filter(h => typeof h === 'string' && h) : [];
+    } catch (e) {
+        return [];
+    }
+}
+
+// 学习的前提是「这个域名没在本次保留的正片分片里出现过」：
+// 同域名广告（靠路径特征删的）学域名会把正片域名拉黑，之后满盘误伤，必须排除。
+function rememberAdHosts(adUris, keptUris, baseUrl) {
+    const keptHosts = new Set();
+    (keptUris || []).forEach(uri => {
+        const host = playlistHost(uri, baseUrl);
+        if (host) keptHosts.add(host);
+    });
+    const hosts = new Set(getLearnedAdHosts());
+    (adUris || []).forEach(uri => {
+        const host = playlistHost(uri, baseUrl);
+        if (host && host !== 'placeholder.invalid' && !keptHosts.has(host)) hosts.add(host);
+    });
+    let list = Array.from(hosts);
+    // 上限 64 个，超出保留最近确认的（Set 保持插入顺序，新确认的排在后面）
+    if (list.length > 64) list = list.slice(list.length - 64);
+    try { localStorage.setItem(LEARNED_AD_HOSTS_KEY, JSON.stringify(list)); } catch (e) { /* 存不下就算了 */ }
+}
+
+// 诊断统计在模块化版本里有、单文件版里没有，统一走这里，不存在就跳过
+function recordAdFilterStats(raw, removed, aborted, mode, adBlocks) {
+    if (typeof recordPlaylistMarkers === 'function') {
+        recordPlaylistMarkers(raw, removed, aborted, mode, adBlocks);
+    }
+}
 
 function isDiscontinuityLine(text) {
     return text === '#EXT-X-DISCONTINUITY' || text.indexOf('#EXT-X-DISCONTINUITY:') === 0;
@@ -801,6 +872,182 @@ function playlistHost(uri, baseUrl) {
     }
 }
 
+// 主机特征法（第一道过滤）：
+// - 有断点标记的播放列表按块删：块内任一分片命中广告 URL 特征或已学习广告域名，
+//   整块删掉（连块内 KEY 行一起删，避免解密状态错乱）。
+// - 完全没有断点标记的播放列表按分片删：只删 EXTINF+URI 对，# 行一律保留
+//   （这类源几乎不带 KEY，时间轴误差由 30% 兜底比例管着），
+//   并额外处理片头贴片：开头连续的非主导域名分片判为贴片广告。
+function filterByHostRules(m3u8Content, lines, baseUrl, applyFilter) {
+    const learned = new Set(getLearnedAdHosts());
+    const hostHit = uri => isAdSegmentUri(uri) || learned.has(playlistHost(uri, baseUrl));
+    const blocks = splitPlaylistBlocks(lines);
+    const hasMarkers = blocks.some(block => block.discontinuity);
+    if (hasMarkers) {
+        const hitBlocks = [];
+        let removedSegments = 0;
+        let removedDuration = 0;
+        let totalSegments = 0;
+        let totalDuration = 0;
+        blocks.forEach((block, index) => {
+            block.segments.forEach(segment => {
+                totalSegments += 1;
+                totalDuration += segment.duration;
+            });
+            if (!block.segments.length) return;
+            if (block.segments.some(segment => hostHit(segment.uri))) {
+                hitBlocks.push(index);
+                removedSegments += block.segments.length;
+                removedDuration += block.duration;
+            }
+        });
+        if (!hitBlocks.length) {
+            recordAdFilterStats(m3u8Content, 0, false, 'none', 0);
+            return m3u8Content;
+        }
+        // 兜底：删太多说明判定规则在误伤正片，宁可让用户看广告也不能把正片删没
+        const tooMuch = removedSegments >= totalSegments || removedDuration > totalDuration * AD_REMOVE_MAX_RATIO;
+        if (tooMuch || !applyFilter) {
+            recordAdFilterStats(m3u8Content, 0, tooMuch, 'host', hitBlocks.length);
+            return m3u8Content;
+        }
+        const kept = [];
+        const tail = [];
+        const keptUris = [];
+        const adUris = [];
+        let droppedBefore = false;
+        blocks.forEach((block, index) => {
+            if (hitBlocks.indexOf(index) >= 0) {
+                droppedBefore = true;
+                block.segments.forEach(segment => adUris.push(segment.uri));
+                block.lines.forEach(line => {
+                    if (line.trim() === '#EXT-X-ENDLIST') tail.push(line);
+                });
+                return;
+            }
+            // 被删块与保留块之间要有一个断点：被删块自己的前置断点借不到时，
+            // 在下一个保留块前补一个。多余的断点最多触发一次 remux，不会卡住播放。
+            if (droppedBefore && !block.discontinuity) kept.push('#EXT-X-DISCONTINUITY');
+            droppedBefore = false;
+            block.segments.forEach(segment => keptUris.push(segment.uri));
+            block.lines.forEach(line => kept.push(line));
+        });
+        tail.forEach(line => kept.push(line));
+        // 确认是广告的分片域名记入学习型黑名单（正片用过的域名不记）
+        rememberAdHosts(adUris, keptUris, baseUrl);
+        recordAdFilterStats(m3u8Content, removedSegments, false, 'host', hitBlocks.length);
+        return kept.join('\n');
+    }
+    // ---- 无断点标记：按分片处理 ----
+    // 先解析成分片流，统计各域名时长找出正片主导域名，再按规则删
+    const items = [];
+    let pendingExtinf = null;
+    let pendingDuration = 0;
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const trimmed = line.trim();
+        if (trimmed.indexOf('#EXTINF') === 0) {
+            const value = parseFloat(trimmed.slice(8));
+            pendingDuration = isNaN(value) ? 0 : value;
+            pendingExtinf = line;
+            continue;
+        }
+        if (!trimmed || trimmed.charAt(0) === '#') {
+            items.push({ tag: true, line });
+            continue;
+        }
+        items.push({ tag: false, line, extinf: pendingExtinf, duration: pendingDuration, uri: trimmed });
+        pendingExtinf = null;
+        pendingDuration = 0;
+    }
+    const segItems = items.filter(item => !item.tag);
+    const totalSegments = segItems.length;
+    const totalDuration = segItems.reduce((n, item) => n + item.duration, 0);
+    // 正片主导域名：分片总时长最长的域名（贴片广告比正片短得多，不会占主导）
+    const hostDuration = new Map();
+    segItems.forEach(item => {
+        const host = playlistHost(item.uri, baseUrl);
+        hostDuration.set(host, (hostDuration.get(host) || 0) + item.duration);
+    });
+    let dominantHost = '';
+    let dominantDuration = 0;
+    hostDuration.forEach((duration, host) => {
+        if (duration > dominantDuration) {
+            dominantHost = host;
+            dominantDuration = duration;
+        }
+    });
+    const droppedFlags = segItems.map(item => hostHit(item.uri));
+    // 片头贴片：开头连续的非主导域名分片判为贴片广告。
+    // 贴片总长超过块长上限就放弃这条规则，防止把「正片头在别的 CDN 上」的源误删。
+    if (dominantHost) {
+        let prerollDuration = 0;
+        let prerollEnd = 0;
+        for (let i = 0; i < droppedFlags.length; i++) {
+            if (playlistHost(segItems[i].uri, baseUrl) === dominantHost) break; // 碰到正片就停
+            if (!droppedFlags[i]) prerollDuration += segItems[i].duration;
+            prerollEnd = i + 1;
+        }
+        if (prerollDuration > AD_BLOCK_MAX_SECONDS) prerollEnd = 0;
+        for (let i = 0; i < prerollEnd; i++) droppedFlags[i] = true;
+    }
+    const adUris = [];
+    const keptUris = [];
+    let removedSegments = 0;
+    let removedDuration = 0;
+    segItems.forEach((item, index) => {
+        if (!droppedFlags[index]) {
+            keptUris.push(item.uri);
+            return;
+        }
+        adUris.push(item.uri);
+        removedSegments += 1;
+        removedDuration += item.duration;
+    });
+    const tooMuch = !removedSegments || removedSegments >= totalSegments ||
+        removedDuration > totalDuration * AD_REMOVE_MAX_RATIO;
+    if (tooMuch || !applyFilter) {
+        recordAdFilterStats(m3u8Content, 0, tooMuch, 'host', adUris.length ? 1 : 0);
+        return m3u8Content;
+    }
+    const segItemIndex = new Map();
+    segItems.forEach((item, index) => segItemIndex.set(item, index));
+    const kept = [];
+    let needBreak = false;
+    items.forEach(item => {
+        if (item.tag) {
+            kept.push(item.line);
+            return;
+        }
+        if (droppedFlags[segItemIndex.get(item)]) {
+            needBreak = true; // 删过广告后，下一个保留分片前要补断点
+            return;
+        }
+        if (needBreak) {
+            kept.push('#EXT-X-DISCONTINUITY');
+            needBreak = false;
+        }
+        if (item.extinf) kept.push(item.extinf);
+        kept.push(item.line);
+    });
+    rememberAdHosts(adUris, keptUris, baseUrl);
+    recordAdFilterStats(m3u8Content, removedSegments, false, 'host', 1);
+    return kept.join('\n');
+}
+
+// 广告开始/结束标记：CUE-OUT/CUE-IN 之外，再认 HLS 标准里的
+// #EXT-X-DATERANGE 带 SCTE35-OUT / SCTE35-IN 属性的写法（Adobe Primetime 式 SSAI）。
+// 之前只认 CUE 标记，用 DATERANGE 打标的站过滤不掉。
+function isAdStartTag(trimmed) {
+    if (trimmed.indexOf('#EXT-X-CUE-OUT') === 0) return true;
+    return trimmed.indexOf('#EXT-X-DATERANGE') === 0 && trimmed.indexOf('SCTE35-OUT=') >= 0;
+}
+
+function isAdEndTag(trimmed) {
+    if (trimmed.indexOf('#EXT-X-CUE-IN') === 0) return true;
+    return trimmed.indexOf('#EXT-X-DATERANGE') === 0 && trimmed.indexOf('SCTE35-IN=') >= 0;
+}
+
 // 结构法：断点夹住、分片全在别的域名上、且整块很短的，判定为广告块，整块删掉。
 // 删的时候连同块前那个断点一起丢，让下一个保留块自己的断点顶上，
 // 正片前后正好剩一个断点——时间轴需要它重新对齐，少了会出现缓冲空洞。
@@ -830,8 +1077,22 @@ function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
         }
         hosts.forEach(host => contentHosts.add(host));
     });
+    // 片头贴片广告：第一块没有前置断点，上面的规则碰不到它。
+    // 两遍扫描：等正片域名收集完，若第一块全部分片都在正片没用过的域名上且很短，判为片头广告。
+    if (blocks.length > 1 && blocks[0].segments.length && dropped.indexOf(0) < 0) {
+        const first = blocks[0];
+        const firstHosts = first.segments.map(segment => playlistHost(segment.uri, baseUrl)).filter(Boolean);
+        const otherHosts = new Set();
+        blocks.slice(1).forEach(block => block.segments.forEach(segment => {
+            const host = playlistHost(segment.uri, baseUrl);
+            if (host) otherHosts.add(host);
+        }));
+        const disjoint = firstHosts.length > 0 && firstHosts.every(host => !otherHosts.has(host));
+        const short = first.duration > 0 && first.duration <= AD_BLOCK_MAX_SECONDS;
+        if (disjoint && short) dropped.push(0);
+    }
     if (!dropped.length) {
-        recordPlaylistMarkers(m3u8Content, 0, false, 'none', 0);
+        recordAdFilterStats(m3u8Content, 0, false, 'none', 0);
         return m3u8Content;
     }
     let removedSegments = 0;
@@ -843,15 +1104,18 @@ function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
     // 兜底：删太多说明判定规则不对，宁可让用户看广告也不能把正片删没
     const tooMuch = removedSegments >= totalSegments || removedDuration > totalDuration * AD_REMOVE_MAX_RATIO;
     if (tooMuch || !applyFilter) {
-        recordPlaylistMarkers(m3u8Content, 0, tooMuch, tooMuch ? 'none' : 'structure', dropped.length);
+        recordAdFilterStats(m3u8Content, 0, tooMuch, 'structure', dropped.length);
         return m3u8Content;
     }
     const kept = [];
     const tail = [];
+    const keptUris = [];
+    const adUris = [];
     let emitted = 0;
     blocks.forEach((block, index) => {
         if (dropped.indexOf(index) >= 0) {
             // 尾部广告块里带着 #EXT-X-ENDLIST，整块丢掉会连播放结束标记一起丢
+            block.segments.forEach(segment => adUris.push(segment.uri));
             block.lines.forEach(line => {
                 if (line.trim() === '#EXT-X-ENDLIST') tail.push(line);
             });
@@ -859,28 +1123,33 @@ function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
         }
         // 头一个分片之前不需要断点，写了反而是个孤立标记
         if (block.discontinuity && emitted > 0) kept.push('#EXT-X-DISCONTINUITY');
+        block.segments.forEach(segment => keptUris.push(segment.uri));
         block.lines.forEach(line => kept.push(line));
         emitted += block.segments.length;
     });
     tail.forEach(line => kept.push(line));
-    recordPlaylistMarkers(m3u8Content, removedSegments, false, 'structure', dropped.length);
+    // 确认是广告的块，把分片域名记入学习型黑名单（正片用过的域名不记），下次无标记也能删
+    rememberAdHosts(adUris, keptUris, baseUrl);
+    recordAdFilterStats(m3u8Content, removedSegments, false, 'structure', dropped.length);
     return kept.join('\n');
 }
 
-// 按 SCTE-35 广告标记把标记区间内的分片整段删掉（#EXT-X-CUE-OUT … #EXT-X-CUE-IN）。
-// 早先的实现只删 #EXT-X-DISCONTINUITY 这一行标签、一个分片都不删，所以从来没真正去掉过广告；
-// 反过来删标签还会让 remuxer 按连续时间戳算分段，导致缓冲出现空洞。现在标签一律保留，只删分片。
+// 总入口。先走主机特征法（与结构无关，能抓同域名广告和已学习域名），
+// 再在过滤结果上走标记法（CUE / DATERANGE-SCTE35）或结构法。
 function filterAdsFromM3U8(m3u8Content, applyFilter, baseUrl) {
     if (!m3u8Content) return '';
     const lines = m3u8Content.split('\n');
-    // 有 CUE 标记就走标记法，没有就走结构法（采集站插播广告不给 CUE 标记）
-    const hasCueOut = lines.some(line => line.trim().indexOf('#EXT-X-CUE-OUT') === 0);
-    if (!hasCueOut) return filterByStructure(m3u8Content, lines, baseUrl, applyFilter);
+    const afterHost = filterByHostRules(m3u8Content, lines, baseUrl, applyFilter);
+    const linesAfter = afterHost.split('\n');
+    // 有广告标记就走标记法，没有就走结构法（采集站插播广告不给 CUE 标记）
+    const hasAdStart = linesAfter.some(line => isAdStartTag(line.trim()));
+    if (!hasAdStart) return filterByStructure(afterHost, linesAfter, baseUrl, applyFilter);
     if (!applyFilter) {
-        recordPlaylistMarkers(m3u8Content, 0, false, 'cue', 0);
-        return m3u8Content;
+        recordAdFilterStats(afterHost, 0, false, 'cue', 0);
+        return afterHost;
     }
     const kept = [];
+    const adUris = [];
     let inAd = false;
     let removed = 0;
     let sawCueIn = false;
@@ -895,15 +1164,15 @@ function filterAdsFromM3U8(m3u8Content, applyFilter, baseUrl) {
         }
         return true;
     };
-    for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
+    for (let i = 0; i < linesAfter.length; i++) {
+        const line = linesAfter[i];
         const trimmed = line.trim();
         // CUE-OUT-CONT 也是以 CUE-OUT 开头，一并算作广告区间内
-        if (trimmed.indexOf('#EXT-X-CUE-OUT') === 0) {
+        if (isAdStartTag(trimmed)) {
             inAd = true;
             continue;
         }
-        if (trimmed.indexOf('#EXT-X-CUE-IN') === 0) {
+        if (isAdEndTag(trimmed)) {
             inAd = false;
             sawCueIn = true;
             pendingBreak = true;
@@ -911,6 +1180,7 @@ function filterAdsFromM3U8(m3u8Content, applyFilter, baseUrl) {
         }
         if (inAd) {
             if (trimmed.indexOf('#EXTINF') === 0) removed += 1;
+            else if (trimmed && trimmed.charAt(0) !== '#') adUris.push(trimmed);
             continue;
         }
         if (pendingBreak) {
@@ -935,16 +1205,19 @@ function filterAdsFromM3U8(m3u8Content, applyFilter, baseUrl) {
     }
     // 标记不成对（没有 CUE-IN）说明结构不符合预期，宁可不动，别把正片删了
     if (!sawCueIn) {
-        recordPlaylistMarkers(m3u8Content, 0, false, 'cue', 0);
-        return m3u8Content;
+        recordAdFilterStats(afterHost, 0, false, 'cue', 0);
+        return afterHost;
     }
     // 兜底：标记打错位置时会一口气删掉大半正片，超过三成就当标记不可信，原样放行。
     // 宁可让用户看广告，也不能把正片删没。
-    const totalSegments = lines.reduce((n, l) => (l.trim().indexOf('#EXTINF') === 0 ? n + 1 : n), 0);
+    const totalSegments = linesAfter.reduce((n, l) => (l.trim().indexOf('#EXTINF') === 0 ? n + 1 : n), 0);
     if (removed > 5 && removed > totalSegments * 0.3) {
-        recordPlaylistMarkers(m3u8Content, 0, true, 'cue', 0);
-        return m3u8Content;
+        recordAdFilterStats(afterHost, 0, true, 'cue', 0);
+        return afterHost;
     }
-    recordPlaylistMarkers(m3u8Content, removed, false, 'cue', 0);
+    // 广告分片的域名记入学习型黑名单（正片用过的域名不记）
+    const keptUris = kept.map(l => l.trim()).filter(t => t && t.charAt(0) !== '#');
+    rememberAdHosts(adUris, keptUris, baseUrl);
+    recordAdFilterStats(afterHost, removed, false, 'cue', 0);
     return kept.join('\n');
 }
