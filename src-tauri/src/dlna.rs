@@ -97,6 +97,33 @@ fn proxy_connection_count() -> u64 {
     PROXY_CONN_COUNT.load(Ordering::Relaxed)
 }
 
+/// 本次投屏实际采用的模式与下发地址。
+///
+/// 诊断报告只看连接数是不够的：本地视频投屏走的是另一个服务、不经过代理，
+/// 所以计数会「停在上一次流媒体投屏」的值 —— 拿它当本次投屏的状态会直接
+/// 得出错误结论。把模式和下发地址一起记下来，才能说明这个数字属于哪一次。
+static LAST_CAST_INFO: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
+
+fn set_last_cast_info(info: String) {
+    if let Ok(mut guard) = LAST_CAST_INFO.lock() {
+        *guard = info;
+    }
+}
+
+fn last_cast_info() -> String {
+    LAST_CAST_INFO
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default()
+}
+
+/// 电视取流被跳过的坏分片数（本次投屏期间）。
+static SKIPPED_SEGMENT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn skipped_segment_count() -> u64 {
+    SKIPPED_SEGMENT_COUNT.load(Ordering::Relaxed)
+}
+
 /// 无自定义 UA 时给上游请求补的默认 UA：部分 CDN 对空 UA / 电视 UA 返回 403。
 const DEFAULT_UPSTREAM_UA: &str =
     "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
@@ -172,6 +199,13 @@ pub async fn cast_to_device(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+
+    // 诊断计数按「一次投屏」结算。放在投屏入口而不是代理启动处：
+    // 本地视频投屏根本不启动代理，计数不会被清零，读数会停在上一次流媒体投屏，
+    // 让人误以为是本次的数据。清零后「0」就能明确说明电视这次没连过代理。
+    PROXY_CONN_COUNT.store(0, Ordering::Relaxed);
+    SKIPPED_SEGMENT_COUNT.store(0, Ordering::Relaxed);
+    set_last_cast_info(format!("进行中（目标：{}）", control_url));
 
     // HLS 判定：非直连容器扩展名（mp4/mkv/avi/ts/flv/webm）即按 HLS 处理，
     // 无扩展名清单地址也覆盖。三星官方支持容器不含 HLS——m3u8 无论代理还是
@@ -282,6 +316,14 @@ pub async fn cast_to_device(
                             let _ = dlna_seek(&control_url, pos).await;
                         }
                     }
+                    set_last_cast_info(format!(
+                        "成功 · {}（proto {}）· 下发 {}",
+                        mode_desc,
+                        proto_desc,
+                        parse_http_url(&playback_url)
+                            .map(|(h, p, _)| format!("{}:{}", h, p))
+                            .unwrap_or_else(|| "—".to_string())
+                    ));
                     return Ok(playback_url);
                 }
                 Err(e) => {
@@ -314,6 +356,11 @@ pub async fn cast_to_device(
             "。诊断：电视能连上手机代理但取流失败，多为视频源限制了非浏览器访问或地址已过期，可换一集或换数据源再试",
         );
     }
+    set_last_cast_info(format!(
+        "失败 · 已尝试 {} 个模式 · 电视连接代理 {} 次",
+        attempts.len(),
+        proxy_connection_count()
+    ));
     Err(detail)
 }
 
@@ -460,7 +507,25 @@ pub async fn dlna_diagnostics(
     // [4] 本地代理状态
     report.push_str("\n[4] 本地防盗链代理\n");
     let conns = proxy_connection_count();
-    report.push_str(&format!("  累计已服务电视连接数: {}\n", conns));
+    let cast_info = last_cast_info();
+    if cast_info.is_empty() {
+        report.push_str("  最近一次投屏: 本次启动后还没投过屏\n");
+    } else {
+        report.push_str(&format!("  最近一次投屏: {}\n", cast_info));
+    }
+    // 措辞必须点明归属：本地视频投屏不经过代理，计数会停在上一次流媒体投屏，
+    // 把它当成「本次」的数据会得出完全错误的结论。
+    report.push_str(&format!(
+        "  电视连接代理次数（自最近一次投屏起算）: {}\n",
+        conns
+    ));
+    let skipped = skipped_segment_count();
+    if skipped > 0 {
+        report.push_str(&format!(
+            "  已跳过的坏分片数: {}（单分片失败不再中断投屏，画面会跳过该小段）\n",
+            skipped
+        ));
+    }
     // 连接数正常、设备指令也应答，却黑屏——故障就在代理内部这一段
     let last_err = proxy_last_error();
     if last_err.is_empty() {
@@ -1318,7 +1383,6 @@ async fn start_stream_proxy(
         *guard = Some(ProxyState { base: base.clone(), token });
     }
     let _ = PROXY_SEQ.fetch_add(1, Ordering::Relaxed);
-    PROXY_CONN_COUNT.store(0, Ordering::Relaxed); // 新会话重置诊断计数
     if let Ok(mut guard) = PROXY_LAST_ERROR.lock() {
         guard.clear();
     }
@@ -2451,12 +2515,26 @@ async fn fetch_media_playlist(
 /// reqwest 客户端只设了 connect_timeout，建连成功后卡住是没有保护的。
 const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// 拉取单个分片并流式写给电视；写失败（电视断开）即终止整条流。
-async fn stream_segment(
-    url: &str,
-    upstream: &Upstream,
-    stream: &mut tokio::net::TcpStream,
-) -> Result<(), String> {
+/// 单个分片的拉取重试次数。
+///
+/// 只在「拉取阶段」重试是安全的：此时还一个字节都没写进流里，重试不会产生
+/// 重复数据。写阶段失败是电视断开，重试没有意义。
+const SEGMENT_FETCH_RETRIES: usize = 1;
+
+/// 连续多少个分片失败后放弃整条流。
+///
+/// 单片失败绝不能断流：电视一旦看到连接关闭就会重连，而重连后 `serve_live_ts`
+/// 从头重新解析清单、从第一个分片重新开始 —— 于是又倒在同一片坏分片上，
+/// 反复重连、反复从头拉，表现就是「投一会儿就中断」或「黑色转圈」。
+/// 但连续失败说明源已不可用，硬撑只会让电视挂在一条没有数据的长连接上。
+const MAX_CONSECUTIVE_SEGMENT_FAILURES: usize = 8;
+
+/// 完整拉取一个分片到内存。
+///
+/// 刻意不边下边写：分片拉到一半失败时，流里已经进了半截数据，既没法重试
+/// （会写入重复内容），电视拿到的也是截断的 TS 包。分片通常几百 KB，
+/// 整片缓冲的代价远小于断流的代价。
+async fn fetch_segment_bytes(url: &str, upstream: &Upstream) -> Result<Vec<u8>, String> {
     let response = tokio::time::timeout(
         UPSTREAM_IDLE_TIMEOUT,
         upstream_get(url, upstream).send(),
@@ -2467,25 +2545,21 @@ async fn stream_segment(
     if !response.status().is_success() {
         return Err(format!("分片拉取失败: HTTP {}", response.status().as_u16()));
     }
-    let mut upstream_stream = response;
+    let mut body = response;
+    let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
     loop {
-        match tokio::time::timeout(UPSTREAM_IDLE_TIMEOUT, upstream_stream.chunk()).await {
+        match tokio::time::timeout(UPSTREAM_IDLE_TIMEOUT, body.chunk()).await {
             Err(_) => return Err("分片数据读取超时".to_string()),
-            Ok(Ok(Some(chunk))) => {
-                stream
-                    .write_all(&chunk)
-                    .await
-                    .map_err(|_| "电视中断了连接".to_string())?;
-            }
+            Ok(Ok(Some(chunk))) => buf.extend_from_slice(&chunk),
             Ok(Ok(None)) => break,
             Ok(Err(e)) => return Err(format!("读取分片数据失败: {}", e)),
         }
     }
-    stream
-        .flush()
-        .await
-        .map_err(|_| "电视中断了连接".to_string())?;
-    Ok(())
+    if buf.is_empty() {
+        // 空分片直接当失败：写进流里只会让电视的解复用器多等一个包
+        return Err("分片内容为空".to_string());
+    }
+    Ok(buf)
 }
 
 /// live.ts 端点：HLS → 连续 MPEG-TS 字节流。
@@ -2543,12 +2617,52 @@ transferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nConnection: 
     stream.flush().await.ok();
 
     let mut served: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut consecutive_failures = 0usize;
     loop {
         for seg in std::mem::take(&mut pending) {
             if !served.insert(seg.clone()) {
                 continue; // 直播轮询时跳过已服务的分片
             }
-            stream_segment(&seg, &upstream, &mut stream).await?;
+            // 拉取（含一次重试）。这里失败还没写过字节，重试安全。
+            let mut fetched = fetch_segment_bytes(&seg, &upstream).await;
+            for _ in 0..SEGMENT_FETCH_RETRIES {
+                if fetched.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                fetched = fetch_segment_bytes(&seg, &upstream).await;
+            }
+            let data = match fetched {
+                Ok(data) => {
+                    consecutive_failures = 0;
+                    data
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    SKIPPED_SEGMENT_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if consecutive_failures >= MAX_CONSECUTIVE_SEGMENT_FAILURES {
+                        // 只有「放弃整条流」才算故障，才写进诊断的错误字段。
+                        // 单片跳过不写：流还在正常往前走，写进去会让用户看到
+                        // 「最近一次代理错误」有内容而误以为投屏失败了。
+                        record_proxy_error(format!(
+                            "TS 连续 {} 个分片失败，已放弃本条流（最后一片: {} — {}）",
+                            consecutive_failures, seg, e
+                        ));
+                        return Err(format!(
+                            "连续 {} 个分片失败，放弃本条流（最后一片: {}）",
+                            consecutive_failures, seg
+                        ));
+                    }
+                    // 单片坏不中断整条流：跳过继续喂下一片。
+                    // 断流会让电视重连并从头开始，那才是「投一会儿就中断」的来源。
+                    continue;
+                }
+            };
+            // 写失败只可能是电视主动断开（切集/退出投屏），是正常结束，
+            // 不能当成故障去重连或降级。
+            if stream.write_all(&data).await.is_err() || stream.flush().await.is_err() {
+                return Ok(());
+            }
         }
         if endlist {
             break; // VOD：整部播完
@@ -2845,6 +2959,91 @@ fn b64url_decode(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 单个分片失败不能拖垮整条 TS 流。
+    ///
+    /// 这是「投一会儿就中断」「黑色转圈」的直接来源：以前分片失败用 `?` 向上
+    /// 传播，整条连接立刻断开；电视看到流结束就重连，而重连后 `serve_live_ts`
+    /// 从头解析清单、从第一个分片重来，于是反复倒在同一片坏分片上 ——
+    /// 客户端看到的就是「转圈」或「播一会儿断了」，永远播不过去。
+    #[tokio::test]
+    async fn live_ts_skips_broken_segment_and_keeps_streaming() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 上游：清单 4 片，第 2 片固定 403
+        let up = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = up.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let (code, body): (&str, &[u8]) = if path.contains("index.m3u8") {
+                        (
+                            "200 OK",
+                            b"#EXTM3U\n#EXTINF:1,\nseg1.ts\n#EXTINF:1,\nseg2.ts\n\
+                              #EXTINF:1,\nseg3.ts\n#EXTINF:1,\nseg4.ts\n#EXT-X-ENDLIST\n",
+                        )
+                    } else if path.contains("seg2") {
+                        ("403 Forbidden", b"denied-body")
+                    } else if path.contains("seg1") {
+                        ("200 OK", b"SEG-ONE")
+                    } else if path.contains("seg3") {
+                        ("200 OK", b"SEG-THREE")
+                    } else {
+                        ("200 OK", b"SEG-FOUR")
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: application/octet-stream\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        code,
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+
+        // 电视端：连上来取流
+        let tv = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tv_addr = tv.local_addr().unwrap();
+        let target = format!("http://{}/index.m3u8", up_addr);
+        let upstream = Arc::new(Upstream {
+            referer: None,
+            user_agent: None,
+            cookie: None,
+            token: "t".to_string(),
+            is_samsung: false,
+            ad_uris: Vec::new(),
+        });
+        let server = tokio::spawn(async move {
+            let (sock, _) = tv.accept().await.unwrap();
+            serve_live_ts(sock, target, upstream).await
+        });
+
+        let mut client = tokio::net::TcpStream::connect(tv_addr).await.unwrap();
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        let result = server.await.unwrap();
+        let text = String::from_utf8_lossy(&out);
+
+        assert!(result.is_ok(), "坏分片不应让整条流报错: {:?}", result);
+        assert!(text.contains("SEG-ONE"), "首个分片应已下发");
+        assert!(text.contains("SEG-THREE"), "坏分片之后应继续下发: {}", text);
+        assert!(text.contains("SEG-FOUR"), "后续分片应全部下发: {}", text);
+        assert!(
+            !text.contains("denied-body"),
+            "403 的响应体不该混进流里: {}",
+            text
+        );
+    }
 
     #[test]
     fn b64url_roundtrip() {
