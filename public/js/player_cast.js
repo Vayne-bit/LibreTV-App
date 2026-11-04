@@ -340,9 +340,8 @@
             const deviceIp = hostOf(device.control_url);
             tauriInvoke('start_local_file_server', { path: pendingLocalPath, preferredIp: deviceIp }).then(function (entry) {
                 // 本机用回环地址播放，电视用 LAN 地址（按设备网段选，多网卡/VPN 下可达）
-                if (activeArt && activeArt.switchUrl) {
-                    try { activeArt.switchUrl(entry.loopback_url); } catch (e) { /* 不支持切换则忽略 */ }
-                }
+                // 本机这侧同样要把类型切成文件实际类型，否则 mp4 会被塞进 hls.js
+                switchPlayerTo(entry.loopback_url, activeArt);
                 castUrlToDevice(device, entry.url, null, false);
             }).catch(function (e) {
                 notice(activeArt, '本地视频服务失败：' + errMsg(e));
@@ -406,6 +405,38 @@
         }
     }
 
+    // 切换播放器到新地址，并按新地址重算播放类型。
+    //
+    // 为什么不能直接调 art.switchUrl：artplayer 的 url setter 是
+    //     n = option.type || V(新地址)
+    // option.type 是实例初始化时定下的，换 URL 时不会重算。
+    // 本 App 播放器初始是 m3u8（option.type='m3u8'，走 playM3u8/hls.js），
+    // 所以裸调 switchUrl 换成本地 mp4 时，mp4 会被塞进 hls.js 去解析 ——
+    // hls.js 认不出 mp4，报错又被 switchUrl 的 Promise 吞掉，
+    // 结果就是「点了文件、播放器毫无变化」。
+    // 必须先把 option.type 改成新地址对应的类型，再切。
+    function switchPlayerTo(url, art) {
+        const player = art || activeArt;
+        if (!player || !player.switchUrl) return false;
+        try {
+            const type = typeof getVideoType === 'function' ? getVideoType(url) : '';
+            if (type) player.option.type = type;
+            // 从 m3u8 切到普通文件时，旧的 hls.js 实例还占着 video 元素，
+            // 不销毁的话新地址没法接管（和解流引擎共用同一个 <video>）
+            if (type && type !== 'm3u8' && type !== 'flv' && typeof destroyStreamEngines === 'function') {
+                destroyStreamEngines(player);
+            }
+            const result = player.switchUrl(url);
+            if (result && typeof result.catch === 'function') {
+                result.catch(function (e) { console.warn('switchUrl failed', e); });
+            }
+            return true;
+        } catch (e) {
+            console.warn('switchUrl failed', e);
+            return false;
+        }
+    }
+
     // 本地视频播放：系统文件选择器 → 本机起 HTTP 服务 → 直接用回环地址在 App 内播放
     // （不在此投屏；投屏交给菜单里的「投屏到电视」，当前视频源已就绪即可直接投）
     async function pickAndPlayLocalVideo(art) {
@@ -425,8 +456,9 @@
         notice(activeArt, '已选择本地文件，正在本机准备播放...');
         // 本机播放走回环地址；preferredIp 传 null 让服务自己选 LAN 地址（电视投屏时才需要）
         tauriInvoke('start_local_file_server', { path: path, preferredIp: null }).then(function (entry) {
-            if (activeArt && activeArt.switchUrl) {
-                try { activeArt.switchUrl(entry.loopback_url); } catch (e) { /* 不支持切换则忽略 */ }
+            if (!switchPlayerTo(entry.loopback_url, activeArt)) {
+                notice(activeArt, '播放器无法切换到本地文件');
+                return;
             }
             notice(activeArt, '正在本机播放：' + (entry.name || path));
         }).catch(function (e) {
@@ -487,8 +519,9 @@
                 notice(activeArt, '正在解析「' + q + '」...');
                 tauriInvoke('resolve_vip_url', { pageUrl: q, apiBase: apiBase }).then(function (res) {
                     if (!res || !res.url) { notice(activeArt, '解析未返回可播地址'); return; }
-                    if (activeArt && activeArt.switchUrl) {
-                        try { activeArt.switchUrl(res.url); } catch (e) {}
+                    if (!switchPlayerTo(res.url, activeArt)) {
+                        notice(activeArt, '播放器无法切换到解析地址');
+                        return;
                     }
                     notice(activeArt, '解析成功，正在本机播放；需要投屏请点齿轮菜单「投屏到电视」');
                 }).catch(function (e) {
@@ -583,8 +616,9 @@
         vipFetchDetail(src, String(id)).then(function (episodes) {
             const url = (episodes || []).find(function (u) { return /^https?:\/\//.test(u); });
             if (!url) { notice(activeArt, '未解析到可播地址'); return; }
-            if (activeArt && activeArt.switchUrl) {
-                try { activeArt.switchUrl(url); } catch (e) {}
+            if (!switchPlayerTo(url, activeArt)) {
+                notice(activeArt, '播放器无法切换到该地址');
+                return;
             }
             notice(activeArt, '正在本机播放；需要投屏请点齿轮菜单「投屏到电视」');
         }).catch(function (e) {
