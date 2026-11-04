@@ -26,10 +26,18 @@ function buildPlayerPageUrl(position) {
         index: String(currentEpisodeIndex),
         position: String(Math.floor(position || 0))
     });
+    // 本地文件模式要把标记和原始路径一起带上：丢了 local 会被当成在线视频
+    // （写进观看历史），丢了 path 则投屏时拿不到 LAN 地址所需的路径
+    if (typeof isLocalFileMode === 'function' && isLocalFileMode()) {
+        params.set('local', '1');
+        const localPath = urlParams.get('path') || '';
+        if (localPath) params.set('path', localPath);
+    }
     return `player.html?${params.toString()}`;
 }
 
 function saveToHistory() {
+    if (typeof isLocalFileMode === 'function' && isLocalFileMode()) return;
     if (!currentEpisodes || currentEpisodes.length === 0 || !currentVideoUrl) return;
     const urlParams = new URLSearchParams(window.location.search);
     const sourceName = urlParams.get('source') || '';
@@ -73,6 +81,7 @@ function startProgressSaveInterval() {
 }
 
 function saveCurrentProgress() {
+    if (typeof isLocalFileMode === 'function' && isLocalFileMode()) return;
     const { position, duration } = getPlaybackState();
     if (!duration || position < 1) return;
     try {

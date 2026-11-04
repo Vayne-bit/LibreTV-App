@@ -27,6 +27,7 @@ function initializeApp() {
     if (doubanToggle) doubanToggle.checked = localStorage.getItem('doubanEnabled') !== 'false';
 
     setupEventListeners();
+    if (typeof setupLocalFileEntry === 'function') setupLocalFileEntry();
     setTimeout(checkAdultAPIsSelected, 100);
 
     initAppShell();

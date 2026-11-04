@@ -41,6 +41,13 @@ function updateButtonStates() {
     const nextButton = document.getElementById('nextButton');
     if (prevButton) prevButton.disabled = currentEpisodeIndex <= 0;
     if (nextButton) nextButton.disabled = currentEpisodeIndex >= currentEpisodes.length - 1;
+    // 本地文件没有在线线路可换，隐藏「换源」入口（点了只会弹找不到源）
+    if (typeof isLocalFileMode === 'function' && isLocalFileMode()) {
+        ['switchSourceBtn', 'errorSwitchSourceBtn'].forEach(function (id) {
+            const btn = document.getElementById(id);
+            if (btn) btn.classList.add('hidden');
+        });
+    }
 }
 
 function getGroupCount() {

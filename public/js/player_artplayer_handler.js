@@ -131,6 +131,11 @@ function destroyStreamEngines(instance) {
 
 // 片源加载失败：先尝试自动换源，找不到再显示错误页
 function handleSourceFailure() {
+    // 本地文件没有在线线路可换，直接报错即可（也别弹「换个源」这类无效出口）
+    if (typeof isLocalFileMode === 'function' && isLocalFileMode()) {
+        showPlayerError('本地文件加载失败，可能已被移动或删除');
+        return;
+    }
     if (typeof autoRelinkAndPlay === 'function') {
         autoRelinkAndPlay().then(result => {
             if (!result || !result.ok) {
@@ -579,6 +584,8 @@ function initPlayer(videoUrl) {
         videoHasEnded = true;
         clearVideoProgress();
         requestScreenAwake(false);
+        // 本地文件只有一集，没有「下一集」概念
+        if (typeof isLocalFileMode === 'function' && isLocalFileMode()) return;
         if (autoplayEnabled && currentEpisodeIndex < currentEpisodes.length - 1) {
             art.notice.show = '即将播放下一集';
             setTimeout(() => {
@@ -642,6 +649,8 @@ function switchPlayerUrl(url, startPosition = 0) {
 
 function armSlowLoadHint() {
     clearTimeout(slowLoadTimer);
+    // 本地文件是本机回环地址，不存在「换更快的线路」这回事
+    if (typeof isLocalFileMode === 'function' && isLocalFileMode()) return;
     slowLoadTimer = setTimeout(() => {
         if (playbackStarted || !art) return;
         // 起播过慢时给一个直接换源的出口，而不是只留一句提示

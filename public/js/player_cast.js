@@ -249,6 +249,13 @@
             return;
         }
         const url = currentSourceUrl(activeArt);
+        // 本地文件模式：当前源是 127.0.0.1 回环地址，电视访问不到（访问的是电视自己）。
+        // 走本地文件投屏分支：按电视的网段重新起一份服务，用 LAN 地址投过去。
+        const localPath = (typeof getLocalFilePath === 'function') ? getLocalFilePath() : '';
+        if (localPath) {
+            chooseDeviceThenCast(url, currentReferer(), true, localPath);
+            return;
+        }
         if (!url) {
             notice(activeArt, '当前没有可投屏的视频源');
             return;
@@ -341,7 +348,14 @@
             tauriInvoke('start_local_file_server', { path: pendingLocalPath, preferredIp: deviceIp }).then(function (entry) {
                 // 本机用回环地址播放，电视用 LAN 地址（按设备网段选，多网卡/VPN 下可达）
                 // 本机这侧同样要把类型切成文件实际类型，否则 mp4 会被塞进 hls.js
-                switchPlayerTo(entry.loopback_url, activeArt);
+                // 独立播放页（本地文件模式）已经在播这个文件了，不要再切一次 URL——那会
+                // 把播放进度清零。只需要在类型不对时补一次类型修正。
+                if (typeof isLocalFileMode === 'function' && isLocalFileMode()) {
+                    // 本机播放地址不变，类型已由播放页初始化时按扩展名判定，无需处理
+                } else if (!switchPlayerTo(entry.loopback_url, activeArt)) {
+                    notice(activeArt, '本机无法切换到本地文件');
+                    return;
+                }
                 castUrlToDevice(device, entry.url, null, false);
             }).catch(function (e) {
                 notice(activeArt, '本地视频服务失败：' + errMsg(e));

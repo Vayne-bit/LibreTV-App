@@ -82,7 +82,10 @@ function initializePageContent() {
         pendingSeekPosition = startPosition > 10 ? startPosition : getSavedProgress();
         initPlayer(currentVideoUrl);
         // 同步来的条目片源多半已失效，提前自动找源，避免先黑屏再报错
-        if (typeof precheckRelinkIfNeeded === 'function') precheckRelinkIfNeeded();
+        // 本地文件是本机文件，没有在线线路可找
+        if (typeof isLocalFileMode !== 'function' || !isLocalFileMode()) {
+            if (typeof precheckRelinkIfNeeded === 'function') precheckRelinkIfNeeded();
+        }
     } else if (urlParams.get('relink') === '1' && typeof autoRelinkAndPlay === 'function') {
         // 同步来的记录本机没有直链，直接开始找源，不走报错分支
         pendingSeekPosition = startPosition > 10 ? startPosition : getSavedProgress();
