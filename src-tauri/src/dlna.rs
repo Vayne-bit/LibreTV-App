@@ -69,6 +69,30 @@ static PROXY_SEQ: AtomicU64 = AtomicU64::new(0);
 /// 计数为 0 = 电视根本没连上手机（AP 隔离/不同网段）；>0 = 电视可达但取流被拒。
 static PROXY_CONN_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// 代理侧最近一次「非正常断开」的原因。
+///
+/// 电视黑屏转圈时，连接数和设备指令都是正常的——问题发生在代理内部
+/// （拉清单失败 / 上游超时 / 分片 403），而这条链路没有任何日志出口。
+/// 把它挂到诊断报告上，下次出问题能直接看出是哪个环节断的。
+static PROXY_LAST_ERROR: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
+
+fn record_proxy_error(err: String) {
+    // 电视自己关流/切集是正常行为，不该覆盖真正的故障原因
+    if err.contains("电视中断了连接") || err.contains("Broken pipe") {
+        return;
+    }
+    if let Ok(mut guard) = PROXY_LAST_ERROR.lock() {
+        *guard = err;
+    }
+}
+
+fn proxy_last_error() -> String {
+    PROXY_LAST_ERROR
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default()
+}
+
 fn proxy_connection_count() -> u64 {
     PROXY_CONN_COUNT.load(Ordering::Relaxed)
 }
@@ -435,7 +459,19 @@ pub async fn dlna_diagnostics(
 
     // [4] 本地代理状态
     report.push_str("\n[4] 本地防盗链代理\n");
-    report.push_str(&format!("  累计已服务电视连接数: {}\n", proxy_connection_count()));
+    let conns = proxy_connection_count();
+    report.push_str(&format!("  累计已服务电视连接数: {}\n", conns));
+    // 连接数正常、设备指令也应答，却黑屏——故障就在代理内部这一段
+    let last_err = proxy_last_error();
+    if last_err.is_empty() {
+        report.push_str("  最近一次代理错误: 无\n");
+        if conns == 0 {
+            report.push_str("  判读: 电视一次都没连上代理——检查 AP 隔离/访客网络/路由器是否隔离内网设备\n");
+        }
+    } else {
+        report.push_str(&format!("  最近一次代理错误: {}\n", last_err));
+        report.push_str("  判读: 电视已连上代理，是代理去取上游时失败——这条错误即黑屏/中断的直接原因\n");
+    }
 
     report.push_str("\n（以上全文复制发给开发者即可定位问题环节）\n");
     Ok(report)
@@ -1268,7 +1304,9 @@ async fn start_stream_proxy(
                 Ok((stream, _peer)) => {
                     let upstream = upstream.clone();
                     tauri::async_runtime::spawn(async move {
-                        let _ = handle_proxy_conn(stream, upstream).await;
+                        if let Err(e) = handle_proxy_conn(stream, upstream).await {
+                            record_proxy_error(e);
+                        }
                     });
                 }
                 Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
@@ -1281,6 +1319,9 @@ async fn start_stream_proxy(
     }
     let _ = PROXY_SEQ.fetch_add(1, Ordering::Relaxed);
     PROXY_CONN_COUNT.store(0, Ordering::Relaxed); // 新会话重置诊断计数
+    if let Ok(mut guard) = PROXY_LAST_ERROR.lock() {
+        guard.clear();
+    }
     Ok((entry, ts_entry))
 }
 
@@ -2127,8 +2168,21 @@ transferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nConnection: 
     if let Some(cookie) = &upstream.cookie {
         request = request.header(reqwest::header::COOKIE, cookie);
     }
+    // 清单请求不透传 Range：部分源站对带 Range 的清单请求回 206 + 截断内容，
+    // 代理据此改写出来的就是半份清单——电视只会表现为黑屏或播到一半断掉。
+    // 清单本身只有几十 KB，整份读取没有任何性能顾虑。
+    let target_is_playlist = {
+        let lower = target.to_ascii_lowercase();
+        let clean = lower
+            .split(|c: char| c == '?' || c == '#')
+            .next()
+            .unwrap_or(&lower);
+        clean.ends_with(".m3u8") || clean.ends_with(".m3u")
+    };
     if let Some(range) = &range {
-        request = request.header(reqwest::header::RANGE, range);
+        if !target_is_playlist {
+            request = request.header(reqwest::header::RANGE, range);
+        }
     }
     let response = request
         .send()
@@ -2390,30 +2444,41 @@ async fn fetch_media_playlist(
     parse_media_playlist(&text, url, &upstream.ad_uris)
 }
 
+/// 上游分片请求的静默超时：这么久没收到任何数据就判定上游失联。
+///
+/// 没有超时的后果是整条 TS 流永久挂住：代理既不发数据也不断开，电视端缓冲
+/// 耗尽后只能无限转圈，而代理这边一声不响——用户和日志都看不出发生了什么。
+/// reqwest 客户端只设了 connect_timeout，建连成功后卡住是没有保护的。
+const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// 拉取单个分片并流式写给电视；写失败（电视断开）即终止整条流。
 async fn stream_segment(
     url: &str,
     upstream: &Upstream,
     stream: &mut tokio::net::TcpStream,
 ) -> Result<(), String> {
-    let response = upstream_get(url, upstream)
-        .send()
-        .await
-        .map_err(|e| format!("拉取分片失败: {}", e))?;
+    let response = tokio::time::timeout(
+        UPSTREAM_IDLE_TIMEOUT,
+        upstream_get(url, upstream).send(),
+    )
+    .await
+    .map_err(|_| "拉取分片超时（上游无响应）".to_string())?
+    .map_err(|e| format!("拉取分片失败: {}", e))?;
     if !response.status().is_success() {
         return Err(format!("分片拉取失败: HTTP {}", response.status().as_u16()));
     }
     let mut upstream_stream = response;
     loop {
-        match upstream_stream.chunk().await {
-            Ok(Some(chunk)) => {
+        match tokio::time::timeout(UPSTREAM_IDLE_TIMEOUT, upstream_stream.chunk()).await {
+            Err(_) => return Err("分片数据读取超时".to_string()),
+            Ok(Ok(Some(chunk))) => {
                 stream
                     .write_all(&chunk)
                     .await
                     .map_err(|_| "电视中断了连接".to_string())?;
             }
-            Ok(None) => break,
-            Err(e) => return Err(format!("读取分片数据失败: {}", e)),
+            Ok(Ok(None)) => break,
+            Ok(Err(e)) => return Err(format!("读取分片数据失败: {}", e)),
         }
     }
     stream
@@ -2431,11 +2496,35 @@ async fn serve_live_ts(
     target: String,
     upstream: Arc<Upstream>,
 ) -> Result<(), String> {
-    let media_url = resolve_media_playlist(&target, &upstream).await?;
-    let (mut pending, mut endlist) = fetch_media_playlist(&media_url, &upstream).await?;
-    if pending.is_empty() {
-        return Err("媒体清单里没有可用分片".to_string());
+    // 探测阶段：响应头还没发出去，任何失败都要回一个明确的 5xx。
+    // 以前这里是直接 `return Err`，调用方 `let _ =` 又把错误丢掉 ——
+    // 结果是电视连上来后一个字节都收不到，只能无限转圈：
+    // 用户看不到错因，投屏梯度也不会落到下一档。
+    let prepared = async {
+        let media_url = resolve_media_playlist(&target, &upstream).await?;
+        let (pending, endlist) = fetch_media_playlist(&media_url, &upstream).await?;
+        if pending.is_empty() {
+            return Err("媒体清单里没有可用分片".to_string());
+        }
+        Ok((media_url, pending, endlist))
     }
+    .await;
+    let (media_url, mut pending, mut endlist) = match prepared {
+        Ok(value) => value,
+        Err(e) => {
+            record_proxy_error(format!("TS 串流准备失败: {}", e));
+            let body = e.as_bytes();
+            let head = format!(
+                "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\n\
+Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+            let _ = stream.flush().await;
+            return Ok(());
+        }
+    };
 
     let ts_mime = if upstream.is_samsung {
         "video/vnd.dlna.mpeg-tts"
@@ -2506,8 +2595,37 @@ fn rewrite_playlist(text: &str, playlist_url: &str, ad_uris: &[String]) -> Strin
         // 无广告：走原来的纯改写路径，不改变任何输出
         return rewrite_playlist_plain(text, playlist_url);
     }
-    let blocks = split_playlist_blocks(text);
+    // 清单头部（第一个分片行之前的行）无条件保留。
+    //
+    // 大量站源把广告直接贴在正片前面、且不加断点标记，于是 #EXTM3U、
+    // #EXT-X-VERSION、#EXT-X-TARGETDURATION、#EXT-X-MEDIA-SEQUENCE 与广告分片
+    // 同处第一块。整块删除会把清单头一起删掉，输出变成「不以 #EXTM3U 开头、
+    // 没有 TARGETDURATION」的非法清单 —— 渲染端整份拒绝，表现为黑屏转圈。
+    // 这些是全局标签，与后面跟哪个分片无关，因此单独取出、不参与块删除判定。
+    let lines: Vec<&str> = text.lines().collect();
+    // 边界取「第一个 #EXTINF」而不是「第一个分片行」：#EXTINF 是分片自己的属性，
+    // 留在头部就成了「有 EXTINF 却没有分片」的孤立声明，时长统计与严格解析器会出错。
+    let head_end = lines
+        .iter()
+        .position(|line| {
+            let t = line.trim();
+            t.starts_with("#EXTINF") || (!t.is_empty() && !t.starts_with('#'))
+        })
+        .unwrap_or(lines.len());
     let mut out = String::with_capacity(text.len() + 256);
+    for line in &lines[..head_end] {
+        // 头部也可能带 URI 属性（#EXT-X-KEY / #EXT-X-MAP，master 里的
+        // #EXT-X-MEDIA / #EXT-X-I-FRAME-STREAM-INF），同样要走代理
+        if line.trim().starts_with('#') && line.contains("URI=\"") {
+            out.push_str(&rewrite_tag_uris(line, playlist_url));
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+
+    let body = lines[head_end..].join("\n");
+    let blocks = split_playlist_blocks(&body);
     let mut tail: Vec<&str> = Vec::new();
     let mut emitted = 0usize;
     for block in &blocks {
@@ -2551,6 +2669,14 @@ fn rewrite_playlist(text: &str, playlist_url: &str, ad_uris: &[String]) -> Strin
     for line in tail {
         out.push_str(line);
         out.push('\n');
+    }
+    // 兜底：名单把所有分片都删光时（判定出错 / 清单与名单不同源），
+    // 剩下的只有头部标签，同样是非法清单。宁可让用户看广告，也不能黑屏。
+    if !out.lines().any(|line| {
+        let t = line.trim();
+        !t.is_empty() && !t.starts_with('#')
+    }) {
+        return rewrite_playlist_plain(text, playlist_url);
     }
     out
 }
@@ -2850,6 +2976,65 @@ mod tests {
         // 断点数应与保留块数匹配（广告块前后的断点被合并）
         assert_eq!(rewritten.matches("#EXT-X-DISCONTINUITY").count(), 1, "{}", rewritten);
         assert!(rewritten.contains("#EXT-X-ENDLIST"), "播放结束标记应保留");
+    }
+
+    /// 片头广告：第一个块必须保留清单头部标签。
+    ///
+    /// 大量站源把广告直接贴在正片前面，没有断点标记，于是 #EXTM3U /
+    /// #EXT-X-VERSION / #EXT-X-TARGETDURATION / #EXT-X-MEDIA-SEQUENCE
+    /// 与广告分片同处「第一块」。整块删除会把这些标签一起删掉——
+    /// 输出变成没有 #EXTM3U 开头、没有 TARGETDURATION 的非法清单，
+    /// 电视拿到后解析失败，表现为黑屏转圈。
+    #[test]
+    fn playlist_rewrite_keeps_header_when_leading_block_is_ad() {
+        let base = "http://192.168.1.5:12345".to_string();
+        if let Ok(mut guard) = PROXY.lock() {
+            *guard = Some(ProxyState { base, token: "test-token".to_string() });
+        }
+        let playlist = "#EXTM3U\n\
+                        #EXT-X-VERSION:3\n\
+                        #EXT-X-TARGETDURATION:10\n\
+                        #EXT-X-PLAYLIST-TYPE:VOD\n\
+                        #EXT-X-MEDIA-SEQUENCE:0\n\
+                        #EXTINF:5,\n\
+                        ad1.ts\n\
+                        #EXTINF:5,\n\
+                        ad2.ts\n\
+                        #EXT-X-DISCONTINUITY\n\
+                        #EXTINF:10,\n\
+                        c1.ts\n\
+                        #EXT-X-ENDLIST\n";
+        let ads = vec!["ad1.ts".to_string(), "ad2.ts".to_string()];
+        let rewritten = rewrite_playlist(playlist, "https://src.example.com/vod/list.m3u8", &ads);
+        assert!(
+            rewritten.starts_with("#EXTM3U"),
+            "清单必须以 #EXTM3U 开头，否则渲染端整份拒绝: {}",
+            rewritten
+        );
+        assert!(
+            rewritten.contains("#EXT-X-TARGETDURATION"),
+            "HLS 必需标签 TARGETDURATION 丢失: {}",
+            rewritten
+        );
+        assert!(
+            !rewritten.contains("ad1.ts") && !rewritten.contains("ad2.ts"),
+            "广告分片仍应被剔除: {}",
+            rewritten
+        );
+        // #EXTINF 必须与分片一一对应：留在头部会变成「有 EXTINF 没有分片」的孤立声明
+        let seg_count = rewritten
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with('#')
+            })
+            .count();
+        assert_eq!(
+            rewritten.matches("#EXTINF").count(),
+            seg_count,
+            "EXTINF 数与分片数不一致（有孤立 EXTINF）: {}",
+            rewritten
+        );
     }
 
     #[test]

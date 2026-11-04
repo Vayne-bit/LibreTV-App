@@ -1308,6 +1308,25 @@ function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
     const keptUris = [];
     const adUris = [];
     let emitted = 0;
+    // 清单头部（第一个分片行之前的行）无条件保留。
+    //
+    // 片头贴片广告没有断点标记，于是 #EXTM3U、#EXT-X-VERSION、
+    // #EXT-X-TARGETDURATION、#EXT-X-MEDIA-SEQUENCE 与广告分片同处第一块。
+    // 整块删除会把这些标签一起删掉，产出「不以 #EXTM3U 开头、没有
+    // TARGETDURATION」的非法清单——播放器整份拒绝，表现为黑屏。
+    // 它们是全局标签，与后面跟哪个分片无关，因此先单独取出、不参与块删除。
+    let headCount = 0;
+    if (blocks.length && blocks[0].lines) {
+        for (let i = 0; i < blocks[0].lines.length; i++) {
+            const t = blocks[0].lines[i].trim();
+            // #EXTINF 是分片自己的属性，必须跟着分片走——留在头部就成了
+            // 「有 EXTINF 却没有分片」的孤立声明，时长统计与严格解析器都会出错
+            if (t.indexOf('#EXTINF') === 0) break;
+            if (t && t.charAt(0) !== '#') break;
+            headCount = i + 1;
+        }
+        blocks[0].lines.slice(0, headCount).forEach(line => kept.push(line));
+    }
     blocks.forEach((block, index) => {
         if (dropped.indexOf(index) >= 0) {
             // 尾部广告块里带着 #EXT-X-ENDLIST，整块丢掉会连播放结束标记一起丢
@@ -1320,7 +1339,10 @@ function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
         // 头一个分片之前不需要断点，写了反而是个孤立标记
         if (block.discontinuity && emitted > 0) kept.push('#EXT-X-DISCONTINUITY');
         block.segments.forEach(segment => keptUris.push(segment.uri));
-        block.lines.forEach(line => kept.push(line));
+        block.lines.forEach((line, lineIndex) => {
+            if (index === 0 && lineIndex < headCount) return; // 头部已单独保留
+            kept.push(line);
+        });
         emitted += block.segments.length;
     });
     tail.forEach(line => kept.push(line));
