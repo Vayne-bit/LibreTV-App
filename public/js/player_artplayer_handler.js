@@ -896,7 +896,7 @@ function parseRawPlaylist(m3u8Content, baseUrl) {
                 end: clock + pending,
                 host: playlistHost(trimmed, baseUrl),
                 // 路径前缀：同一个 CDN 下的分片共享前缀，广告常用另一个前缀
-                pathPrefix: playlistPathPrefix(trimmed)
+                pathPrefix: playlistPathPrefix(trimmed, baseUrl)
             };
             block.segments.push(seg);
             block.duration += pending;
@@ -914,10 +914,15 @@ function parseRawPlaylist(m3u8Content, baseUrl) {
     };
 }
 
-// 分片的路径前缀（去掉最后一级文件名）：广告块常整块来自另一个目录
-function playlistPathPrefix(uri) {
+// 分片的路径前缀（去掉最后一级文件名）：广告块常整块来自另一个目录。
+// baseUrl 必须传：相对路径分片（如 `c630xxx.ts`、`3000k/hls/x.ts`）若用
+// 占位基座解析，整份清单的前缀会坍缩成同一个 `placeholder.invalid/...`，
+// 「前缀隔离」安全阀退化失效（只影响召回——坍缩只会让判据宁可放过——
+// 但 dyttzy 等相对路径源的结构过滤会整体失灵）。playlistHost 一直都用
+// 真实 baseUrl 解析，两者必须一致。
+function playlistPathPrefix(uri, baseUrl) {
     try {
-        const u = new URL(uri, 'https://placeholder.invalid/');
+        const u = new URL(uri, baseUrl || 'https://placeholder.invalid/');
         const path = u.pathname.replace(/[^/]*$/, '');
         return u.host + path;
     } catch (e) {
@@ -1041,7 +1046,7 @@ function isDiscontinuityLine(text) {
 //   segments[].pathPrefix —— 分片所在的 host+目录（广告块整块来自另一个目录）
 //   segments[].start/end —— 该分片在原始清单时间轴上的位置
 // 判据本身在 player_ad_locator.js（与「长按一次自动识别广告边界」共用一份实现）。
-function splitPlaylistBlocks(lines) {
+function splitPlaylistBlocks(lines, baseUrl) {
     const blocks = [];
     let block = { discontinuity: false, keyNone: false, lines: [], segments: [], duration: 0 };
     let pending = 0;
@@ -1069,7 +1074,7 @@ function splitPlaylistBlocks(lines) {
             block.segments.push({
                 uri: trimmed,
                 duration: pending,
-                pathPrefix: playlistPathPrefix(trimmed),
+                pathPrefix: playlistPathPrefix(trimmed, baseUrl),
                 start: clock,
                 end: clock + pending
             });
@@ -1100,7 +1105,7 @@ function playlistHost(uri, baseUrl) {
 function filterByHostRules(m3u8Content, lines, baseUrl, applyFilter) {
     const learned = new Set(getLearnedAdHosts());
     const hostHit = uri => isAdSegmentUri(uri) || learned.has(playlistHost(uri, baseUrl));
-    const blocks = splitPlaylistBlocks(lines);
+    const blocks = splitPlaylistBlocks(lines, baseUrl);
     const hasMarkers = blocks.some(block => block.discontinuity);
     if (hasMarkers) {
         const hitBlocks = [];
@@ -1279,7 +1284,7 @@ function isAdEndTag(trimmed) {
 // 正片域名集合只在非广告块上累积，首块之后「异域名」几乎恒真，整片正片被连锁误删。
 // 宁可漏删广告，也不能删掉正片。
 function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
-    const blocks = splitPlaylistBlocks(lines);
+    const blocks = splitPlaylistBlocks(lines, baseUrl);
     let totalSegments = 0;
     let totalDuration = 0;
     blocks.forEach(block => block.segments.forEach(segment => {

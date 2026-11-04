@@ -151,6 +151,30 @@ static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
         .unwrap_or_default()
 });
 
+/// 测试专用：CAST_MIRROR_BASE 设置时把所有上游 URL 改写到本机通用镜像。
+/// 背景：沙箱环境禁止编译产物直连外网（connect 一律 os error 10013），
+/// 多源端到端模拟用「Node 镜像回环」替代出网传输层——master 跟随、相对地址
+/// 解析、分片拉取、TS 拼接等被测逻辑全部照旧真实。生产构建此函数是空操作。
+#[cfg(not(test))]
+fn mirror_url(url: &str) -> &str {
+    url
+}
+
+#[cfg(test)]
+fn mirror_url(url: &str) -> String {
+    let mirror = match std::env::var("CAST_MIRROR_BASE") {
+        Ok(base) if !base.trim().is_empty() => base,
+        _ => return url.to_string(),
+    };
+    if url.starts_with("http://127.0.0.1")
+        || url.starts_with("http://localhost")
+        || !(url.starts_with("http://") || url.starts_with("https://"))
+    {
+        return url.to_string();
+    }
+    format!("{}/{}", mirror.trim_end_matches('/'), url)
+}
+
 // ---------- Tauri 命令 ----------
 
 /// 搜索局域网内的 DLNA 渲染设备（带 AVTransport 服务）。
@@ -2454,7 +2478,7 @@ transferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nConnection: 
     let target = String::from_utf8(target_bytes).map_err(|_| "代理地址不是合法 UTF-8")?;
 
     // 构造上游请求：带鉴权头 + Range 透传；未提供 UA 时补默认浏览器 UA
-    let mut request = HTTP.get(&target);
+    let mut request = HTTP.get(mirror_url(&target));
     if let Some(referer) = &upstream.referer {
         request = request.header(reqwest::header::REFERER, referer);
     }
@@ -2591,7 +2615,7 @@ transferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nConnection: 
 /// 带会话鉴权头的上游 GET（TS 串流专用；直取通道的 Range 透传逻辑不同，不复用）。
 /// 同步构建 RequestBuilder（非 async——构建器不涉及 IO）。
 fn upstream_get(url: &str, upstream: &Upstream) -> reqwest::RequestBuilder {
-    let mut request = HTTP.get(url);
+    let mut request = HTTP.get(mirror_url(url));
     if let Some(referer) = &upstream.referer {
         request = request.header(reqwest::header::REFERER, referer);
     }
@@ -4160,8 +4184,8 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}",
             .expect("模拟渲染端应收到 CurrentURI");
         assert_eq!(delivered, playback_url, "电视收到的地址应与下发一致");
 
-        let (head_status, head_text, ttfb, total, max_gap, sync_ok) =
-            tv_fetch_like_samsung(&playback_url, 20).await;
+        let (head_status, _get_status, head_text, ttfb, total, max_gap, sync_ok) =
+            tv_fetch_like_samsung(&playback_url, 20, &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("cast_e2e_capture.ts")).await;
         println!("[E2E] HEAD: {}", head_status);
         println!("[E2E] HEAD 头:\n{}", head_text);
         println!(
@@ -4183,9 +4207,136 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         assert!(sync_ok, "TS 同步字节（188 字节对齐 0x47）应规整——乱流电视直接拒播");
     }
 
+    /// 多源投屏模拟：CAST_E2E_URL_FILE 指向「label|url」行列表（url 可指向本机
+    /// 通用镜像 http://127.0.0.1:18500/<目标>，出网传输由镜像代办，其余链路全真实），
+    /// 对每个源跑完整 cast_to_device → HEAD/GET 取流，逐源分类汇报。
+    ///
+    /// 分类口径：
+    ///   PASS        —— TS 串流 200、供给与同步字节健康
+    ///   SOURCE-DOWN —— 上游 502/拉不到（源站自身不可用，非投屏链路问题）
+    ///   FAIL        —— 链路问题：TS 200 但供给过慢 / 同步字节乱 / 停摆（必须修的）
+    #[tokio::test]
+    #[ignore]
+    async fn e2e_multi_source_simulation() {
+        let list_path = std::env::var("CAST_E2E_URL_FILE").expect("需要 CAST_E2E_URL_FILE");
+        let content = std::fs::read_to_string(&list_path).expect("读取 URL 列表失败");
+        let entries: Vec<(String, String)> = content
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                if l.is_empty() || l.starts_with('#') {
+                    return None;
+                }
+                let (label, url) = l.split_once('|')?;
+                Some((label.trim().to_string(), url.trim().to_string()))
+            })
+            .collect();
+        assert!(!entries.is_empty(), "URL 列表为空");
+        let secs: u64 = std::env::var("CAST_E2E_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        let (control_url, _renderer) =
+            spawn_fake_renderer(9197, FakeTvBehavior::PlaysAfterSet).await;
+
+        let captures_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("cast_captures");
+        let _ = std::fs::create_dir_all(&captures_dir);
+
+        let mut summary: Vec<String> = Vec::new();
+        let (mut pass, mut source_down, mut fail) = (0usize, 0usize, 0usize);
+        let mut fail_lines: Vec<String> = Vec::new();
+        for (label, url) in &entries {
+            let cast = cast_to_device(
+                control_url.clone(),
+                url.clone(),
+                Some(label.clone()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+            let playback_url = match cast {
+                Err(e) => {
+                    fail += 1;
+                    let line = format!("FAIL(cast) [{}] {}", label, e.chars().take(100).collect::<String>());
+                    fail_lines.push(line.clone());
+                    summary.push(line);
+                    continue;
+                }
+                Ok(u) => u,
+            };
+            let safe_label: String = label
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+                .collect();
+            let cap = captures_dir.join(format!("{}.ts", safe_label));
+            let (_h_status, get_status, _head, ttfb, total, max_gap, sync_ok) =
+                tv_fetch_like_samsung(&playback_url, secs, &cap).await;
+            // 502 = 上游拉不到（镜像回传的源站错误），属源站问题
+            if get_status.contains("502") {
+                source_down += 1;
+                let body = std::fs::read_to_string(&cap).unwrap_or_default();
+                let reason: String = body.chars().take(90).collect();
+                summary.push(format!("SOURCE-DOWN [{}] {}", label, reason));
+                continue;
+            }
+            if !get_status.starts_with("HTTP/1.1 200") && !get_status.starts_with("HTTP/1.0 200") {
+                fail += 1;
+                let line = format!("FAIL(status) [{}] GET 状态: {}", label, get_status);
+                fail_lines.push(line.clone());
+                summary.push(line);
+                continue;
+            }
+            let min_bytes = 300 * 1024 * secs as usize / 8; // ≈0.3Mbps 的极低供给下限
+            if total < min_bytes {
+                fail += 1;
+                let line = format!(
+                    "FAIL(feed) [{}] {} 秒仅取到 {} 字节（<{:.0}KB/s），TTFB {:.2}s, 最大间隔 {:.2}s",
+                    label, secs, total, total as f64 / secs as f64 / 1024.0, ttfb, max_gap
+                );
+                fail_lines.push(line.clone());
+                summary.push(line);
+                continue;
+            }
+            if !sync_ok {
+                fail += 1;
+                let line = format!("FAIL(sync) [{}] TS 同步字节不规整（188 对齐 0x47）", label);
+                fail_lines.push(line.clone());
+                summary.push(line);
+                continue;
+            }
+            pass += 1;
+            summary.push(format!(
+                "PASS [{}] {}s 取到 {:.1}MB（{:.0}KB/s）TTFB {:.2}s 最大间隔 {:.2}s",
+                label, secs, total as f64 / 1048576.0, total as f64 / secs as f64 / 1024.0, ttfb, max_gap
+            ));
+        }
+        println!("\n===== 多源投屏模拟（{} 源 × {}s）=====", entries.len(), secs);
+        for line in &summary {
+            println!("{}", line);
+        }
+        println!(
+            "===== 汇总: PASS {} / SOURCE-DOWN {} / FAIL {} =====",
+            pass, source_down, fail
+        );
+        assert!(
+            fail == 0,
+            "存在投屏链路自身的问题（FAIL）:\n{}",
+            fail_lines.join("\n")
+        );
+    }
+
     /// 模拟电视取流：HEAD 探测 → GET 读取 capture_seconds 秒。
-    /// 返回 (HEAD 状态行, HEAD 头文本, 首字节耗时, 总字节, 最大读间隔, 是否同步字节规整)。
-    async fn tv_fetch_like_samsung(url: &str, capture_seconds: u64) -> (String, String, f64, usize, f64, bool) {
+    /// 返回 (HEAD 状态行, GET 状态行, HEAD 头文本, 首字节耗时, 总字节, 最大读间隔, 是否同步字节规整)。
+    async fn tv_fetch_like_samsung(
+        url: &str,
+        capture_seconds: u64,
+        capture_path: &std::path::Path,
+    ) -> (String, String, String, f64, usize, f64, bool) {
         let (host, port, path) = parse_http_url(url).expect("live.ts URL 应可解析");
         // ---- HEAD 探测（三星在 SetAVTransportURI 前的行为）----
         let mut sock = tokio::net::TcpStream::connect((host.as_str(), port))
@@ -4222,12 +4373,10 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         let mut last_read = started;
         let mut total = 0usize;
         let mut sync_ok = true;
+        let mut get_status = String::new();
         let mut body_started = false; // 首个读块含 HTTP 响应头，剥离后再做 TS 对齐检查
         let deadline = started + Duration::from_secs(capture_seconds);
-        let file_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("cast_e2e_capture.ts");
-        let mut out = std::fs::File::create(&file_path).expect("创建抓流文件失败");
+        let mut out = std::fs::File::create(capture_path).expect("创建抓流文件失败");
         loop {
             if Instant::now() >= deadline {
                 break;
@@ -4253,6 +4402,11 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                             .position(|w| w == b"\r\n\r\n")
                         {
                             Some(pos) => {
+                                get_status = String::from_utf8_lossy(&data[..pos])
+                                    .lines()
+                                    .next()
+                                    .unwrap_or_default()
+                                    .to_string();
                                 data = &data[pos + 4..];
                                 body_started = true;
                             }
@@ -4276,6 +4430,7 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         out.flush().ok();
         (
             head_status,
+            get_status,
             head_text,
             first_byte_at.map(|t| (t - started).as_secs_f64()).unwrap_or(f64::MAX),
             total,

@@ -100,7 +100,8 @@ function build(spec) {
         if (b.keyNone) lines.push('#EXT-X-KEY:METHOD=NONE');
         else if (b.key) lines.push('#EXT-X-KEY:METHOD=AES-128,URI="key.key"');
         for (let i = 0; i < b.n; i++) {
-            lines.push(`#EXTINF:${b.dur},`);
+            const d = Array.isArray(b.durs) ? b.durs[i] : b.dur;
+            lines.push(`#EXTINF:${d},`);
             lines.push(`${b.prefix}${b.id || 'seg'}${i}.ts`);
         }
     });
@@ -264,6 +265,31 @@ const CASES = [
             { discontinuity: true, keyNone: true, prefix: 'https://ads.vendor.net/spot/hls/', n: 4, dur: 5, id: 'ad' },
         ],
         expect: [1, 3],
+    },
+    {
+        // 实测 ikun 源（2026-11-05 采集）的真实广告形态：pod 里混一条偏长创意
+        // [3,3,5,3,3,0.64]，旧判据只豁免偏短残片 → 三处插入全部漏删
+        name: '长创意广告 pod（ikun 实测形态）：偏长创意 + 偏短残片，三处插入复用同组分片',
+        base: 'https://kkzycdn.com:65/20260831/maindir/2229kb/hls/index.m3u8',
+        spec: [
+            { discontinuity: false, prefix: 'https://kkzycdn.com:65/20260831/maindir/2229kb/hls/', n: 68, dur: 3 },
+            { discontinuity: true, keyNone: true, prefix: 'https://kkzycdn.com:65/20261102/adpod/10082kb/hls/', n: 6, durs: [3, 3, 5, 3, 3, 0.64], id: 'ad' },
+            { discontinuity: true, prefix: 'https://kkzycdn.com:65/20260831/maindir/2229kb/hls/', n: 561, dur: 3 },
+            { discontinuity: true, keyNone: true, prefix: 'https://kkzycdn.com:65/20261102/adpod/10082kb/hls/', n: 6, durs: [3, 3, 5, 3, 3, 0.64], id: 'ad' },
+            { discontinuity: true, prefix: 'https://kkzycdn.com:65/20260831/maindir/2229kb/hls/', n: 208, dur: 3 },
+            { discontinuity: true, keyNone: true, prefix: 'https://kkzycdn.com:65/20261102/adpod/10082kb/hls/', n: 6, durs: [3, 3, 5, 3, 3, 0.64], id: 'ad' },
+        ],
+        expect: [1, 3, 5],
+    },
+    {
+        // 守卫：长创意豁免有上限（≤2.5×众数），超限的不规整块仍然不动
+        name: '长创意超上限（10s > 2.5×3s）→ 不规整，宁漏勿误',
+        base: 'https://kkzycdn.com:65/20260831/maindir/2229kb/hls/index.m3u8',
+        spec: [
+            { discontinuity: false, prefix: 'https://kkzycdn.com:65/20260831/maindir/2229kb/hls/', n: 200, dur: 3 },
+            { discontinuity: true, keyNone: true, prefix: 'https://kkzycdn.com:65/20261102/adpod/10082kb/hls/', n: 6, durs: [3, 3, 10, 3, 3, 0.64], id: 'ad' },
+        ],
+        expect: 'none',
     },
 ];
 

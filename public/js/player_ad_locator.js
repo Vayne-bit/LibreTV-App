@@ -39,13 +39,17 @@
         });
         if (!mode) return false;
         // 众数时长占块内分片数的一半以上 → 规整
-        // 允许一个残片：末片时长明显短于众数时不算破坏规整
+        // 允许残片：广告 pod 的收尾对齐分片偏短（< 0.7×众数）、混入的创意偏长
+        // （实测 ikun 源广告 pod = [3,3,5,3,3,0.64]，那条 5s 长创意卡死了
+        // 「只豁免偏短残片」的旧判据，三处插入广告全部漏删）——两者都算离群，
+        // 但「与众数同长的分片」必须过半，离群永远不能反客为主。
         let matching = 0;
         let outliers = 0;
         segments.forEach(s => {
             const d = Math.round(s.duration * 10) / 10;
             if (Math.abs(d - mode) <= mode * UNIFORM_TOLERANCE) matching += 1;
             else if (s.duration < mode * 0.7) outliers += 1; // 偏短的残片
+            else if (s.duration > mode && s.duration <= mode * 2.5) outliers += 1; // 混入的长创意
         });
         if (matching + outliers < segments.length) return false;
         return matching >= Math.max(1, Math.ceil(segments.length / 2));

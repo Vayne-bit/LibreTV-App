@@ -1,2 +1,5 @@
 node_modules
 proxy_debug.log
+samples
+samples_fresh
+src-tauri/target

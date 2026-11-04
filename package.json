@@ -1,6 +1,6 @@
 {
   "name": "libretv",
-  "version": "1.3.8",
+  "version": "1.3.9",
   "description": "免费在线视频搜索与观看平台",
   "private": true,
   "type": "module",

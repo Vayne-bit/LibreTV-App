@@ -30,7 +30,7 @@ const ctx = vm.createContext(sb);
 
 const PRELUDE = `
 const AD_BLOCK_MAX_SECONDS=300;const AD_REMOVE_MAX_RATIO=0.3;
-const AD_HOST_PATTERNS=[];const AD_PATH_PATTERN=/xx/;
+const AD_HOST_PATTERNS=['doubleclick.net','googlesyndication','adnxs.com','pubmatic.com','rubiconproject.com','criteo.com','taboola.com','outbrain.com','moatads.com','tanx.com','mediav.com','miaozhen.com','ipinyou.com','adsame','admaster','adview.cn','allyes.com','adchina.com'];const AD_PATH_PATTERN=/(^|\\/)(ads?|adverts?|advertising|adcreative|adplayer|adframe|bannerads?|popunder|interstitial|preroll|midroll|postroll)(\\/|$)/i;
 const LEARNED_AD_HOSTS_KEY='l';const PLAYLIST_MARKER_STATS_KEY='p';
 const rawPlaylistCache=new Map();const RAW_PLAYLIST_CACHE_MAX=4;
 let lastRawPlaylist=null;let lastRemovedSegmentIds=new Set();let lastRemovedSegmentUris=[];
@@ -77,6 +77,10 @@ console.log('过滤后以 #EXTM3U 开头:', startsOk);
 console.log('过滤后保留 #EXT-X-TARGETDURATION:', hasTarget);
 console.log('过滤后头部:', JSON.stringify(headLines(filtered)));
 
-// 被删的分片是否真属于广告目录（adjump），而不是正片
-const wrong = removed.filter(u => !/adjump/i.test(u));
+// 被删分片的通用误删判据：其路径前缀也出现在保留分片里 = 正片在用同一目录
+// （早期的 /adjump/ 硬编码只适用于 fengbao14 一家，对其他源全是误报）
+const prefixOf = (u) => { try { const x = new URL(u, baseUrl); return x.host + x.pathname.replace(/[^/]*$/, ''); } catch (e) { return null; } };
+const keptPrefixes = new Set();
+filtered.split(String.fromCharCode(10)).forEach(l => { const t = l.trim(); if (t && t[0] !== '#') { const p = prefixOf(t); if (p) keptPrefixes.add(p); } });
+const wrong = removed.filter(u => { const p = prefixOf(u); return p && keptPrefixes.has(p); });
 console.log('\n被删分片中不属于广告目录的（即疑似误删正片）:', wrong.length, JSON.stringify(wrong.slice(0, 10)));

@@ -831,7 +831,7 @@ function isDiscontinuityLine(text) {
 //   keyNone —— 块内出现过 #EXT-X-KEY:METHOD=NONE（正片通常全程加密，广告块会切到明文）
 //   segments[].pathPrefix —— 分片所在的 host+目录（广告块整块来自另一个目录）
 //   segments[].start/end —— 该分片在原始清单时间轴上的位置
-function splitPlaylistBlocks(lines) {
+function splitPlaylistBlocks(lines, baseUrl) {
     const blocks = [];
     let block = { discontinuity: false, keyNone: false, lines: [], segments: [], duration: 0 };
     let pending = 0;
@@ -859,7 +859,7 @@ function splitPlaylistBlocks(lines) {
             block.segments.push({
                 uri: trimmed,
                 duration: pending,
-                pathPrefix: playlistPathPrefix(trimmed),
+                pathPrefix: playlistPathPrefix(trimmed, baseUrl),
                 start: clock,
                 end: clock + pending
             });
@@ -873,9 +873,12 @@ function splitPlaylistBlocks(lines) {
 }
 
 // 分片的路径前缀（去掉最后一级文件名）：广告块常整块来自另一个目录
-function playlistPathPrefix(uri) {
+function playlistPathPrefix(uri, baseUrl) {
     try {
-        const u = new URL(uri, 'https://placeholder.invalid/');
+        // baseUrl 必须传：相对路径分片若用占位基座解析，整份清单的前缀会
+        // 坍缩成同一个 placeholder.invalid/...，前缀隔离安全阀失效（与
+        // public/js/player_artplayer_handler.js 保持一致，详见那边注释）
+        const u = new URL(uri, baseUrl || 'https://placeholder.invalid/');
         const path = u.pathname.replace(/[^/]*$/, '');
         return u.host + path;
     } catch (e) {
@@ -901,7 +904,7 @@ function playlistHost(uri, baseUrl) {
 function filterByHostRules(m3u8Content, lines, baseUrl, applyFilter) {
     const learned = new Set(getLearnedAdHosts());
     const hostHit = uri => isAdSegmentUri(uri) || learned.has(playlistHost(uri, baseUrl));
-    const blocks = splitPlaylistBlocks(lines);
+    const blocks = splitPlaylistBlocks(lines, baseUrl);
     const hasMarkers = blocks.some(block => block.discontinuity);
     if (hasMarkers) {
         const hitBlocks = [];
@@ -1081,7 +1084,7 @@ function isAdEndTag(trimmed) {
 // 删的时候连同块前那个断点一起丢，让下一个保留块自己的断点顶上，
 // 正片前后正好剩一个断点——时间轴需要它重新对齐，少了会出现缓冲空洞。
 function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
-    const blocks = splitPlaylistBlocks(lines);
+    const blocks = splitPlaylistBlocks(lines, baseUrl);
     let totalSegments = 0;
     let totalDuration = 0;
     blocks.forEach(block => block.segments.forEach(segment => {
@@ -1161,7 +1164,10 @@ function adBlockIsUniformDuration(segments) {
     segments.forEach(s => {
         const d = Math.round(s.duration * 10) / 10;
         if (Math.abs(d - mode) <= mode * AD_LOCATOR_UNIFORM_TOLERANCE) matching += 1;
-        else if (s.duration < mode * 0.7) outliers += 1; // 偏短的残片
+        // 残片与长创意都算离群（广告 pod 常混一条更长的创意，实测 ikun 源
+        // [3,3,5,3,3,0.64] 卡死只认偏短残片的旧判据），众数分片必须过半
+        else if (s.duration < mode * 0.7) outliers += 1;
+        else if (s.duration > mode && s.duration <= mode * 2.5) outliers += 1;
     });
     if (matching + outliers < segments.length) return false;
     return matching >= Math.max(1, Math.ceil(segments.length / 2));

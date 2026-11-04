@@ -1,11 +1,19 @@
-// 广告过滤误判率实测：把 public/js/player_artplayer_handler.js 里的过滤逻辑
-// 搬到 Node 里跑，对真实清单样本逐个分析：
-//   1. 哪些块被判为广告删掉了
-//   2. 删掉的块到底像不像广告（人工判据）
-//   3. 各条规则单独的贡献与误伤
+// 广告过滤误判率实测（已废弃 —— 见下）
+//
+// 本脚本的「真值函数」looksLikeAd 是旧宽判据时代的启发式：
+//   · 片头片尾复用同一组分片的广告会被它判成「与正片共享分片 → 非广告」；
+//   · 「时长不超过最长块一半」会把固定切片源的正片短块误标成广告。
+// 用它当真值会产出失真结论（2026-11-05 曾据此误判「误伤 531」）。
+// 判定必须唯一归属真实代码 + 独立真值，请改用：
+//   · scripts/compare-old-new.mjs      —— 独立真值 + 新旧判据对比（样本目录参数同本脚本）
+//   · scripts/measure-fresh-ad-filter.mjs —— 应用内 20 源站新鲜样本实测
+//   · scripts/stress-ad-filter.mjs     —— 边界场景压力测试
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
+
+console.log('本脚本已废弃：真值启发式过时（片头片尾复用分片的广告会被误判为非广告）。\n请改用 compare-old-new.mjs（独立真值+新旧对比）/ measure-fresh-ad-filter.mjs（新鲜样本）/ stress-ad-filter.mjs（边界场景）。');
+process.exit(0);
 
 const SAMPLES = process.argv[2] || '/tmp/plsamples';
 const manifest = JSON.parse(fs.readFileSync(path.join(SAMPLES, 'manifest.json'), 'utf8'));
@@ -48,11 +56,12 @@ sandbox.globalThis = sandbox;
 const ctx = vm.createContext(sandbox);
 
 const NEEDED = [
-  'isDiscontinuityLine', 'splitPlaylistBlocks', 'playlistHost', 'isAdSegmentUri',
+  'isDiscontinuityLine', 'splitPlaylistBlocks', 'playlistHost', 'playlistPathPrefix', 'isAdSegmentUri',
   'getLearnedAdHosts', 'rememberAdHosts', 'recordAdFilterStats', 'filterByHostRules',
   'isAdStartTag', 'isAdEndTag', 'filterByStructure', 'filterAdsFromM3U8',
   'parseRawPlaylist', 'playlistPathPrefix', 'segmentIdentity', 'computeRemovedSegmentIds',
   'finishFiltering', 'getRawPlaylist', 'rememberRawPlaylist', 'playlistCacheKey',
+  'findAdBlockIndexes',
 ];
 const src = NEEDED.map(extractFunction).join('\n\n');
 const PRELUDE = `
@@ -70,13 +79,19 @@ const AD_PATH_PATTERN = /(^|\\/)(ads?|adverts?|advertising|adcreative|adplayer|a
 const LEARNED_AD_HOSTS_KEY = 'learnedAdHosts';
 const PLAYLIST_MARKER_STATS_KEY = 'playlistMarkerStats';
 `;
-vm.runInContext(PRELUDE + src + '\nglobalThis.__api = { filterAdsFromM3U8, filterByStructure, filterByHostRules, splitPlaylistBlocks, playlistHost, isAdSegmentUri, parseRawPlaylist };', ctx);
+// 注入真实 locator（filterByStructure → findAdBlockIndexes 依赖 AdBlockLocator）
+const locatorSrc = fs.readFileSync(path.join(process.cwd(), 'public/js/player_ad_locator.js'), 'utf8')
+  .replace('})(window);', '})(globalThis);');
+const locCtx = vm.createContext({ window: {}, console, URL, Date, Set, Map, Math, JSON });
+vm.runInContext(locatorSrc, locCtx);
+sandbox.AdBlockLocator = locCtx.AdBlockLocator;
+vm.runInContext(PRELUDE + src + '\nglobalThis.__api = { filterAdsFromM3U8, filterByStructure, filterByHostRules, splitPlaylistBlocks, playlistHost, isAdSegmentUri, parseRawPlaylist, findAdBlockIndexes };', ctx);
 const api = sandbox.__api;
 
 // ---------- 人工判据：这个块是不是广告 ----------
 // 依据：广告块的典型特征 —— 有独立路径前缀、KEY NONE、固定时长、且与正片分片不共享任何分片
 function analyzeBlocks(text, baseUrl) {
-  const blocks = api.splitPlaylistBlocks(text.split('\n'));
+  const blocks = api.splitPlaylistBlocks(text.split('\n'), baseUrl);
   const info = blocks.map((b, i) => {
     const hosts = [...new Set(b.segments.map(s => api.playlistHost(s.uri, baseUrl)))];
     const prefixes = [...new Set(b.segments.map(s => {
@@ -122,29 +137,13 @@ for (const item of manifest) {
   const blocks = analyzeBlocks(text, baseUrl);
   const truth = blocks.map(b => looksLikeAd(b, blocks));
 
-  // 当前结构法会删哪些块
-  const structureOnly = api.filterByStructure(text, text.split('\n'), baseUrl, false);
-  // applyFilter=false 时会记统计但不删；这里直接手动跑判定逻辑更准：
-  // 复刻 filterByStructure 的判定（disjoint || resetKey）
-  const contentHosts = new Set();
-  const dropped = [];
-  blocks.forEach((b, idx) => {
-    if (!b.segCount) return;
-    const resetKey = b.keyNone;
-    const short = b.duration > 0 && b.duration <= 300;
-    const disjoint = b.hosts.every(h => !contentHosts.has(h));
-    const isAd = b.discontinuity && short && (disjoint || resetKey);
-    if (isAd) { dropped.push(idx); return; }
-    b.hosts.forEach(h => contentHosts.add(h));
-  });
-  // 片头贴片
-  if (blocks.length > 1 && blocks[0].segCount && dropped.indexOf(0) < 0) {
-    const first = blocks[0];
-    const otherHosts = new Set();
-    blocks.slice(1).forEach(o => o.hosts.forEach(h => otherHosts.add(h)));
-    const disjoint = first.hosts.length > 0 && first.hosts.every(h => !otherHosts.has(h));
-    if (disjoint && first.duration > 0 && first.duration <= 300) dropped.push(0);
-  }
+  // 当前结构法会删哪些块：直接跑真实 filterByStructure 的判定
+  // （早期这里复刻的是旧宽判据 disjoint||resetKey，与 92d9e67 之后的
+  //   严判据代码完全脱节，产出过「误伤 531」的失真结论 —— 判定必须
+  //   唯一归属真实代码，harness 不自写第二份判据）
+  const dropped = api.findAdBlockIndexes(
+    api.splitPlaylistBlocks(text.split('\n'), baseUrl)
+  );
 
   const totalSegments = blocks.reduce((n, b) => n + b.segCount, 0);
   const totalDuration = blocks.reduce((n, b) => n + b.duration, 0);
