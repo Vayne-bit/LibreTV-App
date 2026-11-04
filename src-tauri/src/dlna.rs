@@ -1289,6 +1289,7 @@ pub struct LocalFileEntry {
 }
 
 // 本地文件引用：磁盘路径（桌面/部分 Android），或 Android SAF content:// URI
+#[derive(Clone)]
 enum LocalFileRef {
     Disk(PathBuf),
     // Android 文档选择器返回 content://，需经 tauri-plugin-fs 的 content resolver 取 fd 读取
@@ -1838,8 +1839,11 @@ async fn handle_local_file_conn(
             // content:// 经 fs 插件 content resolver 取文件描述符，包装成可 seek 的异步文件
             let fp: FilePath = uri.parse().unwrap();
             let app2 = app.clone();
+            // tauri-plugin-fs 2.7+ 的 open() 按值接收 OpenOptions；
+            // builder 的 setter 返回 &mut OpenOptions，需 clone 成拥有值再传入。
+            let opts = OpenOptions::new().read(true).clone();
             let std_file = match tauri::async_runtime::spawn_blocking(move || {
-                app2.fs().open(fp, OpenOptions::new().read(true))
+                app2.fs().open(fp, opts)
             })
             .await
             {
