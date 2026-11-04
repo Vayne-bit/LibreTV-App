@@ -1858,7 +1858,7 @@ async fn handle_local_file_conn(
                     return Ok(());
                 }
             };
-            let mut f = tokio::fs::File::from_std(std_file);
+            let f = tokio::fs::File::from_std(std_file);
             let total = f.metadata().await.map(|m| m.len()).unwrap_or(0);
             (f, total, mime)
         }
@@ -2270,8 +2270,8 @@ fn pick_variant(text: &str, base_url: &str) -> Option<String> {
 /// 清单分类（纯逻辑，供单测）：resolve_media_playlist 按结果决定继续跟变体
 /// 还是到达媒体清单。媒体清单解析错误（加密/fMP4）原样透传。
 enum PlaylistKind {
-    /// 媒体清单：分片绝对地址 + 是否 VOD（有 ENDLIST）
-    Media(Vec<String>, bool),
+    /// 媒体清单（分片列表本身由 fetch_media_playlist 另行获取，此处只做分类与合法性校验）
+    Media,
     /// master 清单：第一个变体的绝对地址
     Master(String),
     Unknown,
@@ -2280,7 +2280,8 @@ enum PlaylistKind {
 fn classify_playlist(text: &str, base_url: &str) -> Result<PlaylistKind, String> {
     // 媒体清单特征：分片时长标记或目标时长声明
     if text.contains("#EXTINF") || text.contains("#EXT-X-TARGETDURATION") {
-        return parse_media_playlist(text, base_url).map(|(s, e)| PlaylistKind::Media(s, e));
+        // 解析一次只为校验（加密/fMP4 直接报错并透传），分片列表不由此处产出
+        return parse_media_playlist(text, base_url).map(|_| PlaylistKind::Media);
     }
     if text.contains("#EXT-X-STREAM-INF") {
         return Ok(match pick_variant(text, base_url) {
@@ -2297,7 +2298,7 @@ async fn resolve_media_playlist(url: &str, upstream: &Upstream) -> Result<String
     for _ in 0..3 {
         let text = upstream_text(&current, upstream).await?;
         match classify_playlist(&text, &current)? {
-            PlaylistKind::Media(..) => return Ok(current),
+            PlaylistKind::Media => return Ok(current),
             PlaylistKind::Master(variant) => current = variant,
             PlaylistKind::Unknown => {
                 return Err(if text.contains("#EXT-X-STREAM-INF") {
@@ -2833,7 +2834,7 @@ xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>402</errorCode>\
         let media = "#EXTM3U\n#EXTINF:10,\nseg.ts\n#EXT-X-ENDLIST\n";
         assert!(matches!(
             classify_playlist(media, "https://a.b/v.m3u8"),
-            Ok(PlaylistKind::Media(_, true))
+            Ok(PlaylistKind::Media)
         ));
         let master = "#EXT-X-STREAM-INF:BANDWIDTH=1\nsub/index.m3u8\n";
         assert!(matches!(

@@ -3,6 +3,7 @@ package com.libretv.app
 import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.media.AudioManager
 import android.os.Build
@@ -12,6 +13,7 @@ import android.view.View
 import android.view.WindowManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
+import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -128,6 +130,30 @@ class MainActivity : TauriActivity() {
     findViewById<View>(android.R.id.content)?.let { ViewCompat.requestApplyInsets(it) }
   }
 
+  /**
+   * Android 13+ 需要运行时授予 POST_NOTIFICATIONS，否则常驻通知不会显示在通知栏
+   * （前台服务本身仍会运行，用户可在「前台服务任务管理器」里看到）。
+   * 仅在首次需要时申请；用户拒绝后不再反复打扰，投屏保活不受影响。
+   */
+  private fun requestNotificationPermission() {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+    val granted = ContextCompat.checkSelfPermission(
+      this,
+      android.Manifest.permission.POST_NOTIFICATIONS
+    ) == PackageManager.PERMISSION_GRANTED
+    if (granted) return
+    runOnUiThread {
+      try {
+        requestPermissions(
+          arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
+          1001
+        )
+      } catch (e: Exception) {
+        // 申请失败静默忽略：保活服务不依赖通知权限
+      }
+    }
+  }
+
   inner class PlayerBridge {
     // 进入播放页时记录原始音量与亮度，退出时还原
     private var originalVolume = -1
@@ -156,8 +182,12 @@ class MainActivity : TauriActivity() {
     @JavascriptInterface
     fun keepAwake(enabled: Boolean) {
       try {
-        val intent = Intent(this, CastKeepAliveService::class.java)
+        // 注意：PlayerBridge 是 MainActivity 的 inner class，此处的 this 指向
+        // PlayerBridge 实例本身（不是 Context），构造 Intent 必须显式用
+        // this@MainActivity，否则匹配不到 Intent(Context, Class) 构造函数。
+        val intent = Intent(this@MainActivity, CastKeepAliveService::class.java)
         if (enabled) {
+          requestNotificationPermission()
           if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent)
           } else {

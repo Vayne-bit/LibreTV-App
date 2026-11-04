@@ -39,6 +39,10 @@ if (!manifest.includes('android:resizeableActivity')) {
 // DLNA 投屏：SSDP 组播需要 CHANGE_WIFI_MULTICAST_STATE 权限（MainActivity 里 acquire MulticastLock）。
 // 投屏保活前台服务需要 FOREGROUND_SERVICE（API 28+ 必需，否则 startForegroundService 抛 SecurityException）；
 // POST_NOTIFICATIONS 仅声明（启动前台服务本身不需要该运行时权限，但声明后 Android 13+ 可正常显示通知）。
+// FOREGROUND_SERVICE_CONNECTED_DEVICE：Android 14(API 34)+ 要求 targetSdk>=34 的应用为每个前台服务
+// 声明对应的 foregroundServiceType 权限，否则 startForeground() 抛 SecurityException /
+// MissingForegroundServiceTypeException。connectedDevice 的运行时前置条件（清单中声明
+// CHANGE_WIFI_MULTICAST_STATE 等之一）本项目已满足。
 // 逐项检查后追加，避免与 Tauri 生成的 Manifest 里已有权限重复（重复会触发 Gradle 警告）。
 const permissions = {
   INTERNET: 'android.permission.INTERNET',
@@ -46,20 +50,35 @@ const permissions = {
   ACCESS_WIFI_STATE: 'android.permission.ACCESS_WIFI_STATE',
   WAKE_LOCK: 'android.permission.WAKE_LOCK',
   FOREGROUND_SERVICE: 'android.permission.FOREGROUND_SERVICE',
+  FOREGROUND_SERVICE_CONNECTED_DEVICE: 'android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE',
   POST_NOTIFICATIONS: 'android.permission.POST_NOTIFICATIONS',
 };
 const missing = Object.values(permissions).filter((name) => !manifest.includes(name));
 if (missing.length > 0) {
   const block = missing.map((name) => `    <uses-permission android:name="${name}" />`).join('\n');
+  const before = manifest;
   manifest = manifest.replace('<application', `${block}\n    <application`);
+  if (manifest === before) {
+    console.error('[android-overrides] 无法定位 <application> 标签，权限未注入。');
+    process.exit(1);
+  }
 }
 
 // 投屏保活前台服务声明（与 MainActivity.keepAwake 配套启动/停止）。
+// foregroundServiceType="connectedDevice"：投屏期间手机持续通过网络向外部电视供流，
+// 属于「与需要网络连接的外部设备交互」。Android 14+ 未声明类型会在 startForeground() 时崩溃。
 if (!manifest.includes('CastKeepAliveService')) {
+  const before = manifest;
   manifest = manifest.replace(
     '</application>',
-    '    <service android:name=".CastKeepAliveService" android:exported="false" />\n</application>'
+    '    <service\n        android:name=".CastKeepAliveService"\n        android:exported="false"\n        android:foregroundServiceType="connectedDevice" />\n</application>'
   );
+  if (manifest === before) {
+    // 静默失败会导致服务未注册：投屏保活一启动就 ActivityNotFoundException。
+    // 在 CI 阶段直接失败，比真机排查便宜得多。
+    console.error('[android-overrides] 无法定位 </application>，CastKeepAliveService 未注册。');
+    process.exit(1);
+  }
 }
 writeFileSync(manifestPath, manifest);
 console.log('[android-overrides] patched AndroidManifest.xml');

@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
@@ -35,11 +36,32 @@ class CastKeepAliveService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIF_ID, buildNotification())
+        promoteToForeground()
         acquireLocks()
         // START_NOT_STICKY：进程被系统回收后不自动重启。
         // 投屏本就随进程消亡，不需要一个孤儿服务继续挂着通知。
         return START_NOT_STICKY
+    }
+
+    /**
+     * 提升为前台服务。
+     *
+     * Android 14 (API 34) 起，targetSdk >= 34 的应用必须为每个前台服务声明
+     * foregroundServiceType，否则 startForeground() 直接抛 MissingForegroundServiceTypeException。
+     * 这里是「与外部电视通过网络交互并持续供流」，选用 connectedDevice 类型；
+     * 其运行时前置条件（清单中声明 CHANGE_WIFI_MULTICAST_STATE 等）本项目已满足。
+     *
+     * 注意：不要用 areNotificationsEnabled() 决定是否创建通知渠道——
+     * 用户拒绝 POST_NOTIFICATIONS 后渠道会创建失败，此时再 startForeground() 会抛异常
+     * 导致崩溃。渠道无条件创建，通知是否可见交给系统裁剪。
+     */
+    private fun promoteToForeground() {
+        val notification = buildNotification()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+        } else {
+            startForeground(NOTIF_ID, notification)
+        }
     }
 
     override fun onDestroy() {
@@ -104,7 +126,10 @@ class CastKeepAliveService : Service() {
     }
 
     private fun buildNotification(): Notification {
+        // getLaunchIntentForPackage 可能返回 null（例如没有 LAUNCHER 入口），
+        // 直接传给 PendingIntent.getActivity 会 NPE，这里兜底成本服务的 Activity。
         val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+            ?: Intent(this, MainActivity::class.java)
         val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         } else {
