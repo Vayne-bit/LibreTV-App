@@ -48,6 +48,14 @@ struct Upstream {
     /// video/vnd.dlna.mpeg-tts（标准 DLNA 专用 MIME）；标准安卓 DLNA 渲染端更认
     /// video/mp2t。两者 DIDL 的 DLNA flags 与响应头一致，仅 TS 的 MIME 分流。
     is_samsung: bool,
+    /// 广告过滤：前端判定好的「要删掉哪些分片 URI」。
+    ///
+    /// 为什么不在 Rust 侧重写一遍广告判据：判据本身（断点 + 无加密 KEY +
+    /// 独立路径前缀 + 时长规整 + 安全阀）在前端已有一份实现并通过真实站源实测。
+    /// Rust 再写一份就是第二套规则，两边必然漂移 —— 判错的那边会直接删掉正片。
+    /// 所以这里只做执行：前端按自己的判据算出广告分片 URI 列表传下来，
+    /// Rust 按列表剔除。判据的唯一归属仍是前端。
+    ad_uris: Vec<String>,
 }
 
 struct ProxyState {
@@ -127,10 +135,19 @@ pub async fn cast_to_device(
     referer: Option<String>,
     user_agent: Option<String>,
     cookie: Option<String>,
+    ad_uris: Option<Vec<String>>,
 ) -> Result<String, String> {
     let referer = referer.filter(|s| !s.trim().is_empty());
     let user_agent = user_agent.filter(|s| !s.trim().is_empty());
     let cookie = cookie.filter(|s| !s.trim().is_empty());
+    // 前端判定好的广告分片 URI：投屏时电视自己拉流，浏览器侧的过滤对它无效，
+    // 必须把「哪些分片是广告」带下来，代理与 TS 串流两条路径都按它剔除。
+    let ad_uris: Vec<String> = ad_uris
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     // HLS 判定：非直连容器扩展名（mp4/mkv/avi/ts/flv/webm）即按 HLS 处理，
     // 无扩展名清单地址也覆盖。三星官方支持容器不含 HLS——m3u8 无论代理还是
@@ -195,6 +212,7 @@ pub async fn cast_to_device(
                         cookie.clone(),
                         proxy_ip,
                         is_samsung,
+                        ad_uris.clone(),
                     )
                     .await?;
                     ts_entry
@@ -209,6 +227,7 @@ pub async fn cast_to_device(
                         cookie.clone(),
                         proxy_ip,
                         is_samsung,
+                        ad_uris.clone(),
                     )
                     .await?;
                     entry
@@ -1209,6 +1228,7 @@ async fn start_stream_proxy(
     cookie: Option<String>,
     preferred_ip: Option<IpAddr>,
     samsung: bool,
+    ad_uris: Vec<String>,
 ) -> Result<(String, String), String> {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
         .await
@@ -1240,6 +1260,7 @@ async fn start_stream_proxy(
         cookie,
         token: token.clone(),
         is_samsung: samsung,
+        ad_uris,
     });
     tauri::async_runtime::spawn(async move {
         loop {
@@ -2147,7 +2168,7 @@ transferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nConnection: 
             .await
             .map_err(|e| format!("读取播放列表失败: {}", e))?;
         let text = String::from_utf8_lossy(&body_bytes);
-        let rewritten = rewrite_playlist(&text, &target);
+        let rewritten = rewrite_playlist(&text, &target, &upstream.ad_uris);
         let body = rewritten.into_bytes();
         let mut head = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nCache-Control: no-store\r\n",
@@ -2280,8 +2301,9 @@ enum PlaylistKind {
 fn classify_playlist(text: &str, base_url: &str) -> Result<PlaylistKind, String> {
     // 媒体清单特征：分片时长标记或目标时长声明
     if text.contains("#EXTINF") || text.contains("#EXT-X-TARGETDURATION") {
-        // 解析一次只为校验（加密/fMP4 直接报错并透传），分片列表不由此处产出
-        return parse_media_playlist(text, base_url).map(|_| PlaylistKind::Media);
+        // 解析一次只为校验（加密/fMP4 直接报错并透传），分片列表不由此处产出。
+        // 广告剔除不在这一步做（这里只判断清单类型），实际过滤在取流时按 ad_uris 执行。
+        return parse_media_playlist(text, base_url, &[]).map(|_| PlaylistKind::Media);
     }
     if text.contains("#EXT-X-STREAM-INF") {
         return Ok(match pick_variant(text, base_url) {
@@ -2315,7 +2337,12 @@ async fn resolve_media_playlist(url: &str, upstream: &Upstream) -> Result<String
 /// 解析媒体清单（纯逻辑，供单测）：返回（分片绝对地址列表, 是否 VOD/有 ENDLIST）。
 /// 加密（AES-128/SAMPLE-AES）与 fMP4（EXT-X-MAP）无法靠拼接转 TS，直接报错
 /// 让投屏梯度落到下一个模式。
-fn parse_media_playlist(text: &str, base_url: &str) -> Result<(Vec<String>, bool), String> {
+/// ad_uris：前端判定好的广告分片 URI（已解析成绝对地址），命中的分片整块跳过。
+fn parse_media_playlist(
+    text: &str,
+    base_url: &str,
+    ad_uris: &[String],
+) -> Result<(Vec<String>, bool), String> {
     let mut segments = Vec::new();
     let mut endlist = false;
     for line in text.lines() {
@@ -2344,7 +2371,12 @@ fn parse_media_playlist(text: &str, base_url: &str) -> Result<(Vec<String>, bool
             continue; // 其余标签不影响拼接
         }
         // 非注释非空行即分片 URI（HLS 规范），解析为绝对地址
-        segments.push(resolve_url(base_url, line));
+        let resolved = resolve_url(base_url, line);
+        // 广告分片：跳过。判定在前端完成，这里只执行。
+        if is_ad_segment(line, &resolved, ad_uris) {
+            continue;
+        }
+        segments.push(resolved);
     }
     Ok((segments, endlist))
 }
@@ -2355,7 +2387,7 @@ async fn fetch_media_playlist(
     upstream: &Upstream,
 ) -> Result<(Vec<String>, bool), String> {
     let text = upstream_text(url, upstream).await?;
-    parse_media_playlist(&text, url)
+    parse_media_playlist(&text, url, &upstream.ad_uris)
 }
 
 /// 拉取单个分片并流式写给电视；写失败（电视断开）即终止整条流。
@@ -2445,8 +2477,125 @@ transferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nConnection: 
     Ok(())
 }
 
-/// 把 m3u8 里的分片/密钥/子列表地址改写成本地代理地址。
-fn rewrite_playlist(text: &str, playlist_url: &str) -> String {
+/// 这个分片是不是广告分片。
+///
+/// 两种写法都认：
+///   - 清单里的原始字面量（相对路径就写相对路径）
+///   - 解析后的绝对地址
+///
+/// 为什么要两种都认：前端把「要删的分片」传下来时，手里只有清单原文里的写法；
+/// 而不同站点的广告地址形态不一（360zy 是绝对地址，部分站是相对路径）。
+/// 只认一种就会漏删（漏删安全，但功能失效）；两种都认则两种形态都能命中。
+/// 匹配用的是字面比较，不会出现「解析差异导致误判」—— 匹配不上就是匹配不上。
+fn is_ad_segment(line: &str, resolved: &str, ad_uris: &[String]) -> bool {
+    ad_uris
+        .iter()
+        .any(|u| u == line || u == resolved)
+}
+
+/// 把 m3u8 里的分片/密钥/子列表地址改写成本地代理地址，并剔除广告块。
+///
+/// ad_uris：前端判定好的广告分片地址。
+/// 命中的块整块删掉 —— 只删其中的分片会留下半截广告；
+/// 连块内的 KEY 行和断点一起删，否则会留下孤立的加密状态（后续分片解不开）。
+///
+/// 判据不在这里：广告块的识别由前端完成（见 Upstream.ad_uris 注释），
+/// Rust 只负责按给定的地址列表执行剔除。
+fn rewrite_playlist(text: &str, playlist_url: &str, ad_uris: &[String]) -> String {
+    if ad_uris.is_empty() {
+        // 无广告：走原来的纯改写路径，不改变任何输出
+        return rewrite_playlist_plain(text, playlist_url);
+    }
+    let blocks = split_playlist_blocks(text);
+    let mut out = String::with_capacity(text.len() + 256);
+    let mut tail: Vec<&str> = Vec::new();
+    let mut emitted = 0usize;
+    for block in &blocks {
+        // 整块删的条件：块内有分片，且块内每个分片都是广告分片。
+        // 「每个」而不是「任一」：只要块里混了一个正片分片就整块保留 ——
+        // 宁可漏删广告，也不能误删正片。
+        let is_ad = !block.segments.is_empty()
+            && block.segments.iter().all(|line| {
+                let trimmed = line.trim();
+                is_ad_segment(trimmed, &resolve_url(playlist_url, trimmed), ad_uris)
+            });
+        if is_ad {
+            // 尾部广告块里带着 #EXT-X-ENDLIST，整块丢掉会连播放结束标记一起丢
+            for line in &block.lines {
+                if line.trim() == "#EXT-X-ENDLIST" {
+                    tail.push(line);
+                }
+            }
+            continue;
+        }
+        // 头一个分片之前不需要断点，写了反而是个孤立标记
+        if block.discontinuity && emitted > 0 {
+            out.push_str("#EXT-X-DISCONTINUITY\n");
+        }
+        for line in &block.lines {
+            let trimmed = line.trim();
+            let rewritten = if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                // 分片/子列表地址
+                proxy_url_for(&resolve_url(playlist_url, trimmed))
+            } else if trimmed.starts_with("#EXT-X-KEY") || trimmed.starts_with("#EXT-X-MAP") {
+                // 密钥/初始化段的 URI="..." 属性也要走代理
+                rewrite_tag_uris(line, playlist_url)
+            } else {
+                line.to_string()
+            };
+            out.push_str(&rewritten);
+            out.push('\n');
+        }
+        emitted += block.segments.len();
+    }
+    for line in tail {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// 清单分块：按断点标记切开，每块记住原始行与其中的分片行。
+struct PlaylistBlock {
+    /// 该块前面是否有断点标记
+    discontinuity: bool,
+    /// 块内的原始行（含标签与分片行，不含断点标记本身）
+    lines: Vec<String>,
+    /// 块内分片行
+    segments: Vec<String>,
+}
+
+fn split_playlist_blocks(text: &str) -> Vec<PlaylistBlock> {
+    let mut blocks: Vec<PlaylistBlock> = Vec::new();
+    let mut discontinuity = false;
+    let mut lines: Vec<String> = Vec::new();
+    let mut segments: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "#EXT-X-DISCONTINUITY" || trimmed.starts_with("#EXT-X-DISCONTINUITY:") {
+            blocks.push(PlaylistBlock {
+                discontinuity,
+                lines: std::mem::take(&mut lines),
+                segments: std::mem::take(&mut segments),
+            });
+            discontinuity = true;
+            continue;
+        }
+        lines.push(line.to_string());
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            segments.push(line.to_string());
+        }
+    }
+    blocks.push(PlaylistBlock {
+        discontinuity,
+        lines,
+        segments,
+    });
+    blocks
+}
+
+/// 把 m3u8 里的分片/密钥/子列表地址改写成本地代理地址（不做广告过滤）。
+fn rewrite_playlist_plain(text: &str, playlist_url: &str) -> String {
     let mut out = String::with_capacity(text.len() + 256);
     for line in text.lines() {
         let trimmed = line.trim();
@@ -2655,13 +2804,72 @@ mod tests {
     fn playlist_rewrite() {
         let base = "http://192.168.1.5:12345".to_string();
         if let Ok(mut guard) = PROXY.lock() {
-            *guard = Some(ProxyState { base });
+            *guard = Some(ProxyState { base, token: "test-token".to_string() });
         }
         let playlist = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:4,\nseg1.ts\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhi/index.m3u8\n";
-        let rewritten = rewrite_playlist(playlist, "https://src.example.com/vod/list.m3u8");
+        let rewritten = rewrite_playlist(playlist, "https://src.example.com/vod/list.m3u8", &[]);
         assert!(rewritten.contains("/s/")); // 分片与密钥都已改写
         assert!(rewritten.contains("#EXTINF:4,"));
         assert!(rewritten.starts_with("#EXTM3U"));
+    }
+
+    #[test]
+    fn playlist_rewrite_removes_ad_block() {
+        let base = "http://192.168.1.5:12345".to_string();
+        if let Ok(mut guard) = PROXY.lock() {
+            *guard = Some(ProxyState { base, token: "test-token".to_string() });
+        }
+        // 正片 → 广告块（KEY:NONE + 独立目录）→ 正片
+        let playlist = "#EXTM3U\n\
+                        #EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n\
+                        #EXTINF:10,\n\
+                        c1.ts\n\
+                        #EXT-X-DISCONTINUITY\n\
+                        #EXT-X-KEY:METHOD=NONE\n\
+                        #EXTINF:5,\n\
+                        ad1.ts\n\
+                        #EXTINF:5,\n\
+                        ad2.ts\n\
+                        #EXT-X-DISCONTINUITY\n\
+                        #EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n\
+                        #EXTINF:10,\n\
+                        c2.ts\n\
+                        #EXT-X-ENDLIST\n";
+        let ads = vec!["ad1.ts".to_string(), "ad2.ts".to_string()];
+        let rewritten = rewrite_playlist(playlist, "https://src.example.com/vod/list.m3u8", &ads);
+        // 分片地址会被改写成代理地址（b64），按「非标签行」统计分片个数
+        let segment_lines: Vec<&str> = rewritten
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with('#')
+            })
+            .collect();
+        assert_eq!(segment_lines.len(), 2, "只应保留 2 个正片分片: {}", rewritten);
+        assert!(!rewritten.contains("METHOD=NONE"), "广告块的明文 KEY 不应残留: {}", rewritten);
+        // 断点数应与保留块数匹配（广告块前后的断点被合并）
+        assert_eq!(rewritten.matches("#EXT-X-DISCONTINUITY").count(), 1, "{}", rewritten);
+        assert!(rewritten.contains("#EXT-X-ENDLIST"), "播放结束标记应保留");
+    }
+
+    #[test]
+    fn playlist_rewrite_keeps_ad_block_when_uri_mismatch() {
+        let base = "http://192.168.1.5:12345".to_string();
+        if let Ok(mut guard) = PROXY.lock() {
+            *guard = Some(ProxyState { base, token: "test-token".to_string() });
+        }
+        // 广告地址对不上 → 不删任何东西（宁可漏删广告，不能删掉正片）
+        let playlist = "#EXTM3U\n#EXTINF:10,\nc1.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:5,\nad1.ts\n";
+        let ads = vec!["other.ts".to_string()];
+        let rewritten = rewrite_playlist(playlist, "https://src.example.com/vod/list.m3u8", &ads);
+        let segment_lines = rewritten
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with('#')
+            })
+            .count();
+        assert_eq!(segment_lines, 2, "两个分片都应保留: {}", rewritten);
     }
 
     #[test]
@@ -2778,7 +2986,7 @@ xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>402</errorCode>\
                     https://other.cdn/seg003.ts\n\
                     #EXT-X-ENDLIST\n";
         let (segments, endlist) =
-            parse_media_playlist(text, "https://a.b/vod/index.m3u8").expect("parse ok");
+            parse_media_playlist(text, "https://a.b/vod/index.m3u8", &[]).expect("parse ok");
         assert!(endlist);
         assert_eq!(segments.len(), 3);
         assert_eq!(segments[0], "https://a.b/vod/seg001.ts"); // 目录相对
@@ -2790,7 +2998,7 @@ xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>402</errorCode>\
     fn parse_media_playlist_live_has_no_endlist() {
         let text = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nlive.ts\n";
         let (segments, endlist) =
-            parse_media_playlist(text, "http://a.b/live.m3u8").expect("parse ok");
+            parse_media_playlist(text, "http://a.b/live.m3u8", &[]).expect("parse ok");
         assert!(!endlist);
         assert_eq!(segments, vec!["http://a.b/live.ts".to_string()]);
     }
@@ -2798,15 +3006,33 @@ xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>402</errorCode>\
     #[test]
     fn parse_media_playlist_rejects_encryption() {
         let text = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:10,\nseg.ts\n";
-        let err = parse_media_playlist(text, "https://a.b/v.m3u8").unwrap_err();
+        let err = parse_media_playlist(text, "https://a.b/v.m3u8", &[]).unwrap_err();
         assert!(err.contains("AES-128"), "报错应带加密方法: {}", err);
     }
 
     #[test]
     fn parse_media_playlist_rejects_fmp4() {
         let text = "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:10,\nseg.m4s\n";
-        let err = parse_media_playlist(text, "https://a.b/v.m3u8").unwrap_err();
+        let err = parse_media_playlist(text, "https://a.b/v.m3u8", &[]).unwrap_err();
         assert!(err.contains("fMP4"), "报错应说明 fMP4: {}", err);
+    }
+
+    #[test]
+    fn parse_media_playlist_skips_ad_segments() {
+        // 广告分片由前端判定后传下来，TS 串流路径必须跳过它们
+        let text = "#EXTM3U\n\
+                    #EXT-X-TARGETDURATION:10\n\
+                    #EXTINF:10,\n\
+                    seg001.ts\n\
+                    #EXTINF:10,\n\
+                    ad001.ts\n\
+                    #EXTINF:10,\n\
+                    seg002.ts\n";
+        let ads = vec!["https://a.b/vod/ad001.ts".to_string()];
+        let (segments, _) =
+            parse_media_playlist(text, "https://a.b/vod/index.m3u8", &ads).expect("parse ok");
+        assert_eq!(segments.len(), 2, "广告分片应被剔除");
+        assert!(!segments.iter().any(|s| s.ends_with("ad001.ts")));
     }
 
     #[test]

@@ -826,19 +826,29 @@ function isDiscontinuityLine(text) {
 }
 
 // 把播放列表按断点标记切成块，每块记录自己的分片、时长、以及前面有没有断点
+//
+// 块上额外带三个字段，是给「广告块结构判据」用的：
+//   keyNone —— 块内出现过 #EXT-X-KEY:METHOD=NONE（正片通常全程加密，广告块会切到明文）
+//   segments[].pathPrefix —— 分片所在的 host+目录（广告块整块来自另一个目录）
+//   segments[].start/end —— 该分片在原始清单时间轴上的位置
 function splitPlaylistBlocks(lines) {
     const blocks = [];
-    let block = { discontinuity: false, lines: [], segments: [], duration: 0 };
+    let block = { discontinuity: false, keyNone: false, lines: [], segments: [], duration: 0 };
     let pending = 0;
+    let clock = 0;
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
         const trimmed = line.trim();
         if (isDiscontinuityLine(trimmed)) {
             blocks.push(block);
-            block = { discontinuity: true, lines: [], segments: [], duration: 0 };
+            block = { discontinuity: true, keyNone: false, lines: [], segments: [], duration: 0 };
             continue;
         }
         block.lines.push(line);
+        if (trimmed.indexOf('#EXT-X-KEY') === 0) {
+            if (trimmed.indexOf('METHOD=NONE') >= 0) block.keyNone = true;
+            continue;
+        }
         if (trimmed.indexOf('#EXTINF') === 0) {
             const value = parseFloat(trimmed.slice(8));
             pending = isNaN(value) ? 0 : value;
@@ -846,13 +856,31 @@ function splitPlaylistBlocks(lines) {
         }
         // 非 # 开头的非空行就是分片地址
         if (trimmed && trimmed.charAt(0) !== '#') {
-            block.segments.push({ uri: trimmed, duration: pending });
+            block.segments.push({
+                uri: trimmed,
+                duration: pending,
+                pathPrefix: playlistPathPrefix(trimmed),
+                start: clock,
+                end: clock + pending
+            });
             block.duration += pending;
+            clock += pending;
             pending = 0;
         }
     }
     blocks.push(block);
     return blocks;
+}
+
+// 分片的路径前缀（去掉最后一级文件名）：广告块常整块来自另一个目录
+function playlistPathPrefix(uri) {
+    try {
+        const u = new URL(uri, 'https://placeholder.invalid/');
+        const path = u.pathname.replace(/[^/]*$/, '');
+        return u.host + path;
+    } catch (e) {
+        return '';
+    }
 }
 
 function playlistHost(uri, baseUrl) {
@@ -1040,7 +1068,16 @@ function isAdEndTag(trimmed) {
     return trimmed.indexOf('#EXT-X-DATERANGE') === 0 && trimmed.indexOf('SCTE35-IN=') >= 0;
 }
 
-// 结构法：断点夹住、分片全在别的域名上、且整块很短的，判定为广告块，整块删掉。
+// 结构法：认「整块就是广告」的插播块。
+//
+// 判据要点：断点夹住 + 块内无加密 KEY + 整块同一路径前缀 + 块内时长规整，
+// 再加三道安全阀（时长 ≤300s、分片数 ≤40、该前缀时长占比 ≤30%）。
+//
+// 为什么不用更宽松的「域名不在正片域名集合里」：
+// 那个判据在真实站源上精确率只有 1.8%（40 个清单误伤 760 块）——
+// 正片域名集合只在非广告块上累积，首块之后「异域名」几乎恒真，整片正片被连锁误删。
+// 宁可漏删广告，也不能删掉正片。
+//
 // 删的时候连同块前那个断点一起丢，让下一个保留块自己的断点顶上，
 // 正片前后正好剩一个断点——时间轴需要它重新对齐，少了会出现缓冲空洞。
 function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
@@ -1051,38 +1088,7 @@ function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
         totalSegments += 1;
         totalDuration += segment.duration;
     }));
-    // 判广告不看「哪个域名分片多」——广告块比正片块长时那个判据会反过来。
-    // 改成「这块用的域名，前面的正片一个都没用过」：广告和正片永远不在同一个域名上。
-    const contentHosts = new Set();
-    const dropped = [];
-    blocks.forEach((block, index) => {
-        if (!block.segments.length) return;
-        const hosts = block.segments.map(segment => playlistHost(segment.uri, baseUrl));
-        const resetKey = block.lines.some(line => line.trim().indexOf('#EXT-X-KEY:METHOD=NONE') === 0);
-        const short = block.duration > 0 && block.duration <= AD_BLOCK_MAX_SECONDS;
-        const disjoint = hosts.every(host => !contentHosts.has(host));
-        // 没有前置断点就不是插播块：这一条保证「没有断点标记的播放列表一律不动」
-        const isAd = block.discontinuity && short && (disjoint || resetKey);
-        if (isAd) {
-            dropped.push(index);
-            return;
-        }
-        hosts.forEach(host => contentHosts.add(host));
-    });
-    // 片头贴片广告：第一块没有前置断点，上面的规则碰不到它。
-    // 两遍扫描：等正片域名收集完，若第一块全部分片都在正片没用过的域名上且很短，判为片头广告。
-    if (blocks.length > 1 && blocks[0].segments.length && dropped.indexOf(0) < 0) {
-        const first = blocks[0];
-        const firstHosts = first.segments.map(segment => playlistHost(segment.uri, baseUrl)).filter(Boolean);
-        const otherHosts = new Set();
-        blocks.slice(1).forEach(block => block.segments.forEach(segment => {
-            const host = playlistHost(segment.uri, baseUrl);
-            if (host) otherHosts.add(host);
-        }));
-        const disjoint = firstHosts.length > 0 && firstHosts.every(host => !otherHosts.has(host));
-        const short = first.duration > 0 && first.duration <= AD_BLOCK_MAX_SECONDS;
-        if (disjoint && short) dropped.push(0);
-    }
+    const dropped = findAdBlockIndexes(blocks);
     if (!dropped.length) {
         recordAdFilterStats(m3u8Content, 0, false, 'none', 0);
         return m3u8Content;
@@ -1124,6 +1130,128 @@ function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
     rememberAdHosts(adUris, keptUris, baseUrl);
     recordAdFilterStats(m3u8Content, removedSegments, false, 'structure', dropped.length);
     return kept.join('\n');
+}
+
+// ============ 广告块结构判据（单文件版，与 public/js/player_ad_locator.js 同一套规则）============
+// 判据实现放在 player_ad_locator.js，供 Tauri 版（public/）与人工标记共用；
+// 单文件版（js/player.js）没有那个模块，这里内联一份等价实现，
+// 改动时两处要同步 —— 规则不一致会导致两端过滤行为不同。
+const AD_LOCATOR_MAX_SEGMENTS = 40;
+// 分片时长规整度：块内所有分片时长都相同 → 强特征；差异在 15% 内 → 弱特征
+const AD_LOCATOR_UNIFORM_TOLERANCE = 0.15;
+
+// 块内分片时长是否规整
+// 广告块末尾常有一段「残片」（时长明显偏短，用来对齐回正片时间轴），
+// 所以不能要求所有分片时长都一样 —— 用众数（最常见的时长）来判断。
+function adBlockIsUniformDuration(segments) {
+    if (!segments.length) return false;
+    const counts = new Map();
+    segments.forEach(s => {
+        const key = Math.round(s.duration * 10) / 10;
+        counts.set(key, (counts.get(key) || 0) + 1);
+    });
+    let mode = 0;
+    let modeCount = 0;
+    counts.forEach((n, d) => {
+        if (n > modeCount) { modeCount = n; mode = d; }
+    });
+    if (!mode) return false;
+    let matching = 0;
+    let outliers = 0;
+    segments.forEach(s => {
+        const d = Math.round(s.duration * 10) / 10;
+        if (Math.abs(d - mode) <= mode * AD_LOCATOR_UNIFORM_TOLERANCE) matching += 1;
+        else if (s.duration < mode * 0.7) outliers += 1; // 偏短的残片
+    });
+    if (matching + outliers < segments.length) return false;
+    return matching >= Math.max(1, Math.ceil(segments.length / 2));
+}
+
+// 块内分片是否全部来自同一路径前缀
+function adBlockSinglePrefix(segments) {
+    const set = new Set(segments.map(s => s.pathPrefix));
+    return set.size === 1 ? set.values().next().value : '';
+}
+
+// 找出所有「疑似广告块」：结构特征齐备且路径前缀没在正片出现过
+function findAdBlockCandidates(playlist) {
+    if (!playlist || !playlist.blocks) return [];
+    const candidates = [];
+    playlist.blocks.forEach((block, index) => {
+        if (!block.segments.length) return;
+        // 特征 1：必须有断点标记（没有断点的一律不动，这是安全底线）
+        if (!block.discontinuity) return;
+        // 特征 2：无加密 KEY —— 正片通常全程加密，广告块会切到 METHOD=NONE
+        if (!block.keyNone) return;
+        // 特征 3：块内分片来自同一路径前缀
+        const prefix = adBlockSinglePrefix(block.segments);
+        if (!prefix) return;
+        // 特征 4：时长规整（广告分片常是固定 5s/10s，正片时长不规则）
+        if (!adBlockIsUniformDuration(block.segments)) return;
+        // 安全阀：时长与分片数
+        if (block.duration <= 0 || block.duration > AD_BLOCK_MAX_SECONDS) return;
+        if (block.segments.length > AD_LOCATOR_MAX_SEGMENTS) return;
+        // 安全阀：这个前缀占全片时长不能超过 30%（正片主体目录一定远超这个比例）
+        let prefixDuration = 0;
+        let totalDuration = 0;
+        playlist.blocks.forEach(b => {
+            b.segments.forEach(s => {
+                totalDuration += s.duration;
+                if (s.pathPrefix === prefix) prefixDuration += s.duration;
+            });
+        });
+        if (totalDuration > 0 && prefixDuration / totalDuration > 0.3) return;
+        // 安全阀：同一前缀可以出现在多个块里（广告常在片头片尾各插一次），
+        // 但这些块必须是同一组分片的复用 —— 分片集合完全相同。
+        const samePrefixBlocks = playlist.blocks.filter(b =>
+            b.segments.length && b.segments.every(s => s.pathPrefix === prefix));
+        if (samePrefixBlocks.length > 1) {
+            const sig = s => s.segments.map(x => x.uri).sort().join('|');
+            const first = sig(samePrefixBlocks[0]);
+            if (!samePrefixBlocks.every(b => sig(b) === first)) return;
+        }
+        candidates.push({ blockIndex: index, prefix: prefix, duration: block.duration });
+    });
+    return candidates;
+}
+
+// 用上面的严判据找出广告块，返回块下标。
+//
+// 片头贴片（第 0 块，前面没有断点标记）要单独处理：
+// 判据里「必须有断点」是给正片兜底的安全线，对贴片不适用，所以这里放宽这一条，
+// 但仍要求 KEY:NONE + 单一前缀 + 时长规整 + 全部安全阀，
+// 并额外要求它的路径前缀不被其它任何块使用（贴片广告独占一个目录）。
+// 缺了最后这条，普通播放列表的第一块（正好短、时长规整、独占前缀）会被误删。
+function findAdBlockIndexes(blocks) {
+    const playlist = {
+        // 第 0 块标记成「带断点」，让贴片也能进候选；其余块的标记原样保留
+        blocks: blocks.map((block, index) => index === 0
+            ? Object.assign({}, block, { discontinuity: true })
+            : block),
+        segments: blocks.reduce((acc, block) => acc.concat(block.segments), [])
+    };
+    let candidates = [];
+    try {
+        candidates = findAdBlockCandidates(playlist) || [];
+    } catch (e) {
+        return [];
+    }
+    const indexes = [];
+    const headPrefix = blocks[0] && blocks[0].segments.length
+        ? blocks[0].segments[0].pathPrefix
+        : '';
+    const headExclusive = !!headPrefix && blocks.slice(1).every(block =>
+        block.segments.every(segment => segment.pathPrefix !== headPrefix));
+    candidates.forEach(candidate => {
+        const index = candidate.blockIndex;
+        // 贴片：独占目录才认，否则放过
+        if (index === 0) {
+            if (headExclusive) indexes.push(index);
+            return;
+        }
+        indexes.push(index);
+    });
+    return indexes;
 }
 
 // 总入口。先走主机特征法（与结构无关，能抓同域名广告和已学习域名），

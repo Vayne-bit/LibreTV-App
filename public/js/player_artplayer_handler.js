@@ -1026,19 +1026,30 @@ function isDiscontinuityLine(text) {
 }
 
 // 把播放列表按断点标记切成块，每块记录自己的分片、时长、以及前面有没有断点
+//
+// 块上额外带三个字段，是给「广告块结构判据」用的：
+//   keyNone —— 块内出现过 #EXT-X-KEY:METHOD=NONE（正片通常全程加密，广告块会切到明文）
+//   segments[].pathPrefix —— 分片所在的 host+目录（广告块整块来自另一个目录）
+//   segments[].start/end —— 该分片在原始清单时间轴上的位置
+// 判据本身在 player_ad_locator.js（与「长按一次自动识别广告边界」共用一份实现）。
 function splitPlaylistBlocks(lines) {
     const blocks = [];
-    let block = { discontinuity: false, lines: [], segments: [], duration: 0 };
+    let block = { discontinuity: false, keyNone: false, lines: [], segments: [], duration: 0 };
     let pending = 0;
+    let clock = 0;
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
         const trimmed = line.trim();
         if (isDiscontinuityLine(trimmed)) {
             blocks.push(block);
-            block = { discontinuity: true, lines: [], segments: [], duration: 0 };
+            block = { discontinuity: true, keyNone: false, lines: [], segments: [], duration: 0 };
             continue;
         }
         block.lines.push(line);
+        if (trimmed.indexOf('#EXT-X-KEY') === 0) {
+            if (trimmed.indexOf('METHOD=NONE') >= 0) block.keyNone = true;
+            continue;
+        }
         if (trimmed.indexOf('#EXTINF') === 0) {
             const value = parseFloat(trimmed.slice(8));
             pending = isNaN(value) ? 0 : value;
@@ -1046,8 +1057,15 @@ function splitPlaylistBlocks(lines) {
         }
         // 非 # 开头的非空行就是分片地址
         if (trimmed && trimmed.charAt(0) !== '#') {
-            block.segments.push({ uri: trimmed, duration: pending });
+            block.segments.push({
+                uri: trimmed,
+                duration: pending,
+                pathPrefix: playlistPathPrefix(trimmed),
+                start: clock,
+                end: clock + pending
+            });
             block.duration += pending;
+            clock += pending;
             pending = 0;
         }
     }
@@ -1240,9 +1258,17 @@ function isAdEndTag(trimmed) {
     return trimmed.indexOf('#EXT-X-DATERANGE') === 0 && trimmed.indexOf('SCTE35-IN=') >= 0;
 }
 
-// 结构法：断点夹住、分片全在别的域名上、且整块很短的，判定为广告块，整块删掉。
-// 删的时候连同块前那个断点一起丢，让下一个保留块自己的断点顶上，
-// 正片前后正好剩一个断点——时间轴需要它重新对齐，少了会出现缓冲空洞。
+// 结构法：认「整块就是广告」的插播块。
+//
+// 判据只有一份实现，放在 player_ad_locator.js（与「长按一次自动识别广告边界」共用），
+// 这里只负责把它接进过滤流程、以及在删除后重建播放列表。
+// 判据要点：断点夹住 + 块内无加密 KEY + 整块同一路径前缀 + 块内时长规整，
+// 再加三道安全阀（时长 ≤300s、分片数 ≤40、该前缀时长占比 ≤30%）。
+//
+// 为什么不用更宽松的「域名不在正片域名集合里」：
+// 那个判据在真实站源上精确率只有 1.8%（40 个清单误伤 760 块）——
+// 正片域名集合只在非广告块上累积，首块之后「异域名」几乎恒真，整片正片被连锁误删。
+// 宁可漏删广告，也不能删掉正片。
 function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
     const blocks = splitPlaylistBlocks(lines);
     let totalSegments = 0;
@@ -1251,38 +1277,7 @@ function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
         totalSegments += 1;
         totalDuration += segment.duration;
     }));
-    // 判广告不看「哪个域名分片多」——广告块比正片块长时那个判据会反过来。
-    // 改成「这块用的域名，前面的正片一个都没用过」：广告和正片永远不在同一个域名上。
-    const contentHosts = new Set();
-    const dropped = [];
-    blocks.forEach((block, index) => {
-        if (!block.segments.length) return;
-        const hosts = block.segments.map(segment => playlistHost(segment.uri, baseUrl));
-        const resetKey = block.lines.some(line => line.trim().indexOf('#EXT-X-KEY:METHOD=NONE') === 0);
-        const short = block.duration > 0 && block.duration <= AD_BLOCK_MAX_SECONDS;
-        const disjoint = hosts.every(host => !contentHosts.has(host));
-        // 没有前置断点就不是插播块：这一条保证「没有断点标记的播放列表一律不动」
-        const isAd = block.discontinuity && short && (disjoint || resetKey);
-        if (isAd) {
-            dropped.push(index);
-            return;
-        }
-        hosts.forEach(host => contentHosts.add(host));
-    });
-    // 片头贴片广告：第一块没有前置断点，上面的规则碰不到它。
-    // 两遍扫描：等正片域名收集完，若第一块全部分片都在正片没用过的域名上且很短，判为片头广告。
-    if (blocks.length > 1 && blocks[0].segments.length && dropped.indexOf(0) < 0) {
-        const first = blocks[0];
-        const firstHosts = first.segments.map(segment => playlistHost(segment.uri, baseUrl)).filter(Boolean);
-        const otherHosts = new Set();
-        blocks.slice(1).forEach(block => block.segments.forEach(segment => {
-            const host = playlistHost(segment.uri, baseUrl);
-            if (host) otherHosts.add(host);
-        }));
-        const disjoint = firstHosts.length > 0 && firstHosts.every(host => !otherHosts.has(host));
-        const short = first.duration > 0 && first.duration <= AD_BLOCK_MAX_SECONDS;
-        if (disjoint && short) dropped.push(0);
-    }
+    const dropped = findAdBlockIndexes(blocks);
     if (!dropped.length) {
         recordAdFilterStats(m3u8Content, 0, false, 'none', 0);
         return m3u8Content;
@@ -1326,6 +1321,47 @@ function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
     return kept.join('\n');
 }
 
+// 用 locator 的严判据找出广告块，返回块下标。
+//
+// 片头贴片（第 0 块，前面没有断点标记）要单独处理：
+// 判据里「必须有断点」是给正片兜底的安全线，对贴片不适用，所以这里放宽这一条，
+// 但仍要求 KEY:NONE + 单一前缀 + 时长规整 + 全部安全阀，
+// 并额外要求它的路径前缀不被其它任何块使用（贴片广告独占一个目录）。
+// 缺了最后这条，普通播放列表的第一块（正好短、时长规整、独占前缀）会被误删。
+function findAdBlockIndexes(blocks) {
+    const locator = (typeof AdBlockLocator !== 'undefined') ? AdBlockLocator : (window.AdBlockLocator || null);
+    if (!locator || typeof locator.findAdBlockCandidates !== 'function') return [];
+    const playlist = {
+        // 第 0 块标记成「带断点」，让贴片也能进候选；其余块的标记原样保留
+        blocks: blocks.map((block, index) => index === 0
+            ? Object.assign({}, block, { discontinuity: true })
+            : block),
+        segments: blocks.reduce((acc, block) => acc.concat(block.segments), [])
+    };
+    let candidates = [];
+    try {
+        candidates = locator.findAdBlockCandidates(playlist) || [];
+    } catch (e) {
+        return [];
+    }
+    const indexes = [];
+    const headPrefix = blocks[0] && blocks[0].segments.length
+        ? blocks[0].segments[0].pathPrefix
+        : '';
+    const headExclusive = !!headPrefix && blocks.slice(1).every(block =>
+        block.segments.every(segment => segment.pathPrefix !== headPrefix));
+    candidates.forEach(candidate => {
+        const index = candidate.blockIndex;
+        // 贴片：独占目录才认，否则放过
+        if (index === 0) {
+            if (headExclusive) indexes.push(index);
+            return;
+        }
+        indexes.push(index);
+    });
+    return indexes;
+}
+
 // 记录本次过滤实际删掉的分片。
 // 用途：把「原始清单时间轴」换算成「播放时间轴」——
 // 删掉广告后后面的分片会前移，播放器看到的时间与原始清单差一个偏移量。
@@ -1335,6 +1371,10 @@ function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
 // 广告分片常在片头片尾复用同一批文件名（实测：IdHH1Wg6.ts 等 4 个文件各出现两次），
 // 只看 URI 会把片尾的广告误判成「已删除」，导致时间轴偏移算错。
 let lastRemovedSegmentIds = new Set();
+
+// 本次过滤删掉的分片地址（原始 URI 字面量）。投屏时要把这份名单传给代理侧，
+// 由它在电视看到的清单里剔除对应分片。
+let lastRemovedSegmentUris = [];
 
 // 给一个分片分配「URI + 出现序号」的唯一标识
 function segmentIdentity(uri, occurrence) {
@@ -1346,6 +1386,22 @@ function getRemovedSegmentIds() {
     return lastRemovedSegmentIds;
 }
 
+// 对外：本次过滤实际删掉的分片地址列表（投屏用）。
+//
+// 投屏时代电视自己去拉流，浏览器侧的过滤对它完全无效 —— 广告会原样播到电视上。
+// 所以要把「哪些分片是广告」带过去，由代理侧按这份名单剔除。
+//
+// 返回清单里的原始 URI 字面量（与清单里写的完全一致，不做地址解析）：
+// 代理侧会同时按「原始字面量」和「解析后的绝对地址」两种形态匹配，
+// 两种形态都认才能覆盖「绝对地址」与「相对路径」两类站源。
+//
+// 名单在过滤收尾时一并记下（computeRemovedSegmentIds），
+// 不在取用时回头翻缓存 —— 缓存只留最近 4 份清单，
+// 投屏时可能已经被别的清单挤掉，名单空了等于过滤没生效。
+function getRemovedSegmentUris() {
+    return lastRemovedSegmentUris;
+}
+
 // 对比「过滤后的清单」与「原始清单」，算出被删掉的分片标识。
 //
 // 为什么用比对而不是在过滤分支里登记：过滤有四条路径（主机特征法断点分支 /
@@ -1355,9 +1411,13 @@ function getRemovedSegmentIds() {
 //
 // 匹配用贪心：原始清单的分片按顺序依次在结果里找，找到就配对，找不到就判定被删。
 // 广告是整块删除的，顺序不会被打乱，贪心匹配不会配错。
+//
+// 同时记下被删分片的 URI（供投屏用）：这里是唯一能同时拿到「原始清单」与
+// 「过滤结果」的时刻，事后再去翻缓存可能已经被别的清单覆盖。
 function computeRemovedSegmentIds(originalPlaylist, filteredText) {
     const removed = new Set();
-    if (!originalPlaylist || !originalPlaylist.segments.length) return removed;
+    const removedUris = [];
+    if (!originalPlaylist || !originalPlaylist.segments.length) return { removed, removedUris };
     // 结果清单里剩下的分片 URI 序列（按顺序）
     const keptUris = [];
     filteredText.split('\n').forEach(line => {
@@ -1371,8 +1431,9 @@ function computeRemovedSegmentIds(originalPlaylist, filteredText) {
             return;
         }
         removed.add(seg.id);
+        removedUris.push(seg.uri);
     });
-    return removed;
+    return { removed, removedUris };
 }
 
 // 过滤收尾：算出这次删掉了哪些分片，供播放时间轴换算使用。
@@ -1380,7 +1441,9 @@ function computeRemovedSegmentIds(originalPlaylist, filteredText) {
 function finishFiltering(filteredText, baseUrl) {
     const original = getRawPlaylist(baseUrl);
     if (original) {
-        lastRemovedSegmentIds = computeRemovedSegmentIds(original, filteredText);
+        const result = computeRemovedSegmentIds(original, filteredText);
+        lastRemovedSegmentIds = result.removed;
+        lastRemovedSegmentUris = result.removedUris;
     }
     return filteredText;
 }

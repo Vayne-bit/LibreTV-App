@@ -386,12 +386,22 @@
             tauriInvoke('cast_to_airplay', { baseUrl: device.control_url, videoUrl: url })
                 .then(onOk).catch(onErr);
         } else {
+            // 广告过滤：投屏时电视自己拉流，浏览器侧的过滤对电视无效。
+            // 把本次判定出的广告分片地址传过去，由代理侧按名单剔除。
+            let adUris = [];
+            try {
+                if (typeof getRemovedSegmentUris === 'function') {
+                    const list = getRemovedSegmentUris();
+                    if (Array.isArray(list)) adUris = list;
+                }
+            } catch (e) { adUris = []; }
             tauriInvoke('cast_to_device', {
                 controlUrl: device.control_url,
                 url: url,
                 title: (typeof currentVideoTitle === 'string' && currentVideoTitle) ? currentVideoTitle : 'LibreTV',
                 position: (art.video && art.video.currentTime) || 0,
-                referer: referer || null
+                referer: referer || null,
+                adUris: adUris
             }).then(onOk).catch(onErr);
         }
     }
