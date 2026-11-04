@@ -262,6 +262,22 @@ pub async fn cast_to_device(
             let playback_url = match *mode {
                 "proxy-ts" => {
                     stop_stream_proxy();
+                    let upstream_arc = std::sync::Arc::new(Upstream {
+                        referer: referer.clone(),
+                        user_agent: user_agent.clone(),
+                        cookie: cookie.clone(),
+                        token: String::new(),
+                        is_samsung,
+                        ad_uris: ad_uris.clone(),
+                    });
+                    // 预热：趁 Set/Play 指令往返的间隙把清单与前几个分片拉进内存，
+                    // 电视随后 GET live.ts 时立刻有数据可读（否则首字节要等
+                    // 清单+首分片串行下载完，移动网络下动辄数秒）
+                    let warm_target = url.clone();
+                    let warm_upstream = upstream_arc.clone();
+                    tauri::async_runtime::spawn(async move {
+                        warm_ts_stream(warm_target, warm_upstream).await
+                    });
                     let (_, ts_entry) = start_stream_proxy(
                         url.clone(),
                         generate_session_token(),
@@ -308,7 +324,9 @@ pub async fn cast_to_device(
             tokio::time::sleep(Duration::from_millis(300)).await;
             match dlna_set_av_transport(&control_url, &playback_url, title.as_deref(), *proto, is_samsung).await {
                 Ok(()) => {
-                    dlna_play(&control_url).await?;
+                    // Play 失败不再整体失败：部分电视收到 SetURI 就自动起播，
+                    // 真实起播与否以下面的传输状态轮询为准
+                    let _ = dlna_play(&control_url).await;
                     // 从当前进度续投；TS 串流是直播形态不支持 REL_TIME 续播；
                     // 部分电视不支持 REL_TIME Seek，失败不影响投屏本身
                     if let Some(pos) = position {
@@ -316,15 +334,39 @@ pub async fn cast_to_device(
                             let _ = dlna_seek(&control_url, pos).await;
                         }
                     }
-                    set_last_cast_info(format!(
-                        "成功 · {}（proto {}）· 下发 {}",
-                        mode_desc,
-                        proto_desc,
-                        parse_http_url(&playback_url)
-                            .map(|(h, p, _)| format!("{}:{}", h, p))
-                            .unwrap_or_else(|| "—".to_string())
-                    ));
-                    return Ok(playback_url);
+                    // 起播验证：轮询电视传输状态，把「电视真的播出来了吗」变成事实。
+                    // 拒收 → 记入 attempts 并自动落到下一个投屏梯度；
+                    // 缓冲中 → 不算失败（慢源/慢电视，用户侧表现是稍等起播）。
+                    let verdict = verify_playback_started(&control_url).await;
+                    let addr_desc = parse_http_url(&playback_url)
+                        .map(|(h, p, _)| format!("{}:{}", h, p))
+                        .unwrap_or_else(|| "—".to_string());
+                    match verdict {
+                        PlayVerdict::Playing => {
+                            set_last_cast_info(format!(
+                                "成功 · {}（proto {}）· 下发 {} · 电视已起播",
+                                mode_desc, proto_desc, addr_desc
+                            ));
+                            return Ok(playback_url);
+                        }
+                        PlayVerdict::Buffering => {
+                            set_last_cast_info(format!(
+                                "已下发 · {}（proto {}）· 下发 {} · 电视缓冲中（若长时间转圈请用「投屏诊断」）",
+                                mode_desc, proto_desc, addr_desc
+                            ));
+                            return Ok(playback_url);
+                        }
+                        PlayVerdict::Error(desc) => {
+                            if mode.starts_with("proxy") && proxy_connection_count() > 0 {
+                                proxy_reached_by_tv = true;
+                            }
+                            attempts.push(format!(
+                                "[{}/{}] 电视已收到指令但拒收内容：{}（下发地址: {}）",
+                                mode_desc, proto_desc, desc, addr_desc
+                            ));
+                            continue;
+                        }
+                    }
                 }
                 Err(e) => {
                     if mode.starts_with("proxy") && proxy_connection_count() > 0 {
@@ -478,7 +520,7 @@ pub async fn dlna_diagnostics(
                 .timeout(Duration::from_secs(6))
                 .header("User-Agent", DEFAULT_UPSTREAM_UA)
                 .header("Range", "bytes=0-1023");
-            if let Some(ref_value) = referer.filter(|s| !s.trim().is_empty()) {
+            if let Some(ref_value) = referer.clone().filter(|s| !s.trim().is_empty()) {
                 req = req.header("Referer", ref_value);
             }
             match req.send().await {
@@ -498,6 +540,121 @@ pub async fn dlna_diagnostics(
                         _ => "源站返回异常状态，可能是源站临时故障或限流",
                     };
                     report.push_str(&format!("  判读: {}\n", hint));
+
+                    // 分片级拉流测试：清单能拉 ≠ 分片能拉。TS 串流要逐片下载，
+                    // 分片层被防盗链/限流/加密时清单测试照样全绿，电视端却黑屏转圈。
+                    // 这里跟进到媒体清单、实测首个分片的可达性与速度，把这一环补上。
+                    let is_playlist = ctype.to_ascii_lowercase().contains("mpegurl")
+                        || url.to_ascii_lowercase().contains(".m3u8");
+                    if is_playlist && (200..300).contains(&status) {
+                        report.push_str("  分片级测试:\n");
+                        let upstream = Upstream {
+                            referer: referer.clone().filter(|s| !s.trim().is_empty()),
+                            user_agent: None,
+                            cookie: None,
+                            token: String::new(),
+                            is_samsung: false,
+                            ad_uris: Vec::new(),
+                        };
+                        match tokio::time::timeout(
+                            Duration::from_secs(10),
+                            resolve_media_playlist(&url, &upstream),
+                        )
+                        .await
+                        {
+                            Err(_) => report.push_str("    - 媒体清单解析: 超时\n"),
+                            Ok(Err(e)) => {
+                                // 加密 / fMP4 / 非 HLS 会在这一步暴露——这正是
+                                // TS 串流梯度无法处理、投屏必然失败的源类型
+                                report.push_str(&format!("    - 媒体清单解析: 失败 —— {}（该源类型 TS 串流暂不支持，投屏会自动尝试其他梯度）\n", e));
+                            }
+                            Ok(Ok(media_url)) => {
+                                match tokio::time::timeout(
+                                    Duration::from_secs(10),
+                                    fetch_media_playlist(&media_url, &upstream),
+                                )
+                                .await
+                                {
+                                    Err(_) => report.push_str("    - 分片清单读取: 超时\n"),
+                                    Ok(Err(e)) => report.push_str(&format!(
+                                        "    - 分片清单读取: 失败 —— {}\n",
+                                        e
+                                    )),
+                                    Ok(Ok((segments, endlist))) => {
+                                        if segments.is_empty() {
+                                            report.push_str("    - 分片清单为空（无可用分片）\n");
+                                        } else {
+                                            report.push_str(&format!(
+                                                "    - 媒体清单 OK: {} 个分片（{}）\n",
+                                                segments.len(),
+                                                if endlist { "VOD" } else { "直播流" }
+                                            ));
+                                            // 首个分片 Range 试探（64KB）：只测可达性与速度，
+                                            // 不整片下载（整片在慢网络下会拖住诊断）
+                                            let probe_started = Instant::now();
+                                            let probe_req = upstream_get(&segments[0], &upstream)
+                                                .header(reqwest::header::RANGE, "bytes=0-65535");
+                                            match tokio::time::timeout(
+                                                Duration::from_secs(10),
+                                                probe_req.send(),
+                                            )
+                                            .await
+                                            {
+                                                Err(_) => report
+                                                    .push_str("    - 首分片试拉: 超时（10 秒无响应）\n"),
+                                                Ok(Err(e)) => report.push_str(&format!(
+                                                    "    - 首分片试拉: 失败 —— {}\n",
+                                                    e
+                                                )),
+                                                Ok(Ok(resp)) => {
+                                                    let pstatus = resp.status().as_u16();
+                                                    let mut got = 0usize;
+                                                    let mut body = resp;
+                                                    while got < 65536 {
+                                                        match tokio::time::timeout(
+                                                            Duration::from_secs(10),
+                                                            body.chunk(),
+                                                        )
+                                                        .await
+                                                        {
+                                                            Ok(Ok(Some(c))) => got += c.len(),
+                                                            _ => break,
+                                                        }
+                                                    }
+                                                    let secs =
+                                                        probe_started.elapsed().as_secs_f64();
+                                                    report.push_str(&format!(
+                                                        "    - 首分片试拉: HTTP {}，取回 {} 字节 / {:.1}s（{:.0} KB/s）\n",
+                                                        pstatus,
+                                                        got,
+                                                        secs,
+                                                        got as f64 / 1024.0 / secs.max(0.001)
+                                                    ));
+                                                    let phint = match pstatus {
+                                                        200 | 206 => {
+                                                            if secs < 2.0 {
+                                                                "分片可达且快，供给层正常"
+                                                            } else {
+                                                                "分片可达但偏慢——若供给速率低于播放速度，电视端会缓冲转圈"
+                                                            }
+                                                        }
+                                                        403 | 401 => {
+                                                            "分片被源站拒绝（分片级防盗链）——投屏必须走本地代理，黑屏转圈多半源于此"
+                                                        }
+                                                        404 | 410 => {
+                                                            "分片已失效——播放会跳过坏片，多片连续失效则中断"
+                                                        }
+                                                        _ => "分片层异常状态，可能是源站限流",
+                                                    };
+                                                    report.push_str(&format!("    - 判读: {}\n", phint));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(e) => report.push_str(&format!("  结果: 本机拉流失败 —— {}（DNS/网络/证书问题，电视同样拉不到）\n", e)),
             }
@@ -526,6 +683,13 @@ pub async fn dlna_diagnostics(
             skipped
         ));
     }
+    // TS 预热缓存状态：>0 表示投屏发起时已把前几个分片拉进内存（电视连接即可取流）；
+    // 0 表示没有启用预热（本次未走 TS 串流）或已被消费/未命中
+    let primed = prime_cache_size();
+    report.push_str(&format!(
+        "  TS 预热缓存: {} 个分片待消费（0 = 本次非 TS 串流或已被电视取走）\n",
+        primed
+    ));
     // 连接数正常、设备指令也应答，却黑屏——故障就在代理内部这一段
     let last_err = proxy_last_error();
     if last_err.is_empty() {
@@ -1222,6 +1386,75 @@ async fn dlna_play(control_url: &str) -> Result<(), String> {
     let body = "<u:Play xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">\
 <InstanceID>0</InstanceID><Speed>1</Speed></u:Play>";
     dlna_soap_call(control_url, "Play", body).await
+}
+
+/// 起播验证轮询的次数上限（每次间隔 1 秒）。
+/// 电视从 TRANSITIONING 到 PLAYING 通常 1~3 秒；慢网络下缓冲期可能更长，
+/// 超出后按「缓冲中」处理（不算失败），避免误杀正在慢起的投屏。
+const PLAY_VERIFY_POLLS: u32 = 12;
+
+/// 起播验证结论。
+#[derive(Debug, PartialEq)]
+enum PlayVerdict {
+    /// 电视已进入 PLAYING
+    Playing,
+    /// 电视仍在 TRANSITIONING（缓冲中），未报错——不算失败
+    Buffering,
+    /// 电视明确拒收（ERROR_OCCURRED / 长停在不播放态）
+    Error(String),
+}
+
+/// 下发 Set/Play 之后的真实起播验证：轮询只读的 GetTransportInfo。
+///
+/// 为什么要做：以前 Set+Play 返回 200 就报「投屏成功」，但电视能否真正
+/// 解码起播无人知晓——用户看到的就是黑屏转圈，而 App 界面写着成功，
+/// 诊断里没有任何一环能解释。轮询传输状态把「电视起播了没」变成可判定、
+/// 可降级、可诊断的事实：拒收就自动落到下一个投屏梯度。
+async fn verify_playback_started(control_url: &str) -> PlayVerdict {
+    verify_playback_started_with(control_url, PLAY_VERIFY_POLLS).await
+}
+
+async fn verify_playback_started_with(control_url: &str, polls: u32) -> PlayVerdict {
+    let mut not_ready = 0usize;
+    let mut poll_err_streak = 0u32;
+    for _ in 0..polls {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        match dlna_get_transport_info(control_url).await {
+            Ok((state, status)) => {
+                poll_err_streak = 0;
+                if status.eq_ignore_ascii_case("ERROR_OCCURRED") {
+                    return PlayVerdict::Error(
+                        "电视上报传输错误（ERROR_OCCURRED）——内容不被电视支持".to_string(),
+                    );
+                }
+                match state.to_ascii_uppercase().as_str() {
+                    "PLAYING" => return PlayVerdict::Playing,
+                    "STOPPED" | "NO_MEDIA_PRESENT" => {
+                        not_ready += 1;
+                        // Play 已下发却连续两轮停在不播放态 = 拒收
+                        // （单轮可能是切换瞬态，不急着判死）
+                        if not_ready >= 2 {
+                            return PlayVerdict::Error(format!(
+                                "电视停留在 {}，未开始播放",
+                                state
+                            ));
+                        }
+                    }
+                    _ => { /* TRANSITIONING / PAUSED_PLAYBACK 等：继续等 */ }
+                }
+            }
+            Err(_) => {
+                poll_err_streak += 1;
+                if poll_err_streak >= 3 {
+                    // 连续查询失败：设备多半不支持 GetTransportInfo（少数低端渲染端），
+                    // 不再拖时间，按缓冲中处理（与旧版「下发即成功」行为一致）
+                    return PlayVerdict::Buffering;
+                }
+                // 单次查询失败不断言：部分电视 HTTP 栈不稳
+            }
+        }
+    }
+    PlayVerdict::Buffering
 }
 
 async fn dlna_stop(control_url: &str) -> Result<(), String> {
@@ -2562,6 +2795,77 @@ async fn fetch_segment_bytes(url: &str, upstream: &Upstream) -> Result<Vec<u8>, 
     Ok(buf)
 }
 
+// ---------- TS 预热与预取 ----------
+//
+// 电视端「黑色转圈」的两大供给类成因，都在这里消除：
+// 1. 首包等待：电视 GET 到达后才开始解析清单 + 拉首片，移动网络下首字节
+//    可能迟至数秒，电视的起播耐心有限。预热让投屏发起（Set/Play 指令往返
+//    期间）就把清单和前几个分片拉进内存，电视一连上立刻有数据。
+// 2. 供给速率：旧实现逐片「拉完一片再拉下一片」，串行单连接。CDN 对单连接
+//    限速/丢包抖动时供给会掉到实时以下，电视缓冲耗尽就转圈。手机浏览器里
+//    hls.js 是多请求并行预取的，所以同一源 App 内能播、串行代理却转圈。
+//    预取窗口（并行拉取、按序写出）把有效供给拉回多连接水平。
+
+/// 预热分片数。前 1~2 片足以让电视起播时零等待。
+const TS_PRIME_SEGMENTS: usize = 2;
+
+/// 预取窗口深度：同时在上游挂着的分片请求数。写出仍严格按清单顺序。
+const TS_PREFETCH_DEPTH: usize = 3;
+
+/// 预热缓存：分片 URL → 已拉取的字节。投屏发起时填充，serve_live_ts 消费
+/// （取出即删）。下一次投屏会整体清空，不会跨会话积累。
+static TS_PRIME: Lazy<Mutex<HashMap<String, Vec<u8>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn pop_prime_segment(seg: &str) -> Option<Vec<u8>> {
+    TS_PRIME.lock().ok().and_then(|mut cache| cache.remove(seg))
+}
+
+fn prime_cache_size() -> usize {
+    TS_PRIME.lock().map(|cache| cache.len()).unwrap_or(0)
+}
+
+/// 投屏发起时的预热：解析清单并预取前几个分片进缓存。
+/// 任何失败都静默——serve_live_ts 会走正常路径重新拉取，预热只是加速。
+async fn warm_ts_stream(target: String, upstream: Arc<Upstream>) {
+    if let Ok(mut cache) = TS_PRIME.lock() {
+        cache.clear(); // 只保留本次投屏的预热数据，防止跨投屏积累内存
+    }
+    let prepared = async {
+        let media_url = resolve_media_playlist(&target, &upstream).await?;
+        let (pending, _endlist) = fetch_media_playlist(&media_url, &upstream).await?;
+        Ok::<Vec<String>, String>(pending)
+    }
+    .await;
+    let pending = match prepared {
+        Ok(list) => list,
+        Err(_) => return,
+    };
+    for seg in pending.iter().take(TS_PRIME_SEGMENTS) {
+        if let Ok(data) = fetch_segment_bytes(seg, &upstream).await {
+            if let Ok(mut cache) = TS_PRIME.lock() {
+                cache.insert(seg.clone(), data);
+            }
+        }
+    }
+}
+
+/// 分片拉取（供预取任务调用）：先吃预热缓存，未命中再带上限重试地拉上游。
+async fn fetch_segment_cached(seg: String, upstream: Arc<Upstream>) -> Result<Vec<u8>, String> {
+    if let Some(data) = pop_prime_segment(&seg) {
+        return Ok(data);
+    }
+    let mut fetched = fetch_segment_bytes(&seg, &upstream).await;
+    for _ in 0..SEGMENT_FETCH_RETRIES {
+        if fetched.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        fetched = fetch_segment_bytes(&seg, &upstream).await;
+    }
+    fetched
+}
+
 /// live.ts 端点：HLS → 连续 MPEG-TS 字节流。
 /// 响应头在清单探测成功之后才发——探测失败时电视拿到明确的 502，
 /// 投屏梯度的报错才有意义。直播清单（无 ENDLIST）轮询追加分片直到电视断开。
@@ -2583,7 +2887,7 @@ async fn serve_live_ts(
         Ok((media_url, pending, endlist))
     }
     .await;
-    let (media_url, mut pending, mut endlist) = match prepared {
+    let (media_url, pending, mut endlist) = match prepared {
         Ok(value) => value,
         Err(e) => {
             record_proxy_error(format!("TS 串流准备失败: {}", e));
@@ -2618,63 +2922,84 @@ transferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nConnection: 
 
     let mut served: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut consecutive_failures = 0usize;
+    // 预取管线：上游并行挂 TS_PREFETCH_DEPTH 个分片请求，写出严格按清单顺序。
+    // 单连接串行时，任一分片的下载慢都会直接饿死电视缓冲（转圈）；
+    // 并行预取把有效供给拉回多连接水平（与浏览器里 hls.js 的行为一致）。
+    let mut pending: std::collections::VecDeque<String> = pending.into_iter().collect();
+    let mut inflight: std::collections::VecDeque<
+        (String, tokio::task::JoinHandle<Result<Vec<u8>, String>>),
+    > = std::collections::VecDeque::new();
     loop {
-        for seg in std::mem::take(&mut pending) {
+        // 填满预取窗口
+        while inflight.len() < TS_PREFETCH_DEPTH {
+            let Some(seg) = pending.pop_front() else {
+                break;
+            };
             if !served.insert(seg.clone()) {
                 continue; // 直播轮询时跳过已服务的分片
             }
-            // 拉取（含一次重试）。这里失败还没写过字节，重试安全。
-            let mut fetched = fetch_segment_bytes(&seg, &upstream).await;
-            for _ in 0..SEGMENT_FETCH_RETRIES {
-                if fetched.is_ok() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                fetched = fetch_segment_bytes(&seg, &upstream).await;
-            }
-            let data = match fetched {
-                Ok(data) => {
-                    consecutive_failures = 0;
-                    data
-                }
-                Err(e) => {
-                    consecutive_failures += 1;
-                    SKIPPED_SEGMENT_COUNT.fetch_add(1, Ordering::Relaxed);
-                    if consecutive_failures >= MAX_CONSECUTIVE_SEGMENT_FAILURES {
-                        // 只有「放弃整条流」才算故障，才写进诊断的错误字段。
-                        // 单片跳过不写：流还在正常往前走，写进去会让用户看到
-                        // 「最近一次代理错误」有内容而误以为投屏失败了。
-                        record_proxy_error(format!(
-                            "TS 连续 {} 个分片失败，已放弃本条流（最后一片: {} — {}）",
-                            consecutive_failures, seg, e
-                        ));
-                        return Err(format!(
-                            "连续 {} 个分片失败，放弃本条流（最后一片: {}）",
-                            consecutive_failures, seg
-                        ));
-                    }
-                    // 单片坏不中断整条流：跳过继续喂下一片。
-                    // 断流会让电视重连并从头开始，那才是「投一会儿就中断」的来源。
-                    continue;
-                }
-            };
-            // 写失败只可能是电视主动断开（切集/退出投屏），是正常结束，
-            // 不能当成故障去重连或降级。
-            if stream.write_all(&data).await.is_err() || stream.flush().await.is_err() {
-                return Ok(());
-            }
+            let upstream_task = upstream.clone();
+            inflight.push_back((
+                seg.clone(),
+                tokio::spawn(async move { fetch_segment_cached(seg, upstream_task).await }),
+            ));
         }
-        if endlist {
-            break; // VOD：整部播完
-        }
-        // 直播清单：隔 2 秒重取，把新分片继续喂给电视
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        match fetch_media_playlist(&media_url, &upstream).await {
-            Ok((next, e)) => {
-                pending = next;
-                endlist = e;
+        let Some((seg, handle)) = inflight.pop_front() else {
+            // 本批分片已全部喂完
+            if endlist {
+                break; // VOD：整部播完
             }
-            Err(_) => continue, // 单次刷新失败不打断整条流
+            // 直播清单：隔 2 秒重取，把新分片继续喂给电视
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            match fetch_media_playlist(&media_url, &upstream).await {
+                Ok((next, e)) => {
+                    pending.extend(next);
+                    endlist = e;
+                }
+                Err(_) => continue, // 单次刷新失败不打断整条流
+            }
+            continue;
+        };
+        let data = match handle.await {
+            Ok(Ok(data)) => {
+                consecutive_failures = 0;
+                data
+            }
+            Ok(Err(e)) => {
+                consecutive_failures += 1;
+                SKIPPED_SEGMENT_COUNT.fetch_add(1, Ordering::Relaxed);
+                if consecutive_failures >= MAX_CONSECUTIVE_SEGMENT_FAILURES {
+                    // 只有「放弃整条流」才算故障，才写进诊断的错误字段。
+                    // 单片跳过不写：流还在正常往前走，写进去会让用户看到
+                    // 「最近一次代理错误」有内容而误以为投屏失败了。
+                    record_proxy_error(format!(
+                        "TS 连续 {} 个分片失败，已放弃本条流（最后一片: {} — {}）",
+                        consecutive_failures, seg, e
+                    ));
+                    return Err(format!(
+                        "连续 {} 个分片失败，放弃本条流（最后一片: {}）",
+                        consecutive_failures, seg
+                    ));
+                }
+                // 单片坏不中断整条流：跳过继续喂下一片。
+                // 断流会让电视重连并从头开始，那才是「投一会儿就中断」的来源。
+                continue;
+            }
+            Err(_) => {
+                // 预取任务自身异常（理论上不该发生），按坏分片处理
+                consecutive_failures += 1;
+                SKIPPED_SEGMENT_COUNT.fetch_add(1, Ordering::Relaxed);
+                if consecutive_failures >= MAX_CONSECUTIVE_SEGMENT_FAILURES {
+                    record_proxy_error(format!("TS 预取任务异常，已放弃本条流（分片: {}）", seg));
+                    return Err(format!("预取任务异常，放弃本条流（分片: {}）", seg));
+                }
+                continue;
+            }
+        };
+        // 写失败只可能是电视主动断开（切集/退出投屏），是正常结束，
+        // 不能当成故障去重连或降级。
+        if stream.write_all(&data).await.is_err() || stream.flush().await.is_err() {
+            return Ok(());
         }
     }
     Ok(())
@@ -3477,5 +3802,485 @@ xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>402</errorCode>\
         let wrong2 = |a: Ipv4Addr, b: Ipv4Addr| (!(u32::from(a) ^ u32::from(b))).leading_zeros();
         assert_ne!(wrong1(dev, wlan), same_prefix_bits(dev, wlan));
         assert_ne!(wrong2(dev, wlan), same_prefix_bits(dev, wlan));
+    }
+}
+
+// ---------- 投屏端到端实证（默认 ignore：依赖真实网络，CI 不跑；本机验证用） ----------
+//
+// 运行方式：
+//   cargo test --lib cast_e2e -- --ignored --nocapture
+//
+// 覆盖的正是真机上「网络视频投屏」的完整链路（不含真实电视硬件）：
+//   假三星 DMR(9197) ←SOAP← cast_to_device → 本机代理 → 模拟电视 HEAD/GET 取流
+// 抓下来的 TS 落盘到 target/cast_e2e_capture.ts，可用 ffprobe/ffmpeg 事后校验
+// 可解码性与 PTS 连续性（电视端黑屏转圈的最常见成因就在这两点）。
+//
+// 本模块的假渲染器同时服务于普通单测（起播验证/预取顺序，绑定临时端口，
+// 不依赖真实网络，随 CI 跑）——见 verify_playback_* / prefetch_* 测试。
+#[cfg(test)]
+mod cast_e2e {
+    use super::*;
+    use std::io::Write as IoWrite;
+
+    const E2E_DEFAULT_URL: &str = "https://vip.dytt-hot.com/20250213/72013_e835617a/index.m3u8";
+
+    fn e2e_url() -> String {
+        std::env::var("CAST_E2E_URL").unwrap_or_else(|_| E2E_DEFAULT_URL.to_string())
+    }
+
+    fn xml_unescape(value: &str) -> String {
+        value
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&")
+    }
+
+    /// 假渲染器的传输状态脚本：GetTransportInfo 按此应答。
+    /// 用于验证起播轮询对「起播/拒收/永远缓冲」三种真实电视行为的判定。
+    #[derive(Clone, Copy, PartialEq)]
+    enum FakeTvBehavior {
+        /// Play 之后进入 PLAYING（正常起播的电视）
+        PlaysAfterSet,
+        /// 停在 STOPPED 并报 ERROR_OCCURRED（拒收内容的电视）
+        ErrorsOut,
+        /// 永远 TRANSITIONING（一直在缓冲的电视）
+        StuckTransitioning,
+    }
+
+    struct FakeRenderer {
+        /// SetAVTransportURI 收到的 CurrentURI（XML 反转义后）
+        current_uri: Arc<Mutex<Option<String>>>,
+        /// SetAVTransportURI 收到的完整 body（供校验 DIDL/protocolInfo）
+        set_body: Arc<Mutex<String>>,
+    }
+
+    /// 起一个最小 DLNA DMR 模拟器。port 传 9197 即命中三星画像判定（is_samsung_renderer），
+    /// 单测传 0（系统分配临时端口，多个测试并行互不冲突）。
+    async fn spawn_fake_renderer(port: u16, behavior: FakeTvBehavior) -> (String, FakeRenderer) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("绑定模拟渲染器端口失败");
+        let actual_port = listener.local_addr().unwrap().port();
+        let current_uri = Arc::new(Mutex::new(None::<String>));
+        let set_body = Arc::new(Mutex::new(String::new()));
+        let play_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let uri_slot = current_uri.clone();
+        let body_slot = set_body.clone();
+        let play_slot = play_called.clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let uri_slot = uri_slot.clone();
+                let body_slot = body_slot.clone();
+                let play_slot = play_slot.clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut buf = vec![0u8; 256 * 1024];
+                    let mut received = 0usize;
+                    // 读到请求头结束
+                    let head_end = loop {
+                        if let Some(pos) = buf[..received]
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                        {
+                            break pos;
+                        }
+                        if received >= buf.len() {
+                            return;
+                        }
+                        let n = sock.read(&mut buf[received..]).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        received += n;
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                    // 按 Content-Length 读满 body
+                    let content_length = head
+                        .to_ascii_lowercase()
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let body_start = head_end + 4;
+                    while received < body_start + content_length {
+                        let n = sock
+                            .read(&mut buf[received..])
+                            .await
+                            .unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        received += n;
+                    }
+                    let body = String::from_utf8_lossy(&buf[body_start..received]).to_string();
+                    let soap_action = head
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("soapaction:"))
+                        .unwrap_or_default()
+                        .split('#')
+                        .nth(1)
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_string();
+                    if soap_action == "SetAVTransportURI" {
+                        if let Some(start) = body.find("<CurrentURI>") {
+                            let rest = &body[start + "<CurrentURI>".len()..];
+                            if let Some(end) = rest.find("</CurrentURI>") {
+                                *uri_slot.lock().unwrap() =
+                                    Some(xml_unescape(rest[..end].trim()));
+                            }
+                        }
+                        *body_slot.lock().unwrap() = body.clone();
+                    }
+                    // 响应体：控制类指令回通用应答；GetTransportInfo 按脚本回传输状态
+                    let resp_body = if soap_action == "GetTransportInfo" {
+                        play_slot.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let (state, status) = match behavior {
+                            FakeTvBehavior::PlaysAfterSet => {
+                                ("PLAYING", "OK")
+                            }
+                            FakeTvBehavior::ErrorsOut => ("STOPPED", "ERROR_OCCURRED"),
+                            FakeTvBehavior::StuckTransitioning => ("TRANSITIONING", "OK"),
+                        };
+                        format!(
+                            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
+s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
+<s:Body><u:GetTransportInfoResponse \
+xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">\
+<CurrentTransportState>{}</CurrentTransportState>\
+<CurrentTransportStatus>{}</CurrentTransportStatus>\
+<CurrentSpeed>1</CurrentSpeed>\
+</u:GetTransportInfoResponse></s:Body></s:Envelope>",
+                            state, status
+                        )
+                    } else {
+                        let action = if soap_action.is_empty() {
+                            "Unknown"
+                        } else {
+                            &soap_action
+                        };
+                        if soap_action == "Play" {
+                            play_slot.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        format!(
+                            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
+s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
+<s:Body><u:{action}Response xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">\
+</u:{action}Response></s:Body></s:Envelope>",
+                            action = action
+                        )
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/xml; charset=\"utf-8\"\r\n\
+Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (
+            format!("http://127.0.0.1:{}/dev/ctl", actual_port),
+            FakeRenderer {
+                current_uri,
+                set_body,
+            },
+        )
+    }
+
+    // ---- 起播验证（普通单测，CI 可跑）----
+
+    #[tokio::test]
+    async fn verify_playback_detects_playing() {
+        let (control_url, _renderer) =
+            spawn_fake_renderer(0, FakeTvBehavior::PlaysAfterSet).await;
+        let verdict = verify_playback_started_with(&control_url, 3).await;
+        assert_eq!(verdict, PlayVerdict::Playing);
+    }
+
+    #[tokio::test]
+    async fn verify_playback_detects_error() {
+        let (control_url, _renderer) = spawn_fake_renderer(0, FakeTvBehavior::ErrorsOut).await;
+        let verdict = verify_playback_started_with(&control_url, 5).await;
+        assert!(
+            matches!(verdict, PlayVerdict::Error(_)),
+            "拒收型电视应判 Error: {:?}",
+            verdict
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_playback_times_out_to_buffering() {
+        let (control_url, _renderer) =
+            spawn_fake_renderer(0, FakeTvBehavior::StuckTransitioning).await;
+        let verdict = verify_playback_started_with(&control_url, 3).await;
+        assert_eq!(verdict, PlayVerdict::Buffering);
+    }
+
+    // ---- 预取管线（普通单测，CI 可跑）----
+
+    /// 预取必须按清单顺序写出，哪怕后发分片先到（上游延迟故意倒挂）。
+    #[tokio::test]
+    async fn prefetch_writes_segments_in_order() {
+        let up = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = up.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    // 清单请求先行；片号越大延迟越短：后发先至，考验写出顺序
+                    let (body, delay_ms): (&[u8], u64) = if path.contains("index.m3u8") {
+                        (
+                            b"#EXTM3U\n#EXTINF:1,\nseg1.ts\n#EXTINF:1,\nseg2.ts\n\
+                              #EXTINF:1,\nseg3.ts\n#EXTINF:1,\nseg4.ts\n#EXT-X-ENDLIST\n",
+                            0,
+                        )
+                    } else if path.contains("seg1") {
+                        (&b"MARK-ONE"[..], 300)
+                    } else if path.contains("seg2") {
+                        (&b"MARK-TWO"[..], 200)
+                    } else if path.contains("seg3") {
+                        (&b"MARK-THREE"[..], 100)
+                    } else {
+                        (&b"MARK-FOUR"[..], 0)
+                    };
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+
+        let tv = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tv_addr = tv.local_addr().unwrap();
+        let target = format!("http://{}/index.m3u8", up_addr);
+        let upstream = Arc::new(Upstream {
+            referer: None,
+            user_agent: None,
+            cookie: None,
+            token: "t".to_string(),
+            is_samsung: false,
+            ad_uris: Vec::new(),
+        });
+        let server = tokio::spawn(async move {
+            let (sock, _) = tv.accept().await.unwrap();
+            serve_live_ts(sock, target, upstream).await
+        });
+
+        let mut client = tokio::net::TcpStream::connect(tv_addr).await.unwrap();
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        server.await.unwrap().unwrap();
+        let text = String::from_utf8_lossy(&out).to_string();
+        // 写出顺序必须严格等于清单顺序
+        let one = text.find("MARK-ONE").expect("应包含 seg1");
+        let two = text.find("MARK-TWO").expect("应包含 seg2");
+        let three = text.find("MARK-THREE").expect("应包含 seg3");
+        let four = text.find("MARK-FOUR").expect("应包含 seg4");
+        assert!(one < two && two < three && three < four, "写出顺序应与清单一致");
+    }
+
+    /// 预热缓存命中时不打上游（上游不可达也能取到预热分片）。
+    #[tokio::test]
+    async fn prime_cache_feeds_without_upstream() {
+        let seg_url = "http://127.0.0.1:1/never-listening/seg.ts".to_string();
+        let data = b"PRIMED-BYTES".to_vec();
+        TS_PRIME.lock().unwrap().clear();
+        TS_PRIME.lock().unwrap().insert(seg_url.clone(), data.clone());
+        let upstream = Arc::new(Upstream {
+            referer: None,
+            user_agent: None,
+            cookie: None,
+            token: "t".to_string(),
+            is_samsung: false,
+            ad_uris: Vec::new(),
+        });
+        let got = fetch_segment_cached(seg_url.clone(), upstream).await.unwrap();
+        assert_eq!(got, data, "应直接命中预热缓存");
+        assert!(pop_prime_segment(&seg_url).is_none(), "取出即删，不重复消费");
+    }
+
+    // ---- 真实网络端到端（#[ignore]，本机验证用）----
+
+    /// 完整链路实证：cast_to_device（真实代码）→ 假三星接受 → 模拟电视取流 20 秒。
+    /// 断言：投屏成功走 TS 串流、HEAD 合规、字节流持续且同步字节规整。
+    #[tokio::test]
+    #[ignore]
+    async fn e2e_real_source_full_chain() {
+        let (control_url, renderer) = spawn_fake_renderer(9197, FakeTvBehavior::PlaysAfterSet).await;
+        let result = cast_to_device(
+            control_url.clone(),
+            e2e_url(),
+            Some("E2E 测试".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "cast_to_device 应成功: {:?}", result.err());
+        let playback_url = result.unwrap();
+        println!("[E2E] 下发给电视的地址: {}", playback_url);
+        assert!(playback_url.contains("/live.ts?u="), "HLS 源应走 TS 串流梯度");
+        let cast_info = last_cast_info();
+        println!("[E2E] 投屏状态: {}", cast_info);
+        assert!(cast_info.contains("电视已起播"), "假渲染器应回报起播: {}", cast_info);
+
+        let set_body = renderer.set_body.lock().unwrap().clone();
+        assert!(
+            set_body.contains("video/vnd.dlna.mpeg-tts"),
+            "三星画像 DIDL 应声明 DLNA 专用 TS MIME"
+        );
+        let delivered = renderer
+            .current_uri
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("模拟渲染端应收到 CurrentURI");
+        assert_eq!(delivered, playback_url, "电视收到的地址应与下发一致");
+
+        let (head_status, head_text, ttfb, total, max_gap, sync_ok) =
+            tv_fetch_like_samsung(&playback_url, 20).await;
+        println!("[E2E] HEAD: {}", head_status);
+        println!("[E2E] HEAD 头:\n{}", head_text);
+        println!(
+            "[E2E] 取流: 首字节 {:.2}s, 共 {} 字节, 平均 {:.0} KB/s, 最大读间隔 {:.2}s, 同步字节规整: {}",
+            ttfb,
+            total,
+            total as f64 / 20.0 / 1024.0,
+            max_gap,
+            sync_ok
+        );
+        assert!(head_status.starts_with("HTTP/1.1 200"), "HEAD 探测应 200");
+        assert!(
+            head_text.to_ascii_lowercase().contains("contentfeatures.dlna.org"),
+            "HEAD 响应应带 contentFeatures 头"
+        );
+        assert!(ttfb < 5.0, "预热后首字节应明显快于旧实现（<5s），实测 {:.2}s", ttfb);
+        assert!(total > 2 * 1024 * 1024, "20 秒应至少拉到 2MB（约 2 倍实时供给），实测 {} 字节", total);
+        assert!(max_gap < 10.0, "不应出现 10 秒级断供（电视会饿死转圈），实测 {:.2}s", max_gap);
+        assert!(sync_ok, "TS 同步字节（188 字节对齐 0x47）应规整——乱流电视直接拒播");
+    }
+
+    /// 模拟电视取流：HEAD 探测 → GET 读取 capture_seconds 秒。
+    /// 返回 (HEAD 状态行, HEAD 头文本, 首字节耗时, 总字节, 最大读间隔, 是否同步字节规整)。
+    async fn tv_fetch_like_samsung(url: &str, capture_seconds: u64) -> (String, String, f64, usize, f64, bool) {
+        let (host, port, path) = parse_http_url(url).expect("live.ts URL 应可解析");
+        // ---- HEAD 探测（三星在 SetAVTransportURI 前的行为）----
+        let mut sock = tokio::net::TcpStream::connect((host.as_str(), port))
+            .await
+            .expect("电视连接代理失败");
+        let head_req = format!("HEAD {} HTTP/1.1\r\nHost: {}\r\ngetcontentFeatures.dlna.org: 1\r\nConnection: close\r\n\r\n", path, host_header(&host, port));
+        sock.write_all(head_req.as_bytes()).await.unwrap();
+        let mut head_resp = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = sock.read(&mut chunk).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            head_resp.extend_from_slice(&chunk[..n]);
+        }
+        let head_text = String::from_utf8_lossy(&head_resp).to_string();
+        let head_status = head_text.lines().next().unwrap_or_default().to_string();
+
+        // ---- GET 取流（带 Range，模拟三星实际取流行为）----
+        let mut sock = tokio::net::TcpStream::connect((host.as_str(), port))
+            .await
+            .expect("电视连接代理失败");
+        let get_req = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nRange: bytes=0-\r\ngetcontentFeatures.dlna.org: 1\r\nConnection: close\r\n\r\n",
+            path,
+            host_header(&host, port)
+        );
+        sock.write_all(get_req.as_bytes()).await.unwrap();
+
+        let started = Instant::now();
+        let mut first_byte_at: Option<Instant> = None;
+        let mut max_gap = 0f64;
+        let mut last_read = started;
+        let mut total = 0usize;
+        let mut sync_ok = true;
+        let mut body_started = false; // 首个读块含 HTTP 响应头，剥离后再做 TS 对齐检查
+        let deadline = started + Duration::from_secs(capture_seconds);
+        let file_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("cast_e2e_capture.ts");
+        let mut out = std::fs::File::create(&file_path).expect("创建抓流文件失败");
+        loop {
+            if Instant::now() >= deadline {
+                break;
+            }
+            match tokio::time::timeout(Duration::from_secs(15), sock.read(&mut chunk)).await {
+                Err(_) => {
+                    max_gap = max_gap.max(last_read.elapsed().as_secs_f64());
+                    break; // 15 秒没有任何数据 = 流停摆
+                }
+                Ok(Ok(0)) => break, // 服务端关流
+                Ok(Ok(n)) => {
+                    let now = Instant::now();
+                    if first_byte_at.is_none() {
+                        first_byte_at = Some(now);
+                    } else {
+                        max_gap = max_gap.max((now - last_read).as_secs_f64());
+                    }
+                    last_read = now;
+                    let mut data = &chunk[..n];
+                    if !body_started {
+                        match data
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                        {
+                            Some(pos) => {
+                                data = &data[pos + 4..];
+                                body_started = true;
+                            }
+                            None => data = &[], // 头还没读完
+                        }
+                    }
+                    // MPEG-TS 同步字节：188 字节包，0x47 起始
+                    for (i, b) in data.iter().enumerate() {
+                        let offset = (total + i) % 188;
+                        if offset == 0 && *b != 0x47 {
+                            sync_ok = false;
+                            break;
+                        }
+                    }
+                    out.write_all(data).unwrap();
+                    total += data.len();
+                }
+                Ok(Err(e)) => panic!("读流出错: {}", e),
+            }
+        }
+        out.flush().ok();
+        (
+            head_status,
+            head_text,
+            first_byte_at.map(|t| (t - started).as_secs_f64()).unwrap_or(f64::MAX),
+            total,
+            max_gap,
+            sync_ok,
+        )
     }
 }
