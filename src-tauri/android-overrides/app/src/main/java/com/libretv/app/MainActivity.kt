@@ -1,6 +1,7 @@
 package com.libretv.app
 
 import android.annotation.SuppressLint
+import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.graphics.Color
 import android.media.AudioManager
@@ -26,10 +27,8 @@ class MainActivity : TauriActivity() {
   // Android WiFi 默认过滤组播，必须持有 MulticastLock 才能收到设备应答。
   private var multicastLock: android.net.wifi.WifiManager.MulticastLock? = null
 
-  // 投屏期间保活：本地代理跑在 App 进程里，电视持续从手机拉流，
-  // 系统休眠/省电会冻结网络导致电视端卡断，需持有 WakeLock + WifiLock。
-  private var castWakeLock: android.os.PowerManager.WakeLock? = null
-  private var castWifiLock: android.net.wifi.WifiManager.WifiLock? = null
+  // 投屏保活锁（WakeLock/WifiLock）与常驻通知的所有权已移入 CastKeepAliveService，
+  // MainActivity 仅通过 keepAwake(true/false) 启停该前台服务。
 
   override fun onCreate(savedInstanceState: Bundle?) {
     WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -150,41 +149,26 @@ class MainActivity : TauriActivity() {
       }
     }
 
-    // DLNA 投屏期间保活：电视持续从手机本地代理拉流，
-    // 系统休眠/省电冻结网络会让电视端卡断。持 WakeLock（CPU）+ WifiLock（高性能 WiFi）。
+    // 投屏期间保活：本地代理/本地媒体源在 App 进程里，电视持续从手机拉流。
+    // 通过前台服务（CastKeepAliveService）把进程提升为前台优先级 + 持 WakeLock/WifiLock +
+    // 常驻通知，规避 Doze 网络限制与 LMK 回收，使锁屏/后台投屏不中断。
+    // 锁与通知的所有权已移入 Service，这里只负责启停。
     @JavascriptInterface
     fun keepAwake(enabled: Boolean) {
       try {
+        val intent = Intent(this, CastKeepAliveService::class.java)
         if (enabled) {
-          if (castWakeLock == null) {
-            val pm = getSystemService(POWER_SERVICE) as android.os.PowerManager
-            castWakeLock = pm.newWakeLock(
-              android.os.PowerManager.PARTIAL_WAKE_LOCK, "LibreTV:CastKeepAlive"
-            ).apply {
-              setReferenceCounted(false)
-              acquire(2 * 60 * 60 * 1000L) // 最长 2 小时，防泄漏兜底
-            }
-          }
-          if (castWifiLock == null) {
-            val wifi = applicationContext.getSystemService(WIFI_SERVICE) as android.net.wifi.WifiManager
+          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+          } else {
             @Suppress("DEPRECATION")
-            castWifiLock = wifi.createWifiLock(
-              android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "LibreTV:CastWifi"
-            ).apply {
-              setReferenceCounted(false)
-              // WifiLock.acquire() 不支持超时参数（那是 WakeLock 的 API）；
-              // 防泄漏靠停止投屏时显式 release + 进程死亡自动释放
-              acquire()
-            }
+            startService(intent)
           }
         } else {
-          castWakeLock?.let { if (it.isHeld) it.release() }
-          castWakeLock = null
-          castWifiLock?.let { if (it.isHeld) it.release() }
-          castWifiLock = null
+          stopService(intent)
         }
       } catch (e: Exception) {
-        // 权限缺失等场景静默失败：投屏可能因省电中断，但不崩溃
+        // 启动失败等场景静默处理：投屏可能因省电中断，但不崩溃
       }
     }
 

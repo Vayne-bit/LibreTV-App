@@ -37,17 +37,29 @@ if (!manifest.includes('android:resizeableActivity')) {
   manifest = manifest.replace('<application', '<application\n        android:resizeableActivity="true"');
 }
 // DLNA 投屏：SSDP 组播需要 CHANGE_WIFI_MULTICAST_STATE 权限（MainActivity 里 acquire MulticastLock）。
+// 投屏保活前台服务需要 FOREGROUND_SERVICE（API 28+ 必需，否则 startForegroundService 抛 SecurityException）；
+// POST_NOTIFICATIONS 仅声明（启动前台服务本身不需要该运行时权限，但声明后 Android 13+ 可正常显示通知）。
 // 逐项检查后追加，避免与 Tauri 生成的 Manifest 里已有权限重复（重复会触发 Gradle 警告）。
 const permissions = {
   INTERNET: 'android.permission.INTERNET',
   CHANGE_WIFI_MULTICAST_STATE: 'android.permission.CHANGE_WIFI_MULTICAST_STATE',
   ACCESS_WIFI_STATE: 'android.permission.ACCESS_WIFI_STATE',
   WAKE_LOCK: 'android.permission.WAKE_LOCK',
+  FOREGROUND_SERVICE: 'android.permission.FOREGROUND_SERVICE',
+  POST_NOTIFICATIONS: 'android.permission.POST_NOTIFICATIONS',
 };
 const missing = Object.values(permissions).filter((name) => !manifest.includes(name));
 if (missing.length > 0) {
   const block = missing.map((name) => `    <uses-permission android:name="${name}" />`).join('\n');
   manifest = manifest.replace('<application', `${block}\n    <application`);
+}
+
+// 投屏保活前台服务声明（与 MainActivity.keepAwake 配套启动/停止）。
+if (!manifest.includes('CastKeepAliveService')) {
+  manifest = manifest.replace(
+    '</application>',
+    '    <service android:name=".CastKeepAliveService" android:exported="false" />\n</application>'
+  );
 }
 writeFileSync(manifestPath, manifest);
 console.log('[android-overrides] patched AndroidManifest.xml');
