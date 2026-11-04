@@ -744,6 +744,9 @@ class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
                     if (response.data && typeof response.data === 'string') {
                         // 广告过滤关掉时也走一遍：只统计标记，不改内容，诊断信息才有数据可看
                         const filtering = typeof adFilteringEnabled === 'undefined' ? true : adFilteringEnabled;
+                        // 过滤前的原始清单留存一份：人工标记要靠它算出广告块的准确起止，
+                        // 过滤后清单已经缺了广告分片，事后无从还原边界。
+                        rememberRawPlaylist(response.data, response.url);
                         response.data = filterAdsFromM3U8(response.data, filtering, response.url);
                     }
                     return onSuccess(response, stats, ctx, networkDetails);
@@ -826,8 +829,122 @@ function recordPlaylistMarkers(raw, removedSegments, aborted, mode, adBlocks) {
     try { localStorage.setItem(PLAYLIST_MARKER_STATS_KEY, JSON.stringify(payload)); } catch (e) { /* 存不下就算了 */ }
 }
 
-// ============ M3U8 广告过滤（标记法 + 结构法 + 主机特征法 + 学习型黑名单）============
-// 采集站 SSAI 插播广告的结构特征：广告是一整块被 #EXT-X-DISCONTINUITY 夹住的分片，
+// ============ 原始播放列表留存（人工标记自动定边界用）============
+// 过滤前的原始清单是唯一的「广告块边界」证据：过滤之后广告分片已经不在清单里，
+// 事后无从知道广告到底从哪开始、到哪结束。这里按清单地址缓存最近一次的原始清单。
+const rawPlaylistCache = new Map(); // key: 清单地址 → { blocks, segments, totalDuration, at }
+const RAW_PLAYLIST_CACHE_MAX = 4;
+
+function playlistCacheKey(baseUrl) {
+    try {
+        const u = new URL(baseUrl, location.href);
+        // 去掉 token 查询参数：同一个清单换 token 仍是同一份内容
+        return u.origin + u.pathname;
+    } catch (e) {
+        return String(baseUrl || '');
+    }
+}
+
+// 把原始清单解析成「块 + 分片」结构，附带每个分片的累计起止时间。
+// 起止时间是 hls.js 的 frag.start 语义（EXTINF 累加），用来把播放时间反查成分片。
+//
+// 每个分片带一个 id（URI + 该 URI 在清单里的出现序号）：
+// 广告分片常在片头片尾复用同一批文件名，只看 URI 分不清是哪一个，
+// 时间轴换算必须靠这个唯一标识。
+function parseRawPlaylist(m3u8Content, baseUrl) {
+    const lines = m3u8Content.split('\n');
+    const blocks = [];
+    let block = { discontinuity: false, keyNone: false, segments: [], duration: 0 };
+    let pending = 0;
+    let clock = 0;
+    const uriSeen = new Map();
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const trimmed = line.trim();
+        if (isDiscontinuityLine(trimmed)) {
+            blocks.push(block);
+            block = { discontinuity: true, keyNone: false, segments: [], duration: 0 };
+            continue;
+        }
+        if (trimmed.indexOf('#EXT-X-KEY') === 0) {
+            if (trimmed.indexOf('METHOD=NONE') >= 0) block.keyNone = true;
+            continue;
+        }
+        if (trimmed.indexOf('#EXTINF') === 0) {
+            const value = parseFloat(trimmed.slice(8));
+            pending = isNaN(value) ? 0 : value;
+            continue;
+        }
+        if (trimmed && trimmed.charAt(0) !== '#') {
+            const occurrence = uriSeen.get(trimmed) || 0;
+            uriSeen.set(trimmed, occurrence + 1);
+            const seg = {
+                uri: trimmed,
+                id: segmentIdentity(trimmed, occurrence),
+                occurrence: occurrence,
+                duration: pending,
+                start: clock,
+                end: clock + pending,
+                host: playlistHost(trimmed, baseUrl),
+                // 路径前缀：同一个 CDN 下的分片共享前缀，广告常用另一个前缀
+                pathPrefix: playlistPathPrefix(trimmed)
+            };
+            block.segments.push(seg);
+            block.duration += pending;
+            clock += pending;
+            pending = 0;
+        }
+    }
+    blocks.push(block);
+    return {
+        blocks: blocks,
+        segments: blocks.reduce((acc, b) => acc.concat(b.segments), []),
+        totalDuration: clock,
+        baseUrl: baseUrl,
+        at: Date.now()
+    };
+}
+
+// 分片的路径前缀（去掉最后一级文件名）：广告块常整块来自另一个目录
+function playlistPathPrefix(uri) {
+    try {
+        const u = new URL(uri, 'https://placeholder.invalid/');
+        const path = u.pathname.replace(/[^/]*$/, '');
+        return u.host + path;
+    } catch (e) {
+        return '';
+    }
+}
+
+function rememberRawPlaylist(m3u8Content, baseUrl) {
+    if (!m3u8Content || !baseUrl) return;
+    try {
+        const key = playlistCacheKey(baseUrl);
+        const parsed = parseRawPlaylist(m3u8Content, baseUrl);
+        rawPlaylistCache.set(key, parsed);
+        lastRawPlaylist = parsed;
+        while (rawPlaylistCache.size > RAW_PLAYLIST_CACHE_MAX) {
+            // Map 保持插入顺序，删最早写入的那个
+            const oldest = rawPlaylistCache.keys().next().value;
+            rawPlaylistCache.delete(oldest);
+        }
+    } catch (e) { /* 解析失败就算了，不影响播放 */ }
+}
+
+// 对外：供 player_ad_marker.js 查询当前播放列表的分片结构
+// 注意：hls.url 指向的是 master 清单，而缓存的键是媒体清单（第二层）的地址，
+// 两者对不上。同一时刻只有一个列表在播，所以查不到时退回最近缓存的那份。
+let lastRawPlaylist = null;
+
+function getRawPlaylist(baseUrl) {
+    const key = playlistCacheKey(baseUrl);
+    const hit = rawPlaylistCache.get(key);
+    if (hit) return hit;
+    if (lastRawPlaylist) return lastRawPlaylist;
+    return null;
+}
+
+// ============ M3U8 广告过滤（标记法 + 结构法 + 主机特征法 + 学习型黑名单）============// 采集站 SSAI 插播广告的结构特征：广告是一整块被 #EXT-X-DISCONTINUITY 夹住的分片，
 // 分片全部指向另一个域名（广告商的 CDN），块内还常带一句 #EXT-X-KEY:METHOD=NONE。
 // 这类源不会给 CUE-OUT/CUE-IN，所以只能靠结构认。
 // 块长上限放宽到 300s：180s 会放过 3~5 分钟的广告组；
@@ -1209,6 +1326,65 @@ function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
     return kept.join('\n');
 }
 
+// 记录本次过滤实际删掉的分片。
+// 用途：把「原始清单时间轴」换算成「播放时间轴」——
+// 删掉广告后后面的分片会前移，播放器看到的时间与原始清单差一个偏移量。
+// 人工标记要按播放时间轴工作，否则标记区间会整体错位。
+//
+// 标识用「URI + 该 URI 在原始清单里的出现序号」而不是裸 URI：
+// 广告分片常在片头片尾复用同一批文件名（实测：IdHH1Wg6.ts 等 4 个文件各出现两次），
+// 只看 URI 会把片尾的广告误判成「已删除」，导致时间轴偏移算错。
+let lastRemovedSegmentIds = new Set();
+
+// 给一个分片分配「URI + 出现序号」的唯一标识
+function segmentIdentity(uri, occurrence) {
+    return uri + '#' + occurrence;
+}
+
+// 对外：本次过滤实际删掉的分片标识集合（用于原始时间轴 → 播放时间轴换算）
+function getRemovedSegmentIds() {
+    return lastRemovedSegmentIds;
+}
+
+// 对比「过滤后的清单」与「原始清单」，算出被删掉的分片标识。
+//
+// 为什么用比对而不是在过滤分支里登记：过滤有四条路径（主机特征法断点分支 /
+// 无断点分支、标记法、结构法），每条都要登记一遍很容易漏；而且登记的是裸 URI，
+// 遇到片头片尾复用同一批广告文件名的情况会算错。比对法只看最终结果，
+// 与走了哪条过滤路径无关。
+//
+// 匹配用贪心：原始清单的分片按顺序依次在结果里找，找到就配对，找不到就判定被删。
+// 广告是整块删除的，顺序不会被打乱，贪心匹配不会配错。
+function computeRemovedSegmentIds(originalPlaylist, filteredText) {
+    const removed = new Set();
+    if (!originalPlaylist || !originalPlaylist.segments.length) return removed;
+    // 结果清单里剩下的分片 URI 序列（按顺序）
+    const keptUris = [];
+    filteredText.split('\n').forEach(line => {
+        const trimmed = line.trim();
+        if (trimmed && trimmed.charAt(0) !== '#') keptUris.push(trimmed);
+    });
+    let keptIndex = 0;
+    originalPlaylist.segments.forEach(seg => {
+        if (keptIndex < keptUris.length && keptUris[keptIndex] === seg.uri) {
+            keptIndex += 1; // 配上了，说明这个分片还在
+            return;
+        }
+        removed.add(seg.id);
+    });
+    return removed;
+}
+
+// 过滤收尾：算出这次删掉了哪些分片，供播放时间轴换算使用。
+// 比对的是「过滤后的清单」与「原始清单」，与走了哪条过滤路径无关。
+function finishFiltering(filteredText, baseUrl) {
+    const original = getRawPlaylist(baseUrl);
+    if (original) {
+        lastRemovedSegmentIds = computeRemovedSegmentIds(original, filteredText);
+    }
+    return filteredText;
+}
+
 // 总入口。先走主机特征法（与结构无关，能抓同域名广告和已学习域名），
 // 再在过滤结果上走标记法（CUE / DATERANGE-SCTE35）或结构法。
 function filterAdsFromM3U8(m3u8Content, applyFilter, baseUrl) {
@@ -1218,7 +1394,9 @@ function filterAdsFromM3U8(m3u8Content, applyFilter, baseUrl) {
     const linesAfter = afterHost.split('\n');
     // 有广告标记就走标记法，没有就走结构法（采集站插播广告不给 CUE 标记）
     const hasAdStart = linesAfter.some(line => isAdStartTag(line.trim()));
-    if (!hasAdStart) return filterByStructure(afterHost, linesAfter, baseUrl, applyFilter);
+    if (!hasAdStart) {
+        return finishFiltering(filterByStructure(afterHost, linesAfter, baseUrl, applyFilter), baseUrl);
+    }
     if (!applyFilter) {
         recordAdFilterStats(afterHost, 0, false, 'cue', 0);
         return afterHost;
@@ -1294,5 +1472,5 @@ function filterAdsFromM3U8(m3u8Content, applyFilter, baseUrl) {
     const keptUris = kept.map(l => l.trim()).filter(t => t && t.charAt(0) !== '#');
     rememberAdHosts(adUris, keptUris, baseUrl);
     recordAdFilterStats(afterHost, removed, false, 'cue', 0);
-    return kept.join('\n');
+    return finishFiltering(kept.join('\n'), baseUrl);
 }
