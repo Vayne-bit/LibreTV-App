@@ -109,6 +109,12 @@ npx tauri dev
 
 更多本地构建方式见 [BUILDING.md](BUILDING.md)。
 
+## 投屏（未并入主线）
+
+DLNA / Chromecast / AirPlay 投屏没有合进主线，代码单独放在 [`feature/dlna-cast`](https://github.com/Vayne-bit/LibreTV-App/tree/feature/dlna-cast) 分支，需要时再从该分支继续开发（该分支是完整可编译状态，可直接 `npx tauri build` 验证）。
+
+暂不合并的原因：Rust 侧的 DLNA 实现只在个别设备（三星 Tizen、乐播）上有反馈，未做广泛实机验证；内置流代理转发时不校验目标是否为私网地址；Android 端的多播锁只申请不释放；Chromecast 依赖的 `gstatic.com` sender 脚本在国内基本不可用。详细说明见 [1.3.7 版本说明](docs/RELEASE-v1.3.7.md)。
+
 ## 云端打包与发版
 
 打包全部在 GitHub Actions 上完成，本机不需要安卓环境：
