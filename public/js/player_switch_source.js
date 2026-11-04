@@ -115,6 +115,9 @@ function pickSwitchSourceEpisode(itemName, itemIndex) {
     currentEpisodeNames = row.episodeNames.slice();
     currentEpisodeIndex = Math.min(currentSwitchEpisodeIndex(), currentEpisodes.length - 1);
     episodesReversed = false;
+    // 倒序状态要跟着落盘：存储里的 true 会让下次进页恢复成倒序，
+    // 而用户此刻看到的列表是正序——视图与持久化状态打架
+    try { localStorage.setItem('episodesReversed', 'false'); } catch (e) { /* 存不下就算了 */ }
     localStorage.setItem('currentEpisodes', JSON.stringify(currentEpisodes));
     localStorage.setItem('currentEpisodeNames', JSON.stringify(currentEpisodeNames));
     localStorage.setItem('currentEpisodeIndex', currentEpisodeIndex);

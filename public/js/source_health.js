@@ -43,6 +43,9 @@ async function runSourceHealthCheck(force = false) {
     if (typeof selectedAPIs === 'undefined' || !Array.isArray(selectedAPIs)) return [];
     const results = [];
     for (const code of selectedAPIs) {
+        // 只探测内建源：custom_N 不是 Rust 侧 API_SITES 的合法 id，
+        // search_videos 对它必然报 Unknown source_id，探测只会永远「失效」
+        if (typeof API_SITES === 'object' && API_SITES && !API_SITES[code]) continue;
         const result = await probeSourceHealth(code);
         results.push(result);
         renderSourceHealth(results);

@@ -135,18 +135,25 @@ function getSearchHistory() {
     try {
         const data = localStorage.getItem(SEARCH_HISTORY_KEY);
         if (!data) return [];
-        
+
         const parsed = JSON.parse(data);
-        
+
         // 检查是否是数组
         if (!Array.isArray(parsed)) return [];
-        
-        // 支持旧格式（字符串数组）和新格式（对象数组）
+
+        // 支持旧格式（字符串数组）和新格式（对象数组）。
+        // 旧版本保存时把 < > 转义成了实体，这里统一还原：
+        // 转义属于渲染时职责（渲染走 textContent），存取都用原始文本。
+        const unescapeLegacy = (text) => String(text)
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>');
         return parsed.map(item => {
             if (typeof item === 'string') {
-                return { text: item, timestamp: 0 };
+                return { text: unescapeLegacy(item), timestamp: 0 };
             }
-            return item;
+            return item && typeof item.text === 'string'
+                ? Object.assign({}, item, { text: unescapeLegacy(item.text) })
+                : item;
         }).filter(item => item && item.text);
     } catch (e) {
         console.error('获取搜索历史出错:', e);
@@ -157,10 +164,12 @@ function getSearchHistory() {
 // 保存搜索历史的增强版本 - 添加时间戳和最大数量限制，现在缓存2个月
 function saveSearchHistory(query) {
     if (!query || !query.trim()) return;
-    
-    // 清理输入，防止XSS
-    query = query.trim().substring(0, 50).replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    
+
+    // 只截断长度，不做 HTML 转义：渲染走 textContent 已经安全；
+    // 存储时转义会让含 < > 的搜索词显示成 &lt; &gt;，
+    // 且点历史标签回填转义串，等于搜了另一个词。
+    query = query.trim().substring(0, 50);
+
     let history = getSearchHistory();
     
     // 获取当前时间

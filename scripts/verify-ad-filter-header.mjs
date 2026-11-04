@@ -41,7 +41,8 @@ let lastRawPlaylist=null;let lastRemovedSegmentIds=new Set();let lastRemovedSegm
   const names = ['isDiscontinuityLine','splitPlaylistBlocks','playlistHost','isAdSegmentUri',
     'getLearnedAdHosts','rememberAdHosts','recordAdFilterStats','filterByHostRules','isAdStartTag','isAdEndTag',
     'filterByStructure','parseRawPlaylist','playlistPathPrefix','segmentIdentity',
-    'computeRemovedSegmentIds','finishFiltering','getRawPlaylist','rememberRawPlaylist','playlistCacheKey'];
+    'computeRemovedSegmentIds','finishFiltering','getRawPlaylist','rememberRawPlaylist','playlistCacheKey',
+    'rememberRemovedSegments','getRemovedSegmentIds','getRemovedSegmentUris'];
   vm.runInContext(PRELUDE + names.map(n => ex(handlerSrc, n)).join('\n'), ctx);
   // 用固定的删块结果替换判据，专测「删块时的输出结构」
   vm.runInContext(`function findAdBlockIndexes(){ return ${JSON.stringify(dropIndexes)}; }`, ctx);

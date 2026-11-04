@@ -139,6 +139,9 @@ function handleSourceFailure() {
     if (typeof autoRelinkAndPlay === 'function') {
         autoRelinkAndPlay().then(result => {
             if (!result || !result.ok) {
+                // 已有一轮换源在跑时返回「正在换源中」：那不是失败，
+                // 只是本次失败事件没参与换源，别把错误页抢在恢复结果出来前弹出来
+                if (result && result.reason === '正在换源中') return;
                 showPlayerError('视频加载失败，可能是线路失效或格式不兼容');
             }
         }).catch(() => {
@@ -171,7 +174,8 @@ function playM3u8(video, url, instance) {
     hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
         const levels = (data && data.levels) || [];
         const best = levels.reduce((acc, level) => (level && level.height > (acc ? acc.height : 0) ? level : acc), null);
-        if (best && best.height) updateResolutionBadge(formatResolution(best.width, best.height));
+        // 新清单没有 RESOLUTION 声明时要清掉旧角标（updateResolutionBadge 对空串按清除处理）
+        updateResolutionBadge(best && best.height ? formatResolution(best.width, best.height) : '');
         // 「自动」档要等知道有几档才能定：单档源加深缓冲，多档源保持浅缓冲让 ABR 敢升档
         if (bufferLevel === 'auto') applyBufferPreset(hls, bufferPresetFor(bufferLevel, levels.length));
     });
@@ -208,6 +212,12 @@ function playFlv(video, url, instance) {
         return;
     }
     const flv = mpegts.createPlayer({ type: 'flv', url, isLive: false }, { enableWorker: false, lazyLoad: false });
+    // mpegts 的致命错误只在自己的实例上发 ERROR 事件，video.error 收不到：
+    // 不接这条线的话 flv 源挂了就是永久转圈，既没有错误页也不会自动换源
+    flv.on(mpegts.Events.ERROR, (type, detail) => {
+        console.warn('[flv] error:', type, detail);
+        if (!playbackStarted && typeof handleSourceFailure === 'function') handleSourceFailure();
+    });
     flv.attachMediaElement(video);
     flv.load();
     instance.flv = flv;
@@ -475,6 +485,15 @@ function initPlayer(videoUrl) {
     playbackStarted = false;
     hidePlayerError();
 
+    // 防双实例：initPlayer 可能被二次触发（如密码验证事件重复派发、
+    // initializePageContent 重跑），直接 new 会往同一个容器里再叠一个播放器 +
+    // 一个 hls 实例——双份声音、双倍带宽，而缓冲统计还绑在已成孤儿的旧实例上。
+    if (art) {
+        try { destroyStreamEngines(art); } catch (e) { /* 引擎本就不在 */ }
+        try { art.destroy(); } catch (e) { /* 已销毁 */ }
+        art = null;
+    }
+
     Artplayer.PLAYBACK_RATE = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
 
     art = new Artplayer({
@@ -567,6 +586,11 @@ function initPlayer(videoUrl) {
         hidePlayerError();
         clearTimeout(slowLoadTimer);
         requestScreenAwake(true);
+        // 稳定起播说明恢复成功：错误恢复预算重新计满。
+        // 以前只增不减，长片里三次互不相关的可恢复错误之后，第四次错误
+        // 直接进「片源失效」流程，即使恢复手段仍然有效。
+        fatalRecoverCount = 0;
+        bufferAppendErrorCount = 0;
     });
 
     art.on('video:pause', () => {
@@ -589,7 +613,8 @@ function initPlayer(videoUrl) {
         if (autoplayEnabled && currentEpisodeIndex < currentEpisodes.length - 1) {
             art.notice.show = '即将播放下一集';
             setTimeout(() => {
-                if (videoHasEnded) playNextEpisode();
+                // 用户在 1 秒窗口里点了重播/拖回进度（视频已在播）就别拖去下一集
+                if (videoHasEnded && !art.playing) playNextEpisode();
             }, 1000);
         }
     });
@@ -629,6 +654,8 @@ window.__libretvNativeBack = function () {
 function switchPlayerUrl(url, startPosition = 0) {
     playbackStarted = false;
     videoHasEnded = false;
+    // 新的一次播放 = 新的自动换源预算（每次播放只自动换一次源）
+    if (typeof autoRelinkState === 'object' && autoRelinkState) autoRelinkState.tried = false;
     // 换集/换源时把上一集没来得及执行的跳转作废，否则会跳错位置
     clearPendingVideoSeek();
     pendingSeekPosition = startPosition;
@@ -683,7 +710,13 @@ function updateNextEpisodeControl() {
 
 // 播放器角标显示当前真实分辨率，非 m3u8 源也能通过 video 元素拿到尺寸
 function updateResolutionBadge(label) {
-    if (!label) return;
+    // 空串语义是「这个片源拿不到分辨率」：隐藏现有角标。
+    // 以前直接 return，换到无分辨率声明的源后一直挂着上一部的角标。
+    if (!label) {
+        const existing = document.getElementById('playerResolutionBadge');
+        if (existing) existing.classList.add('hidden');
+        return;
+    }
     let badge = document.getElementById('playerResolutionBadge');
     if (!badge) {
         const container = document.getElementById('player');
@@ -707,8 +740,19 @@ async function requestScreenAwake(on) {
     }
     try {
         if (on && 'wakeLock' in navigator && !screenWakeLock) {
-            screenWakeLock = await navigator.wakeLock.request('screen');
-            screenWakeLock.addEventListener('release', () => { screenWakeLock = null; });
+            // 两次快速请求会都看到 !screenWakeLock 而各拿一把锁，先到的那把
+            // 被覆盖后无人释放。用同一把 Promise 串行化请求。
+            if (!screenWakeLockRequest) {
+                screenWakeLockRequest = navigator.wakeLock.request('screen')
+                    .then(lock => {
+                        screenWakeLock = lock;
+                        lock.addEventListener('release', () => { screenWakeLock = null; });
+                        return lock;
+                    })
+                    .catch(() => null)
+                    .finally(() => { screenWakeLockRequest = null; });
+            }
+            await screenWakeLockRequest;
         } else if (!on && screenWakeLock) {
             await screenWakeLock.release();
             screenWakeLock = null;
@@ -1127,19 +1171,22 @@ function filterByHostRules(m3u8Content, lines, baseUrl, applyFilter) {
         });
         if (!hitBlocks.length) {
             recordAdFilterStats(m3u8Content, 0, false, 'none', 0);
-            return m3u8Content;
+            // 走一遍收尾登记：把「本次没有删任何分片」写进按清单分键的名单，
+            // 否则消费方（标记换算/投屏名单）会拿到上一条清单的陈旧名单
+            return finishFiltering(m3u8Content, baseUrl);
         }
         // 兜底：删太多说明判定规则在误伤正片，宁可让用户看广告也不能把正片删没
         const tooMuch = removedSegments >= totalSegments || removedDuration > totalDuration * AD_REMOVE_MAX_RATIO;
         if (tooMuch || !applyFilter) {
             recordAdFilterStats(m3u8Content, 0, tooMuch, 'host', hitBlocks.length);
-            return m3u8Content;
+            return finishFiltering(m3u8Content, baseUrl);
         }
         const kept = [];
         const tail = [];
         const keptUris = [];
         const adUris = [];
         let droppedBefore = false;
+        let emitted = 0;
         blocks.forEach((block, index) => {
             if (hitBlocks.indexOf(index) >= 0) {
                 droppedBefore = true;
@@ -1149,12 +1196,16 @@ function filterByHostRules(m3u8Content, lines, baseUrl, applyFilter) {
                 });
                 return;
             }
-            // 被删块与保留块之间要有一个断点：被删块自己的前置断点借不到时，
-            // 在下一个保留块前补一个。多余的断点最多触发一次 remux，不会卡住播放。
-            if (droppedBefore && !block.discontinuity) kept.push('#EXT-X-DISCONTINUITY');
+            // 保留块的原始断点必须还原：splitter 把 DISCONTINUITY 行吃进了标记位，
+            // 并没有存进 block.lines，这里不补回去的话，凡是删过块，输出清单里
+            // 所有合法断点都会消失（时间戳跳变处缺声明 → remuxer 按连续时间轴
+            // 算分段时长 → 缓冲空洞/卡死）。块 0 的 disc 恒为 false（文件头单独成块），
+            // 所以无需 emitted 守卫——守卫反而会吞掉「紧跟文件头的第一个内容块」的断点。
+            if (block.discontinuity || droppedBefore) kept.push('#EXT-X-DISCONTINUITY');
             droppedBefore = false;
             block.segments.forEach(segment => keptUris.push(segment.uri));
             block.lines.forEach(line => kept.push(line));
+            emitted += block.segments.length;
         });
         tail.forEach(line => kept.push(line));
         // 确认是广告的分片域名记入学习型黑名单（正片用过的域名不记）
@@ -1232,7 +1283,7 @@ function filterByHostRules(m3u8Content, lines, baseUrl, applyFilter) {
         removedDuration > totalDuration * AD_REMOVE_MAX_RATIO;
     if (tooMuch || !applyFilter) {
         recordAdFilterStats(m3u8Content, 0, tooMuch, 'host', adUris.length ? 1 : 0);
-        return m3u8Content;
+        return finishFiltering(m3u8Content, baseUrl);
     }
     const segItemIndex = new Map();
     segItems.forEach((item, index) => segItemIndex.set(item, index));
@@ -1294,7 +1345,7 @@ function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
     const dropped = findAdBlockIndexes(blocks);
     if (!dropped.length) {
         recordAdFilterStats(m3u8Content, 0, false, 'none', 0);
-        return m3u8Content;
+        return finishFiltering(m3u8Content, baseUrl);
     }
     let removedSegments = 0;
     let removedDuration = 0;
@@ -1306,7 +1357,7 @@ function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
     const tooMuch = removedSegments >= totalSegments || removedDuration > totalDuration * AD_REMOVE_MAX_RATIO;
     if (tooMuch || !applyFilter) {
         recordAdFilterStats(m3u8Content, 0, tooMuch, 'structure', dropped.length);
-        return m3u8Content;
+        return finishFiltering(m3u8Content, baseUrl);
     }
     const kept = [];
     const tail = [];
@@ -1341,8 +1392,9 @@ function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
             });
             return;
         }
-        // 头一个分片之前不需要断点，写了反而是个孤立标记
-        if (block.discontinuity && emitted > 0) kept.push('#EXT-X-DISCONTINUITY');
+        // 保留块的原始断点必须还原。块 0 的 disc 恒为 false（文件头单独成块），
+        // 无需 emitted 守卫——守卫会吞掉「紧跟文件头的第一个内容块」的断点。
+        if (block.discontinuity) kept.push('#EXT-X-DISCONTINUITY');
         block.segments.forEach(segment => keptUris.push(segment.uri));
         block.lines.forEach((line, lineIndex) => {
             if (index === 0 && lineIndex < headCount) return; // 头部已单独保留
@@ -1417,8 +1469,39 @@ function segmentIdentity(uri, occurrence) {
     return uri + '#' + occurrence;
 }
 
-// 对外：本次过滤实际删掉的分片标识集合（用于原始时间轴 → 播放时间轴换算）
-function getRemovedSegmentIds() {
+// 按「清单地址」分键保存最近一次过滤结果（容量与 rawPlaylistCache 一致）。
+//
+// 为什么不能只用下面两个「全局最近一次」变量：同一个页面可能同时有多条过滤
+// 在跑（播放中的清单 + 后台下载其它集的清单——下载前也会先跑一遍广告过滤），
+// 谁后跑完谁覆盖全局值，播放侧的时间轴换算就会拿错名单：
+// 人工广告标记跳错位置、投屏带下去的广告名单变成别的集的。
+// 消费方（标记/投屏）按当前播放清单的地址来取，就互不干扰了。
+const removedSegmentsByPlaylist = new Map();
+
+function rememberRemovedSegments(baseUrl, result) {
+    try {
+        const key = playlistCacheKey(baseUrl);
+        removedSegmentsByPlaylist.delete(key); // 重写先删再放，让 Map 顺序保持「最近使用」
+        removedSegmentsByPlaylist.set(key, { ids: result.removed, uris: result.removedUris });
+        while (removedSegmentsByPlaylist.size > RAW_PLAYLIST_CACHE_MAX) {
+            const oldest = removedSegmentsByPlaylist.keys().next().value;
+            removedSegmentsByPlaylist.delete(oldest);
+        }
+    } catch (e) { /* 键算不出来就只留全局兜底 */ }
+    lastRemovedSegmentIds = result.removed;
+    lastRemovedSegmentUris = result.removedUris;
+}
+
+// 对外：本次过滤实际删掉的分片标识集合（用于原始时间轴 → 播放时间轴换算）。
+// baseUrl 可选：传了就按清单地址取（多清单并发过滤时各取各的）；
+// 不传保持旧行为（全局最近一次），兼容旧调用与测试沙箱。
+function getRemovedSegmentIds(baseUrl) {
+    if (baseUrl) {
+        try {
+            const hit = removedSegmentsByPlaylist.get(playlistCacheKey(baseUrl));
+            if (hit) return hit.ids;
+        } catch (e) { /* 落到全局兜底 */ }
+    }
     return lastRemovedSegmentIds;
 }
 
@@ -1434,7 +1517,14 @@ function getRemovedSegmentIds() {
 // 名单在过滤收尾时一并记下（computeRemovedSegmentIds），
 // 不在取用时回头翻缓存 —— 缓存只留最近 4 份清单，
 // 投屏时可能已经被别的清单挤掉，名单空了等于过滤没生效。
-function getRemovedSegmentUris() {
+// baseUrl 可选：按清单地址取（多清单并发时不会被别的集覆盖）。
+function getRemovedSegmentUris(baseUrl) {
+    if (baseUrl) {
+        try {
+            const hit = removedSegmentsByPlaylist.get(playlistCacheKey(baseUrl));
+            if (hit) return hit.uris;
+        } catch (e) { /* 落到全局兜底 */ }
+    }
     return lastRemovedSegmentUris;
 }
 
@@ -1478,8 +1568,9 @@ function finishFiltering(filteredText, baseUrl) {
     const original = getRawPlaylist(baseUrl);
     if (original) {
         const result = computeRemovedSegmentIds(original, filteredText);
-        lastRemovedSegmentIds = result.removed;
-        lastRemovedSegmentUris = result.removedUris;
+        // 全局值 + 按清单地址分键各存一份：
+        // 全局保旧语义，分键保住「播放/下载/投屏并发过滤时各用各的名单」
+        rememberRemovedSegments(baseUrl, result);
     }
     return filteredText;
 }
@@ -1498,7 +1589,7 @@ function filterAdsFromM3U8(m3u8Content, applyFilter, baseUrl) {
     }
     if (!applyFilter) {
         recordAdFilterStats(afterHost, 0, false, 'cue', 0);
-        return afterHost;
+        return finishFiltering(afterHost, baseUrl);
     }
     const kept = [];
     const adUris = [];
@@ -1558,14 +1649,14 @@ function filterAdsFromM3U8(m3u8Content, applyFilter, baseUrl) {
     // 标记不成对（没有 CUE-IN）说明结构不符合预期，宁可不动，别把正片删了
     if (!sawCueIn) {
         recordAdFilterStats(afterHost, 0, false, 'cue', 0);
-        return afterHost;
+        return finishFiltering(afterHost, baseUrl);
     }
     // 兜底：标记打错位置时会一口气删掉大半正片，超过三成就当标记不可信，原样放行。
     // 宁可让用户看广告，也不能把正片删没。
     const totalSegments = linesAfter.reduce((n, l) => (l.trim().indexOf('#EXTINF') === 0 ? n + 1 : n), 0);
     if (removed > 5 && removed > totalSegments * 0.3) {
         recordAdFilterStats(afterHost, 0, true, 'cue', 0);
-        return afterHost;
+        return finishFiltering(afterHost, baseUrl);
     }
     // 广告分片的域名记入学习型黑名单（正片用过的域名不记）
     const keptUris = kept.map(l => l.trim()).filter(t => t && t.charAt(0) !== '#');

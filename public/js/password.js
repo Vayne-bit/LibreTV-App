@@ -160,21 +160,10 @@ function initPasswordProtection() {
     if (!isPasswordVerified()) {
         showPasswordModal();
         
-        // 设置密码提交按钮事件监听
-        const submitButton = document.getElementById('passwordSubmitBtn');
-        if (submitButton) {
-            submitButton.addEventListener('click', handlePasswordSubmit);
-        }
-        
-        // 设置密码输入框回车键监听
-        const passwordInput = document.getElementById('passwordInput');
-        if (passwordInput) {
-            passwordInput.addEventListener('keypress', function(e) {
-                if (e.key === 'Enter') {
-                    handlePasswordSubmit();
-                }
-            });
-        }
+        // 提交统一走表单的 onsubmit（index.html 里 passwordForm 已绑定）：
+        // 按钮是 type=submit（点击即触发 submit），输入框回车也触发 submit——
+        // 以前这里又给按钮和回车各挂一个监听，一次提交会跑 2~3 遍验证。
+        void 0;
     }
 }
 

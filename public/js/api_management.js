@@ -151,18 +151,21 @@ function renderCustomAPIsList() {
         apiItem.className = 'flex items-center justify-between p-1 mb-1 bg-[#222] rounded';
         const textColorClass = api.isAdult ? 'text-pink-400' : 'text-white';
         const adultTag = api.isAdult ? '<span class="text-xs text-pink-400 mr-1">(18+)</span>' : '';
-        const detailLine = api.detail ? `<div class="text-xs text-gray-400 truncate">detail: ${api.detail}</div>` : '';
+        // name/url/detail 全部走 escapeHtml：它们的来源不只是用户自己的表单，
+        // 「导入配置」会把 JSON 文件里的 customAPIs 原样写进 localStorage，
+        // 不转义就是一条持久化 XSS（配置文件哈希只证明自洽，不证明可信）
+        const detailLine = api.detail ? `<div class="text-xs text-gray-400 truncate">detail: ${escapeHtml(api.detail)}</div>` : '';
         apiItem.innerHTML = `
             <div class="flex items-center flex-1 min-w-0">
-                <input type="checkbox" id="custom_api_${index}" 
-                       class="form-checkbox h-3 w-3 text-blue-600 mr-1 ${api.isAdult ? 'api-adult' : ''}" 
-                       ${selectedAPIs.includes('custom_' + index) ? 'checked' : ''} 
+                <input type="checkbox" id="custom_api_${index}"
+                       class="form-checkbox h-3 w-3 text-blue-600 mr-1 ${api.isAdult ? 'api-adult' : ''}"
+                       ${selectedAPIs.includes('custom_' + index) ? 'checked' : ''}
                        data-custom-index="${index}">
                 <div class="flex-1 min-w-0">
                     <div class="text-xs font-medium ${textColorClass} truncate">
-                        ${adultTag}${api.name}
+                        ${adultTag}${escapeHtml(api.name)}
                     </div>
-                    <div class="text-xs text-gray-500 truncate">${api.url}</div>
+                    <div class="text-xs text-gray-500 truncate">${escapeHtml(api.url)}</div>
                     ${detailLine}
                 </div>
             </div>

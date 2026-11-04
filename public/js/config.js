@@ -176,7 +176,10 @@ const API_CONFIG = {
         // 修改搜索接口支持分页参数
         path: '/api.php/provide/vod/?ac=videolist&wd=',
         pagePath: '/api.php/provide/vod/?ac=videolist&wd={query}&pg={page}',
-        maxPages: 50, // 最大获取页数
+        // 一页通常 20~30 条：50 页意味着宽泛关键词一次搜索打出上百个请求
+        // （5 源 × 50 页），车机/低端机直接卡死。5 页（约 100~150 条/源）足够覆盖
+        // 有意义的结果，更后面的条目按相关度排序本来就排不进展示。
+        maxPages: 5, // 最大获取页数
         headers: {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'Accept': 'application/json'

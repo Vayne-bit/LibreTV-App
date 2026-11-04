@@ -39,6 +39,7 @@ const AD_HOST_PATTERNS = ['doubleclick.net','googlesyndication','googleadservice
 const AD_PATH_PATTERN = /(^|\\/)(ads?|adverts?|advertising|adcreative|adplayer|adframe|bannerads?|popunder|interstitial|preroll|midroll|postroll)(\\/|$)/i;
 const LEARNED_AD_HOSTS_KEY = 'learnedAdHosts'; const PLAYLIST_MARKER_STATS_KEY = 'playlistMarkerStats';
 const rawPlaylistCache = new Map(); const RAW_PLAYLIST_CACHE_MAX = 4;
+const removedSegmentsByPlaylist = new Map(); // 分键的「被删分片名单」（与 handler 内同名常量一致）
 let lastRawPlaylist = null; let lastRemovedSegmentIds = new Set();
 `;
 const sandbox = {
@@ -53,6 +54,7 @@ vm.runInContext(PRELUDE + locatorSrc + '\n' + extractFunctions(handlerSrc, [
     'isAdSegmentUri', 'getLearnedAdHosts', 'rememberAdHosts', 'recordAdFilterStats',
     'filterByHostRules', 'isAdStartTag', 'isAdEndTag', 'filterByStructure',
     'findAdBlockIndexes', 'filterAdsFromM3U8', 'finishFiltering', 'computeRemovedSegmentIds',
+    'rememberRemovedSegments', 'getRemovedSegmentIds', 'getRemovedSegmentUris',
     'parseRawPlaylist', 'segmentIdentity', 'playlistCacheKey', 'getRawPlaylist',
     'rememberRawPlaylist', 'getRemovedSegmentIds', 'getRemovedSegmentUris',
     

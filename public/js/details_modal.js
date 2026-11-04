@@ -499,9 +499,10 @@ function toggleDetailFavorite(button) {
 }
 
 function stripDetailHtml(value) {
-    const div = document.createElement('div');
-    div.innerHTML = String(value || '');
-    return (div.textContent || '').replace(/\s+/g, ' ').trim();
+    // DOMParser 的文档是独立的，不进活动文档：源站简介里的 <img onerror=...>、
+    // <script> 不会被求值/加载（以前用 document.createElement + innerHTML 会挂到活动文档）
+    const parsed = new DOMParser().parseFromString(String(value || ''), 'text/html');
+    return (parsed.body.textContent || '').replace(/\s+/g, ' ').trim();
 }
 
 function episodeDisplayName(episode, index, total) {

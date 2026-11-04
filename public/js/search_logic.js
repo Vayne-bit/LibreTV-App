@@ -70,13 +70,19 @@ async function searchSingleSource(apiId, query, token) {
 
 function appendSearchResults(sourceCode, sourceName, items) {
     if (!items.length) return;
+    // maxResults 兜底：配置里声明了上限但从未被执行过，聚合搜索的
+    // 累积结果没有边界，宽泛关键词会一路吃内存并拖慢每次重渲染
+    const cap = (typeof AGGREGATED_SEARCH_CONFIG === 'object' && AGGREGATED_SEARCH_CONFIG.maxResults) || 10000;
+    const room = cap - searchState.results.length;
+    if (room <= 0) return;
+    const accepted = items.slice(0, room);
     let source = searchState.sources.find(s => s.code === sourceCode);
     if (!source) {
         source = { code: sourceCode, name: sourceName, count: 0 };
         searchState.sources.push(source);
     }
-    source.count += items.length;
-    searchState.results.push(...items);
+    source.count += accepted.length;
+    searchState.results.push(...accepted);
     renderSearchResults();
 }
 

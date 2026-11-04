@@ -219,16 +219,29 @@ function switchSourceForStall() {
     if (bufferState.switches >= BUFFER_STALL_SWITCH_MAX) return false;
     if (now - bufferState.lastSwitchAt < BUFFER_STALL_SWITCH_COOLDOWN_MS) return false;
     if (!shouldSwitchForStall()) return false;
-    bufferState.lastSwitchAt = now;
-    bufferState.switches += 1;
-    // 换源后是新的片源，卡顿计数从头算，否则换过去立刻又触发一次
-    bufferState.stalls = [];
-    bufferState.suggested = false;
+    let launched = false;
     try {
-        autoRelinkAndPlay({ reason: 'stall' });
+        autoRelinkAndPlay({ reason: 'stall' }).then(result => {
+            // 换源没真正发生（已在换源中/没找到候选/预算用尽）时不能消耗预算：
+            // 计数与冷却只在「真的发起换源」时计入，否则两次机会被空转吞掉，
+            // 卡顿窗口也被清空，下一次要重新攒 6 次卡顿
+            if (!result || !result.ok) {
+                if (bufferState.switches > 0) bufferState.switches -= 1;
+                // 回滚到上一个冷却时间点不可得，保持 now 会让冷却重新计时，
+                // 这正是我们要的：没换成就允许尽快再试
+            } else {
+                // 换源后是新的片源，卡顿计数从头算，否则换过去立刻又触发一次
+                bufferState.stalls = [];
+                bufferState.suggested = false;
+            }
+        }).catch(() => { launched = false; });
+        launched = true;
     } catch (e) {
         return false;
     }
+    if (!launched) return false;
+    bufferState.lastSwitchAt = now;
+    bufferState.switches += 1;
     return true;
 }
 

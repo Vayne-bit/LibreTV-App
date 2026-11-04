@@ -85,8 +85,7 @@ async function handleCustomApiSpecialDetail(id, customApi) {
     console.log(`[Debug] CustomApiSpecialDetail: Requesting HTML via Tauri invoke for: ${detailUrl}`);
 
     try {
-        // @ts-ignore
-        const tauriCore = window.__TAURI__.core;
+        // window.__TAURI__ 未开 withGlobalTauri 时不存在，改走 tauriInvoke（__TAURI_INTERNALS__）
         const rustRequestOptions = {
             url: detailUrl,
             method: "GET",
@@ -95,7 +94,7 @@ async function handleCustomApiSpecialDetail(id, customApi) {
             response_as_text: true // Indicate we want raw text
         };
         
-        const rustResponse = await tauriCore.invoke('make_http_request', { options: rustRequestOptions });
+        const rustResponse = await tauriInvoke('make_http_request', { options: rustRequestOptions });
 
         if (!(rustResponse.status >= 200 && rustResponse.status < 300)) {
             throw createApiError(`自定义API详情页HTML请求失败 (via Rust): ${rustResponse.status}. Body: ${rustResponse.body.substring(0,200)}`, rustResponse.status);
@@ -140,8 +139,7 @@ async function handleSpecialSourceDetail(id, sourceCode) {
     console.log(`[Debug] SpecialSourceDetail: Requesting HTML via Tauri invoke for: ${detailUrl}`);
 
     try {
-        // @ts-ignore
-        const tauriCore = window.__TAURI__.core;
+        // window.__TAURI__ 未开 withGlobalTauri 时不存在，改走 tauriInvoke（__TAURI_INTERNALS__）
         const rustRequestOptions = {
             url: detailUrl,
             method: "GET",
@@ -150,7 +148,7 @@ async function handleSpecialSourceDetail(id, sourceCode) {
             response_as_text: true // Indicate we want raw text
         };
 
-        const rustResponse = await tauriCore.invoke('make_http_request', { options: rustRequestOptions });
+        const rustResponse = await tauriInvoke('make_http_request', { options: rustRequestOptions });
 
         if (!(rustResponse.status >= 200 && rustResponse.status < 300)) {
             throw createApiError(`特殊源详情页HTML请求失败 (via Rust): ${rustResponse.status}. Body: ${rustResponse.body.substring(0,200)}`, rustResponse.status);

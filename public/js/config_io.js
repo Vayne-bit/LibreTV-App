@@ -27,9 +27,36 @@ async function importConfig() {
             }
             const dataHash = await sha256(JSON.stringify(config.data));
             if (dataHash !== config.hash) throw '配置文件哈希值不匹配'; // Corrected error throwing
-            
-            for (let item in config.data) {
-                localStorage.setItem(item, config.data[item]);
+
+            // 白名单 + 值校验：导入文件是任意外部输入，原样 setItem 等于把
+            // passwordVerified / hasSeenDisclaimer 等认证状态也一起放进来，
+            // 而且坏值（如 selectedAPIs 写成 "{"）会在下次启动时把整个 App 变砖。
+            const importableKeys = new Set([
+                'selectedAPIs',
+                'customAPIs',
+                'yellowFilterEnabled',
+                'doubanEnabled',
+                'doubanApiMode',
+                'hasInitializedDefaults',
+                PLAYER_CONFIG.adFilteringStorage,
+                'viewingHistory',
+                FAVORITES_KEY,
+                SEARCH_HISTORY_KEY,
+                'manualAdSegments',
+                'introSkipMap',
+                'learnedAdHosts',
+                'sourceHealth',
+            ]);
+            const entries = Object.entries(config.data || {}).filter(([key]) =>
+                importableKeys.has(key) || key.startsWith('videoProgress_'));
+            const rejected = Object.keys(config.data || {}).length - entries.length;
+            entries.forEach(([key, value]) => {
+                // 只接受字符串值：localStorage 本来只存字符串，
+                // 非字符串会被隐式 "[object Object]" 化成脏数据
+                if (typeof value === 'string') localStorage.setItem(key, value);
+            });
+            if (rejected > 0 && typeof showToast === 'function') {
+                showToast(`已跳过 ${rejected} 个不允许导入的配置项`, 'warning');
             }
             if (typeof showToast === 'function') showToast('配置文件导入成功，3 秒后自动刷新本页面。', 'success'); else console.log("Config imported successfully.");
             setTimeout(() => {

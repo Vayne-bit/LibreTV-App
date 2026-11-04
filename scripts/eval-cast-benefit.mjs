@@ -38,6 +38,7 @@ const PRELUDE = `
 const AD_BLOCK_MAX_SECONDS = 300; const AD_REMOVE_MAX_RATIO = 0.3;
 const LEARNED_AD_HOSTS_KEY = 'learnedAdHosts';
 const rawPlaylistCache = new Map(); const RAW_PLAYLIST_CACHE_MAX = 4;
+const removedSegmentsByPlaylist = new Map(); // 分键的「被删分片名单」（与 handler 内同名常量一致）
 let lastRawPlaylist = null; let lastRemovedSegmentIds = new Set();
 `;
 const sandbox = {

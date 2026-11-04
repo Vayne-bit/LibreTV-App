@@ -948,9 +948,9 @@ function filterByHostRules(m3u8Content, lines, baseUrl, applyFilter) {
                 });
                 return;
             }
-            // 被删块与保留块之间要有一个断点：被删块自己的前置断点借不到时，
-            // 在下一个保留块前补一个。多余的断点最多触发一次 remux，不会卡住播放。
-            if (droppedBefore && !block.discontinuity) kept.push('#EXT-X-DISCONTINUITY');
+            // 保留块的原始断点必须还原（splitter 把断点行吃进标记位），
+            // 与 public/js/player_artplayer_handler.js 的修复保持一致
+            if (block.discontinuity || droppedBefore) kept.push('#EXT-X-DISCONTINUITY');
             droppedBefore = false;
             block.segments.forEach(segment => keptUris.push(segment.uri));
             block.lines.forEach(line => kept.push(line));
@@ -1122,8 +1122,8 @@ function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
             });
             return;
         }
-        // 头一个分片之前不需要断点，写了反而是个孤立标记
-        if (block.discontinuity && emitted > 0) kept.push('#EXT-X-DISCONTINUITY');
+        // 保留块的原始断点必须还原（与 public 版修复一致）
+        if (block.discontinuity) kept.push('#EXT-X-DISCONTINUITY');
         block.segments.forEach(segment => keptUris.push(segment.uri));
         block.lines.forEach(line => kept.push(line));
         emitted += block.segments.length;

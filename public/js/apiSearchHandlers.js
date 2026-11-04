@@ -3,15 +3,15 @@
 
 async function handleSingleSourceSearch(searchQuery, source, customApi) {
     if (!searchQuery) throw createApiError('缺少搜索参数');
-    if (!searchQuery) throw createApiError('缺少搜索参数');
     if (source === 'custom' && !customApi) throw createApiError('使用自定义API时必须提供API地址');
     // API_SITES[source] validation will be implicitly handled by Rust or if Rust command fails.
 
     let responseDataJsonString;
     try {
-        // @ts-ignore
-        const tauriCore = window.__TAURI__.core;
-        responseDataJsonString = await tauriCore.invoke('search_videos', {
+        // 必须走 tauriInvoke（__TAURI_INTERNALS__）：tauri.conf.json 未开
+        // withGlobalTauri，window.__TAURI__ 在打包产物里不存在——这里以前
+        // 一进来就抛 TypeError，源健康探测把所有源全判「失效」并缓存 6 小时。
+        responseDataJsonString = await tauriInvoke('search_videos', {
             query: searchQuery,
             sourceId: source,
             customApiUrl: customApi,

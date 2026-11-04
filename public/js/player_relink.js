@@ -92,9 +92,15 @@ function showRelinkHint(text) {
 async function autoRelinkAndPlay(options) {
     const opts = options || {};
     if (autoRelinkState.running) return { ok: false, reason: '正在换源中' };
+    // 单次播放只自动换一次源（tried 以前是死代码：shouldAutoRelink 从没人调，
+    // 每个致命错误都会再跑一轮全源搜索——一个坏源能连续触发 N 次全网检索）。
+    // 手动换源（换源面板）不走这里，不受影响。
+    if (autoRelinkState.tried) return { ok: false, reason: '本次播放已自动换过源' };
     autoRelinkState.running = true;
     autoRelinkState.tried = true;
 
+    // 用户可能在我们搜索期间自己点了重试/换了集：记录起点，结束前比对
+    const startedUrl = typeof currentVideoUrl === 'string' ? currentVideoUrl : '';
     const targetIndex = typeof currentEpisodeIndex === 'number' ? currentEpisodeIndex : 0;
     const position = typeof getPlaybackState === 'function' ? getPlaybackState().position : 0;
     let hint = '当前线路失效，正在自动换源…';
@@ -107,6 +113,12 @@ async function autoRelinkAndPlay(options) {
             return { ok: false, reason: '换源模块不可用' };
         }
         await loadSwitchSources();
+        // 搜索耗时数秒，期间用户可能已手动重试或切集：此时再改写播放状态
+        // 会把用户刚点开的内容抢走，直接放弃这次自动换源
+        const currentUrlNow = typeof currentVideoUrl === 'string' ? currentVideoUrl : '';
+        if (currentUrlNow !== startedUrl) {
+            return { ok: false, reason: '用户已手动切换播放，取消自动换源' };
+        }
         const items = (typeof switchSourceState !== 'undefined' && Array.isArray(switchSourceState.items))
             ? switchSourceState.items : [];
         // 只考虑探测成功且不是当前源的
@@ -172,7 +184,9 @@ async function autoRelinkAndPlay(options) {
 // 进入播放页时的预检：同步来的条目直接找源，避免先黑屏再报错
 async function precheckRelinkIfNeeded() {
     if (!currentEntryNeedsRelink()) return;
-    // 给播放器一点时间先初始化，再决定是否介入
+    // 给播放器先初始化的时间再决定是否介入。以前是 2.5 秒：首连慢一点的源
+    //（弱网下 TTFB 3~5 秒很常见）还没起播就被强行换源，而且原始地址的
+    // 进度恢复也跟着作废。8 秒对「真失效」来说不算久，对「慢」足够宽容。
     setTimeout(() => {
         if (typeof playbackStarted !== 'undefined' && playbackStarted) {
             // 原始地址能播，直接清掉标记
@@ -180,5 +194,5 @@ async function precheckRelinkIfNeeded() {
             return;
         }
         autoRelinkAndPlay({ precheck: true });
-    }, 2500);
+    }, 8000);
 }

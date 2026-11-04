@@ -401,10 +401,12 @@
         } else {
             // 广告过滤：投屏时电视自己拉流，浏览器侧的过滤对电视无效。
             // 把本次判定出的广告分片地址传过去，由代理侧按名单剔除。
+            // 按当前播放清单地址取名单：同页可能有其它过滤在跑（后台下载其它集），
+            // 全局「最近一次」的名单可能是别的集的。
             let adUris = [];
             try {
                 if (typeof getRemovedSegmentUris === 'function') {
-                    const list = getRemovedSegmentUris();
+                    const list = getRemovedSegmentUris(currentSourceUrl(art));
                     if (Array.isArray(list)) adUris = list;
                 }
             } catch (e) { adUris = []; }

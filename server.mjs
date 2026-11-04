@@ -2,6 +2,8 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import dns from 'dns';
+import net from 'net';
 import cors from 'cors';
 import axios from 'axios';
 
@@ -45,19 +47,33 @@ async function streamToString(stream) {
 
 app.use(cors());
 
+// docker-entrypoint.sh / middleware.js 都会把 index.html 里的 {{PASSWORD}} 占位符
+// 替换成实际配置；node server.mjs 这条部署路径一直没有做替换——配置了密码
+// 却静默不生效（isPasswordProtected 要求 64 位哈希，占位符只有 12 字符）。
+// 所以静态服务 index.html 前在这里做同样的替换（PASSWORD 为 64 位 hex）。
+const SERVER_PASSWORD = (process.env.PASSWORD || '').trim();
+function serveIndex(res) {
+  const indexPath = path.join(__dirname, 'public', 'index.html');
+  if (!fs.existsSync(indexPath)) {
+    const errMsg = 'index.html not found in public directory';
+    console.error(errMsg);
+    appendToLogFile(errMsg);
+    return res.status(404).send(errMsg);
+  }
+  if (!SERVER_PASSWORD) {
+    return res.sendFile(indexPath);
+  }
+  let html = fs.readFileSync(indexPath, 'utf8');
+  html = html.split('{{PASSWORD}}').join(SERVER_PASSWORD);
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(html);
+}
+
 app.get('/', (req, res) => {
   const message = '[Server] Root path / was accessed.';
   console.log(message);
   appendToLogFile(message);
-  const indexPath = path.join(__dirname, 'public', 'index.html');
-  if (fs.existsSync(indexPath)) {
-    res.sendFile(indexPath);
-  } else {
-    const errMsg = 'index.html not found in public directory';
-    console.error(errMsg);
-    appendToLogFile(errMsg);
-    res.status(404).send(errMsg);
-  }
+  serveIndex(res);
 });
 
 app.get('/proxy/:encodedUrl', async (req, res) => {
@@ -92,10 +108,49 @@ app.get('/proxy/:encodedUrl', async (req, res) => {
       }
     };
 
+    // 域名形态检查挡不住「特殊写法」：十进制 IP（http://2130706433/ = 127.0.0.1）、
+    // 十六进制/八进制段、IPv6 映射地址（[::ffff:127.0.0.1]）都能骗过字符串匹配，
+    // DNS 重绑定也会在这里现形。所以最终以「解析出来的真实 IP」为准做放行判断。
+    const isPrivateIp = (ip) => {
+      if (net.isIPv4(ip)) {
+        const [a, b] = ip.split('.').map(Number);
+        return a === 0 || a === 10 || a === 127
+          || (a === 100 && b >= 64 && b <= 127)
+          || (a === 169 && b === 254)
+          || (a === 172 && b >= 16 && b <= 31)
+          || (a === 192 && b === 168);
+      }
+      const lower = ip.toLowerCase().replace(/^\[|\]$/g, '');
+      if (lower === '::' || lower === '::1') return true;
+      if (lower.startsWith('fe80') || lower.startsWith('fc') || lower.startsWith('fd')) return true;
+      // IPv4 映射/兼容地址（::ffff:127.0.0.1 等）
+      const v4mapped = lower.match(/(?:::ffff:|::)(\d+\.\d+\.\d+\.\d+)$/);
+      if (v4mapped) return isPrivateIp(v4mapped[1]);
+      return false;
+    };
+    const resolveTargetIps = async (urlString) => {
+      const hostname = new URL(urlString).hostname.replace(/^\[|\]$/g, '');
+      if (net.isIP(hostname)) return [hostname];
+      return new Promise((resolve) => {
+        dns.lookup(hostname, { all: true }, (err, addresses) => {
+          resolve(err ? [] : (addresses || []).map(item => item.address));
+        });
+      });
+    };
+
     if (!isValidUrl(targetUrl)) {
       const invalidUrlMsg = `[Proxy Server] Invalid URL attempted: ${targetUrl}`;
       console.error(invalidUrlMsg);
       appendToLogFile(invalidUrlMsg);
+      return res.status(400).send('Invalid URL');
+    }
+
+    // 以解析出的真实 IP 做最终裁决（防十进制/十六进制 IP、IPv6 映射、DNS 重绑定绕过）
+    const targetIps = await resolveTargetIps(targetUrl);
+    if (!targetIps.length || targetIps.some(ip => isPrivateIp(ip))) {
+      const blockedMsg = `[Proxy Server] Target resolves to private/unresolvable address, blocked: ${targetUrl} -> ${targetIps.join(',') || 'no-answer'}`;
+      console.error(blockedMsg);
+      appendToLogFile(blockedMsg);
       return res.status(400).send('Invalid URL');
     }
 

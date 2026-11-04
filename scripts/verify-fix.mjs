@@ -72,6 +72,7 @@ const AD_PATH_PATTERN = /(^|\\/)(ads?|adverts?|advertising|adcreative|adplayer|a
 const LEARNED_AD_HOSTS_KEY = 'learnedAdHosts';
 const PLAYLIST_MARKER_STATS_KEY = 'playlistMarkerStats';
 const rawPlaylistCache = new Map();
+const removedSegmentsByPlaylist = new Map();
 const RAW_PLAYLIST_CACHE_MAX = 4;
 let lastRawPlaylist = null;
 let lastRemovedSegmentIds = new Set();

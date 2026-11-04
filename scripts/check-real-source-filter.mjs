@@ -40,6 +40,7 @@ const names = ['isDiscontinuityLine','splitPlaylistBlocks','playlistHost','isAdS
   'getLearnedAdHosts','rememberAdHosts','recordAdFilterStats','filterByHostRules','isAdStartTag','isAdEndTag',
   'filterByStructure','filterAdsFromM3U8','parseRawPlaylist','playlistPathPrefix','segmentIdentity',
   'computeRemovedSegmentIds','finishFiltering','getRawPlaylist','rememberRawPlaylist','playlistCacheKey',
+  'rememberRemovedSegments','getRemovedSegmentIds','getRemovedSegmentUris',
   'findAdBlockIndexes'];
 
 vm.runInContext(PRELUDE + names.map(n => ex(handlerSrc, n)).join('\n'), ctx);

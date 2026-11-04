@@ -94,10 +94,17 @@
 
     // ---------- 自动识别广告块 ----------
 
+    // 当前播放清单的地址（hls 实例的清单地址优先）。取「被删分片名单」时必须
+    // 按这个地址去拿：同页可能有其它过滤在跑（如后台下载其它集），
+    // 全局「最近一次」的名单可能是别的清单的。
+    function currentPlaylistUrl() {
+        if (!art) return '';
+        return (art.hls && art.hls.url) || art.url || '';
+    }
+
     // 当前播放列表的原始结构（过滤前的清单，由 player_artplayer_handler.js 留存）
     function currentPlaylist() {
-        if (!art) return null;
-        const u = (art.hls && art.hls.url) || art.url || '';
+        const u = currentPlaylistUrl();
         if (!u || typeof getRawPlaylist !== 'function') return null;
         try {
             return getRawPlaylist(u);
@@ -117,7 +124,7 @@
         const playlist = currentPlaylist();
         if (!playlist) return null;
         const t = art && art.currentTime ? art.currentTime : 0;
-        const removed = (typeof getRemovedSegmentIds === 'function') ? getRemovedSegmentIds() : null;
+        const removed = (typeof getRemovedSegmentIds === 'function') ? getRemovedSegmentIds(currentPlaylistUrl()) : null;
         try {
             // 播放时间 → 原始时间：把已删除分片的时长加回去
             const originalTime = playbackToOriginalTime(playlist, t, removed);
@@ -367,7 +374,7 @@
         const playTime = Math.round((art.currentTime || 0) * 10) / 10;
         // 起点也换算成原始时间轴（与自动标记、与存储格式保持一致）
         const playlist = currentPlaylist();
-        const removed = (typeof getRemovedSegmentIds === 'function') ? getRemovedSegmentIds() : null;
+        const removed = (typeof getRemovedSegmentIds === 'function') ? getRemovedSegmentIds(currentPlaylistUrl()) : null;
         if (playlist && removed && removed.size) {
             pendingStart = playbackToOriginalTime(playlist, playTime, removed);
         } else {
@@ -395,7 +402,7 @@
         }
         // 手动标记的是播放时间轴，存之前换算成原始时间轴（与自动标记同一格式）
         const playlist = currentPlaylist();
-        const removed = (typeof getRemovedSegmentIds === 'function') ? getRemovedSegmentIds() : null;
+        const removed = (typeof getRemovedSegmentIds === 'function') ? getRemovedSegmentIds(currentPlaylistUrl()) : null;
         let e = playEnd;
         if (playlist && removed && removed.size) {
             e = playbackToOriginalTime(playlist, playEnd, removed);
@@ -448,7 +455,7 @@
         }
         if (!segs.length) return;
         const playlist = currentPlaylist();
-        const removed = (typeof getRemovedSegmentIds === 'function') ? getRemovedSegmentIds() : null;
+        const removed = (typeof getRemovedSegmentIds === 'function') ? getRemovedSegmentIds(currentPlaylistUrl()) : null;
         for (let i = 0; i < segs.length; i++) {
             const seg = segs[i];
             // 原始时间轴 → 播放时间轴
