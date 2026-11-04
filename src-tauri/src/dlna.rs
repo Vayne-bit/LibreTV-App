@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_fs::{FsExt, FilePath, OpenOptions};
 
 // ---------- 数据结构 ----------
 
@@ -1287,17 +1288,24 @@ pub struct LocalFileEntry {
     pub token: String,
 }
 
+// 本地文件引用：磁盘路径（桌面/部分 Android），或 Android SAF content:// URI
+enum LocalFileRef {
+    Disk(PathBuf),
+    // Android 文档选择器返回 content://，需经 tauri-plugin-fs 的 content resolver 取 fd 读取
+    Content(String),
+}
+
 struct LocalFileState {
     base: String,
-    files: HashMap<String, PathBuf>, // token -> 本机文件路径
+    files: HashMap<String, LocalFileRef>,
     port: u16,
 }
 
 static LOCAL_FILE: Lazy<Mutex<Option<LocalFileState>>> = Lazy::new(|| Mutex::new(None));
 
-/// 本机文件按扩展名给 MIME（投屏端校验 protocolInfo 用）。
-fn local_file_mime(path: &Path) -> &'static str {
-    let ext = path
+/// 按文件名/扩展名给 MIME（投屏端校验 protocolInfo 用）。
+fn local_file_mime_from_name(name: &str) -> &'static str {
+    let ext = Path::new(name)
         .extension()
         .and_then(|e| e.to_str())
         .map(|s| s.to_ascii_lowercase());
@@ -1315,28 +1323,66 @@ fn local_file_mime(path: &Path) -> &'static str {
     }
 }
 
+fn local_file_mime(path: &Path) -> &'static str {
+    local_file_mime_from_name(path.file_name().and_then(|f| f.to_str()).unwrap_or(""))
+}
+
+/// 从 content:// URI 中抽取一个带扩展名的文件名，用于 URL 暴露扩展名与 MIME 兜底。
+/// content URI 末段通常不含真实文件名，尽力提取；提取不到则默认 video.mp4（最兼容）。
+fn extract_fname_from_content_uri(uri: &str) -> String {
+    let decoded = uri.replace("%3A", ":").replace("%2F", "/");
+    if let Some(pos) = decoded.rfind('/') {
+        let last = &decoded[pos + 1..];
+        if last.contains('.') && last.len() > 3 {
+            return last.to_string();
+        }
+    }
+    // 退回：找 .ext 模式
+    if let Some(m) = uri.rfind('.') {
+        let ext = &uri[m + 1..];
+        if !ext.is_empty()
+            && ext.len() <= 4
+            && ext.len() >= 2
+            && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            return format!("video.{}", ext);
+        }
+    }
+    "video.mp4".to_string()
+}
+
 #[tauri::command]
 pub async fn start_local_file_server(
+    app: tauri::AppHandle,
     path: String,
     preferred_ip: Option<IpAddr>,
 ) -> Result<LocalFileEntry, String> {
-    let p = PathBuf::from(&path);
-    if !p.is_file() {
-        return Err(format!("文件不存在或不是普通文件: {}", path));
-    }
-    // URL 中保留文件名，让扩展名可见（投屏端据此分类 MIME）
-    let fname = p
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or("video.mp4")
-        .to_string();
-    ensure_local_file_server(preferred_ip).await?;
+    // Android 文档选择器返回 content:// URI，桌面返回 file:// 或普通路径。
+    let is_content = path.starts_with("content://");
+    let (ref_entry, fname) = if is_content {
+        (
+            LocalFileRef::Content(path.clone()),
+            extract_fname_from_content_uri(&path),
+        )
+    } else {
+        let p = PathBuf::from(&path);
+        if !p.is_file() {
+            return Err(format!("文件不存在或不是普通文件: {}", path));
+        }
+        let fname = p
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("video.mp4")
+            .to_string();
+        (LocalFileRef::Disk(p), fname)
+    };
+    ensure_local_file_server(app.clone(), preferred_ip).await?;
     let token = generate_session_token();
     let (url, loopback_url) = {
         let mut guard = LOCAL_FILE.lock().unwrap();
         match guard.as_mut() {
             Some(state) => {
-                state.files.insert(token.clone(), p.clone());
+                state.files.insert(token.clone(), ref_entry);
                 (
                     format!("{}/l/{}/{}", state.base, token, fname),
                     format!("http://127.0.0.1:{}/l/{}/{}", state.port, token, fname),
@@ -1374,11 +1420,15 @@ pub async fn pick_local_video(app: tauri::AppHandle) -> Result<Option<String>, S
     })
     .await
     .map_err(|e| format!("文件选择任务失败: {}", e))?;
-    // FilePath 可能是 Path(PathBuf) 或 Url(file:// 等)；用 into_path() 统一转为
-    // 真实 PathBuf（Url 走 Url::to_file_path），再转字符串供本地文件服务打开。
-    Ok(path
-        .and_then(|p| p.into_path().ok())
-        .map(|pb| pb.to_string_lossy().to_string()))
+    // 返回原始标识：桌面 Path 或 Url(file://) 转真实路径；Android Url(content://) 原样保留，
+    // 交给 start_local_file_server 按 content:// 走 fs 插件 content resolver 读取。
+    Ok(path.map(|p| match p {
+        FilePath::Path(pb) => pb.to_string_lossy().to_string(),
+        FilePath::Url(u) => u
+            .to_file_path()
+            .map(|pb| pb.to_string_lossy().to_string())
+            .unwrap_or_else(|_| u.to_string()),
+    }))
 }
 
 // ---------- 可配置 VIP 解析 ----------
@@ -1654,7 +1704,10 @@ pub async fn cast_to_airplay(base_url: String, video_url: String) -> Result<(), 
     }
 }
 
-async fn ensure_local_file_server(preferred_ip: Option<IpAddr>) -> Result<(), String> {
+async fn ensure_local_file_server(
+    app: tauri::AppHandle,
+    preferred_ip: Option<IpAddr>,
+) -> Result<(), String> {
     if LOCAL_FILE.lock().unwrap().is_some() {
         return Ok(());
     }
@@ -1687,8 +1740,9 @@ async fn ensure_local_file_server(preferred_ip: Option<IpAddr>) -> Result<(), St
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
+                    let app = app.clone();
                     tauri::async_runtime::spawn(async move {
-                        let _ = handle_local_file_conn(stream).await;
+                        let _ = handle_local_file_conn(stream, app).await;
                     });
                 }
                 Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
@@ -1698,7 +1752,10 @@ async fn ensure_local_file_server(preferred_ip: Option<IpAddr>) -> Result<(), St
     Ok(())
 }
 
-async fn handle_local_file_conn(mut stream: tokio::net::TcpStream) -> Result<(), String> {
+async fn handle_local_file_conn(
+    mut stream: tokio::net::TcpStream,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
     // 读请求头（最多 16KB），与代理连接同范式
     let mut buffer = vec![0u8; 16384];
     let mut received = 0usize;
@@ -1739,30 +1796,69 @@ async fn handle_local_file_conn(mut stream: tokio::net::TcpStream) -> Result<(),
         return Ok(());
     }
     let token = segs[1];
-    let file_path: Option<PathBuf> = {
+    let entry: Option<LocalFileRef> = {
         let guard = LOCAL_FILE.lock().unwrap();
         guard.as_ref().and_then(|s| s.files.get(token)).cloned()
     };
-    let file_path = match file_path {
-        Some(p) => p,
+    let entry = match entry {
+        Some(e) => e,
         None => {
             write_status(&mut stream, "404 Not Found", b"not found").await;
             return Ok(());
         }
     };
-    let meta = match tokio::fs::metadata(&file_path).await {
-        Ok(m) => m,
-        Err(_) => {
-            write_status(&mut stream, "404 Not Found", b"not found").await;
-            return Ok(());
+    // 打开文件：桌面/部分 Android 走磁盘 Path；Android SAF 走 content://（fs 插件取 fd）
+    let (mut file, total, mime) = match entry {
+        LocalFileRef::Disk(p) => {
+            let meta = match tokio::fs::metadata(&p).await {
+                Ok(m) => m,
+                Err(_) => {
+                    write_status(&mut stream, "404 Not Found", b"not found").await;
+                    return Ok(());
+                }
+            };
+            if meta.is_dir() {
+                write_status(&mut stream, "404 Not Found", b"not found").await;
+                return Ok(());
+            }
+            let total = meta.len();
+            let mime = local_file_mime(&p);
+            let f = match tokio::fs::File::open(&p).await {
+                Ok(f) => f,
+                Err(_) => {
+                    write_status(&mut stream, "404 Not Found", b"not found").await;
+                    return Ok(());
+                }
+            };
+            (f, total, mime)
+        }
+        LocalFileRef::Content(uri) => {
+            let fname = extract_fname_from_content_uri(&uri);
+            let mime = local_file_mime_from_name(&fname);
+            // content:// 经 fs 插件 content resolver 取文件描述符，包装成可 seek 的异步文件
+            let fp: FilePath = uri.parse().unwrap();
+            let app2 = app.clone();
+            let std_file = match tauri::async_runtime::spawn_blocking(move || {
+                app2.fs().open(fp, OpenOptions::new().read(true))
+            })
+            .await
+            {
+                Ok(Ok(f)) => f,
+                _ => {
+                    write_status(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        b"open content uri failed",
+                    )
+                    .await;
+                    return Ok(());
+                }
+            };
+            let mut f = tokio::fs::File::from_std(std_file);
+            let total = f.metadata().await.map(|m| m.len()).unwrap_or(0);
+            (f, total, mime)
         }
     };
-    if meta.is_dir() {
-        write_status(&mut stream, "404 Not Found", b"not found").await;
-        return Ok(());
-    }
-    let total = meta.len();
-    let mime = local_file_mime(&file_path);
 
     // 渲染端可达性 + DLNA 合规探测：HEAD 也需要正确的 DLNA 头
     if method == "HEAD" {
@@ -1817,13 +1913,6 @@ transferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nConnection: 
         _ => (0, total.saturating_sub(1), "200 OK", String::new()),
     };
     let len = end - start + 1;
-    let mut file = match tokio::fs::File::open(&file_path).await {
-        Ok(f) => f,
-        Err(_) => {
-            write_status(&mut stream, "404 Not Found", b"not found").await;
-            return Ok(());
-        }
-    };
     if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
         write_status(&mut stream, "500 Internal Server Error", b"seek failed").await;
         return Ok(());
