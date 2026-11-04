@@ -340,26 +340,28 @@ function buildPlayerSettings() {
                 return '投屏诊断';
             }
         });
-        // 本地视频投屏：系统文件选择器 → 选设备 → 起本地文件服务投屏
+        // 本地视频播放：系统文件选择器 → 本机起服务 → 在 App 内直接播放；
+        // 投屏复用本菜单里的「投屏到电视」，无需在此重复投屏逻辑
         items.push({
             name: 'local-video',
-            html: '本地视频投屏',
+            html: '本地视频播放',
             width: 200,
             tooltip: '本地文件',
             onClick() {
-                PlayerCast.pickAndCastLocalVideo(art);
-                return '本地视频投屏';
+                PlayerCast.pickAndPlayLocalVideo(art);
+                return '本地视频播放';
             }
         });
-        // VIP 解析投屏：粘贴视频页面 URL，用可配置解析接口取回可播地址后播放并投屏
+        // VIP 解析播放：粘贴 VIP 视频页面 URL（用可配置解析接口取回可播地址），
+        // 或输入关键词检索资源站结果；都只在 App 内播放，投屏复用「投屏到电视」
         items.push({
             name: 'vip-resolve',
-            html: 'VIP 解析投屏',
+            html: 'VIP 解析播放',
             width: 200,
-            tooltip: '解析',
+            tooltip: '解析/搜索',
             onClick() {
-                PlayerCast.openResolveDialog(art);
-                return 'VIP 解析投屏';
+                PlayerCast.openResolvePlay(art);
+                return 'VIP 解析播放';
             }
         });
     }

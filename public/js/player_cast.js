@@ -396,8 +396,9 @@
         }
     }
 
-    // 本地视频：系统文件选择器 → 选设备 → 起本地文件服务投屏
-    async function pickAndCastLocalVideo(art) {
+    // 本地视频播放：系统文件选择器 → 本机起 HTTP 服务 → 直接用回环地址在 App 内播放
+    // （不在此投屏；投屏交给菜单里的「投屏到电视」，当前视频源已就绪即可直接投）
+    async function pickAndPlayLocalVideo(art) {
         activeArt = art || activeArt;
         if (!isTauri() || typeof tauriInvoke !== 'function') {
             notice(activeArt, '本地视频仅限 App 内使用');
@@ -411,12 +412,22 @@
             return;
         }
         if (!path) return; // 用户取消
-        notice(activeArt, '已选择本地文件，正在搜索可投屏设备...');
-        chooseDeviceThenCast(null, null, false, path);
+        notice(activeArt, '已选择本地文件，正在本机准备播放...');
+        // 本机播放走回环地址；preferredIp 传 null 让服务自己选 LAN 地址（电视投屏时才需要）
+        tauriInvoke('start_local_file_server', { path: path, preferredIp: null }).then(function (entry) {
+            if (activeArt && activeArt.switchUrl) {
+                try { activeArt.switchUrl(entry.loopback_url); } catch (e) { /* 不支持切换则忽略 */ }
+            }
+            notice(activeArt, '正在本机播放：' + (entry.name || path));
+        }).catch(function (e) {
+            notice(activeArt, '本地视频服务失败：' + errMsg(e));
+        });
     }
 
-    // 可配置 VIP 解析：粘贴页面 URL → 解析站取回可播 m3u8/mp4 → 本机播放并投屏
-    function openResolveDialog(art) {
+    // VIP 解析播放：一个入口同时支持两种用法（都只在 App 内播放；投屏复用「投屏到电视」）
+    //  · 粘贴 VIP 视频页面 URL → 用可配置解析接口取回可播地址 → 本机播放
+    //  · 输入关键词 → 复用现有资源站聚合搜索列出结果 → 点选 → 取详情首集 → 本机播放
+    function openResolvePlay(art) {
         activeArt = art || activeArt;
         if (!isTauri() || typeof tauriInvoke !== 'function') {
             notice(activeArt, '解析仅限 App 内使用');
@@ -430,43 +441,195 @@
         overlay.id = 'vip-resolve-dialog';
         overlay.style.cssText = 'position:fixed;inset:0;z-index:100001;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;';
         overlay.innerHTML =
-            '<div style="background:#1e1e1e;color:#eee;border-radius:12px;padding:18px;width:min(420px,90vw);">' +
-            '<div style="font-size:15px;margin-bottom:12px;">VIP 视频解析</div>' +
-            '<div style="font-size:12px;opacity:.6;margin-bottom:4px;">视频页面 URL（爱奇艺/腾讯/优酷等）</div>' +
-            '<input id="vip-page-url" style="width:100%;box-sizing:border-box;padding:8px;margin-bottom:10px;background:#2b2b2b;color:#eee;border:1px solid #3a3a3a;border-radius:8px;font-size:13px;" placeholder="https://..." />' +
-            '<div style="font-size:12px;opacity:.6;margin-bottom:4px;">解析接口（可配置，建议自建/可信源）</div>' +
-            '<input id="vip-api-base" value="' + savedApi + '" style="width:100%;box-sizing:border-box;padding:8px;margin-bottom:14px;background:#2b2b2b;color:#eee;border:1px solid #3a3a3a;border-radius:8px;font-size:13px;" placeholder="jx.xmflv.com" />' +
-            '<div style="display:flex;gap:8px;">' +
-            '<button id="vip-resolve-go" style="flex:1;padding:9px;background:#2563eb;color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer;">解析并投屏</button>' +
+            '<div style="background:#1e1e1e;color:#eee;border-radius:12px;padding:18px;width:min(440px,92vw);max-height:88vh;overflow:auto;">' +
+            '<div style="font-size:15px;margin-bottom:4px;">VIP 解析播放</div>' +
+            '<div style="font-size:12px;opacity:.6;margin-bottom:10px;">粘贴 VIP 页面 URL，或输入片名关键词检索</div>' +
+            '<input id="vip-input" style="width:100%;box-sizing:border-box;padding:9px;margin-bottom:8px;background:#2b2b2b;color:#eee;border:1px solid #3a3a3a;border-radius:8px;font-size:13px;" placeholder="https://... 或 片名关键词" />' +
+            '<div id="vip-api-row" style="margin-bottom:12px;">' +
+            '<div style="font-size:12px;opacity:.6;margin-bottom:4px;">解析接口（仅 URL 模式需要，可配置）</div>' +
+            '<input id="vip-api-base" value="' + savedApi + '" style="width:100%;box-sizing:border-box;padding:8px;background:#2b2b2b;color:#eee;border:1px solid #3a3a3a;border-radius:8px;font-size:13px;" placeholder="jx.xmflv.com" />' +
+            '</div>' +
+            '<div style="display:flex;gap:8px;margin-bottom:10px;">' +
+            '<button id="vip-resolve-go" style="flex:1;padding:9px;background:#2563eb;color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer;">播放</button>' +
             '<button id="vip-resolve-cancel" style="padding:9px;background:transparent;color:#999;border:none;font-size:13px;cursor:pointer;">取消</button>' +
-            '</div></div>';
+            '</div>' +
+            '<div id="vip-results" style="display:none;"></div>' +
+            '</div>';
         overlay.onclick = function (event) { if (event.target === overlay) removeResolveDialog(); };
         document.body.appendChild(overlay);
         const goBtn = overlay.querySelector('#vip-resolve-go');
         const cancelBtn = overlay.querySelector('#vip-resolve-cancel');
-        const pageInput = overlay.querySelector('#vip-page-url');
+        const input = overlay.querySelector('#vip-input');
         const apiInput = overlay.querySelector('#vip-api-base');
+        const apiRow = overlay.querySelector('#vip-api-row');
+        const resultsBox = overlay.querySelector('#vip-results');
         if (cancelBtn) cancelBtn.onclick = removeResolveDialog;
+        if (input) setTimeout(function () { try { input.focus(); } catch (e) {} }, 50);
         if (goBtn) goBtn.onclick = function () {
-            const pageUrl = (pageInput && pageInput.value || '').trim();
-            const apiBase = (apiInput && apiInput.value || '').trim();
-            if (!pageUrl) { notice(activeArt, '请先粘贴视频页面 URL'); return; }
-            if (!apiBase) { notice(activeArt, '请填写解析接口'); return; }
-            try { localStorage.setItem('vipApiBase', apiBase); } catch (e) {}
-            removeResolveDialog();
-            notice(activeArt, '正在解析「' + pageUrl + '」...');
-            tauriInvoke('resolve_vip_url', { pageUrl: pageUrl, apiBase: apiBase }).then(function (res) {
-                if (!res || !res.url) { notice(activeArt, '解析未返回可播地址'); return; }
-                // 本机先用解析地址播放，再直接投屏（解析站作为 referer 便于电视端代理取流）
-                if (activeArt && activeArt.switchUrl) {
-                    try { activeArt.switchUrl(res.url); } catch (e) {}
-                }
-                notice(activeArt, '解析成功，已本机播放；正在搜索可投屏设备...');
-                chooseDeviceThenCast(res.url, hostOf(apiBase), false, null);
-            }).catch(function (e) {
-                notice(activeArt, '解析失败：' + errMsg(e));
-            });
+            const q = (input && input.value || '').trim();
+            if (!q) { notice(activeArt, '请输入 URL 或关键词'); return; }
+            const isUrl = /^https?:\/\//i.test(q);
+            if (isUrl) {
+                // URL 模式：外部解析接口取回可播地址
+                const apiBase = (apiInput && apiInput.value || '').trim() || savedApi;
+                try { localStorage.setItem('vipApiBase', apiBase); } catch (e) {}
+                removeResolveDialog();
+                notice(activeArt, '正在解析「' + q + '」...');
+                tauriInvoke('resolve_vip_url', { pageUrl: q, apiBase: apiBase }).then(function (res) {
+                    if (!res || !res.url) { notice(activeArt, '解析未返回可播地址'); return; }
+                    if (activeArt && activeArt.switchUrl) {
+                        try { activeArt.switchUrl(res.url); } catch (e) {}
+                    }
+                    notice(activeArt, '解析成功，正在本机播放；需要投屏请点齿轮菜单「投屏到电视」');
+                }).catch(function (e) {
+                    notice(activeArt, '解析失败：' + errMsg(e));
+                });
+            } else {
+                // 关键词模式：复用现有资源站聚合搜索，列表点选后取详情首集播放
+                if (apiRow) apiRow.style.display = 'none';
+                if (goBtn) { goBtn.disabled = true; goBtn.textContent = '搜索中...'; }
+                vipSearchKeyword(q).then(function (list) {
+                    if (goBtn) { goBtn.disabled = false; goBtn.textContent = '重新搜索'; }
+                    if (!list || list.length === 0) {
+                        resultsBox.style.display = 'block';
+                        resultsBox.innerHTML = '<div style="font-size:13px;opacity:.7;padding:8px 2px;">未检索到结果，换个关键词试试</div>';
+                        return;
+                    }
+                    vipRenderResults(resultsBox, list);
+                }).catch(function (e) {
+                    if (goBtn) { goBtn.disabled = false; goBtn.textContent = '重新搜索'; }
+                    notice(activeArt, '检索失败：' + errMsg(e));
+                });
+            }
         };
+    }
+
+    // 复用后端 search_videos 在资源站中按关键词聚合检索（与首页搜索同源，不重造轮子）
+    async function vipSearchKeyword(keyword) {
+        const sources = Object.keys(API_SITES || {}).filter(function (k) {
+            if (k === 'testSource') return false;
+            return !(API_SITES[k] && API_SITES[k].adult);
+        });
+        const tasks = sources.map(function (src) {
+            return tauriInvoke('search_videos', { query: keyword, sourceId: src, customApiUrl: null })
+                .then(function (raw) {
+                    let data;
+                    try { data = JSON.parse(raw); } catch (e) { return []; }
+                    const list = (data && Array.isArray(data.list)) ? data.list : [];
+                    list.forEach(function (it) {
+                        it.source_code = src;
+                        it.source_name = (API_SITES[src] && API_SITES[src].name) || src;
+                    });
+                    return list;
+                })
+                .catch(function () { return []; });
+        });
+        const all = await Promise.all(tasks);
+        const merged = [];
+        const seen = {};
+        all.forEach(function (arr) {
+            arr.forEach(function (it) {
+                const key = (it.vod_name || '') + '|' + (it.vod_id || '');
+                if (seen[key]) return;
+                seen[key] = true;
+                merged.push(it);
+            });
+        });
+        return merged.slice(0, 40);
+    }
+
+    // 把检索结果渲染成可点选列表
+    function vipRenderResults(box, list) {
+        box.style.display = 'block';
+        box.innerHTML = '<div style="font-size:12px;opacity:.6;margin-bottom:8px;">共 ' + list.length + ' 条，点击即播放</div>';
+        list.forEach(function (it) {
+            const card = document.createElement('div');
+            const safeName = (typeof escapeHtml === 'function' ? escapeHtml(it.vod_name || '未命名') : (it.vod_name || '未命名'));
+            const safeSrc = (typeof escapeHtml === 'function' ? escapeHtml(it.source_name || '') : (it.source_name || ''));
+            const remarks = it.vod_remarks ? (typeof escapeHtml === 'function' ? escapeHtml(String(it.vod_remarks)) : String(it.vod_remarks)) : '';
+            card.style.cssText = 'display:flex;gap:10px;align-items:center;padding:8px;margin:4px 0;background:#2b2b2b;border:1px solid #3a3a3a;border-radius:8px;cursor:pointer;';
+            const pic = (it.vod_pic && /^https?:\/\//.test(it.vod_pic))
+                ? '<img src="' + it.vod_pic + '" style="width:46px;height:62px;object-fit:cover;border-radius:4px;flex:none;" onerror="this.style.display=\'none\'" />'
+                : '<div style="width:46px;height:62px;background:#333;border-radius:4px;flex:none;"></div>';
+            card.innerHTML = pic +
+                '<div style="min-width:0;flex:1;">' +
+                '<div style="font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + safeName + '</div>' +
+                '<div style="font-size:11px;opacity:.6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + safeSrc + (remarks ? ' · ' + remarks : '') + '</div>' +
+                '</div>';
+            card.onclick = function () {
+                removeResolveDialog();
+                vipPlayResult(it);
+            };
+            box.appendChild(card);
+        });
+    }
+
+    // 取某条结果的详情，解析出首个可播地址并播放（JSON 源走 videolist；ffzy/heimuer 走 HTML 抓取）
+    function vipPlayResult(item) {
+        const id = item.vod_id;
+        const src = item.source_code;
+        if (!id) { notice(activeArt, '该结果缺少视频 ID，无法播放'); return; }
+        notice(activeArt, '正在获取「' + (item.vod_name || '') + '」播放地址...');
+        vipFetchDetail(src, String(id)).then(function (episodes) {
+            const url = (episodes || []).find(function (u) { return /^https?:\/\//.test(u); });
+            if (!url) { notice(activeArt, '未解析到可播地址'); return; }
+            if (activeArt && activeArt.switchUrl) {
+                try { activeArt.switchUrl(url); } catch (e) {}
+            }
+            notice(activeArt, '正在本机播放；需要投屏请点齿轮菜单「投屏到电视」');
+        }).catch(function (e) {
+            notice(activeArt, '获取播放地址失败：' + errMsg(e));
+        });
+    }
+
+    // 取详情：JSON 源走 videolist 解析 vod_play_url；ffzy/heimuer 走 HTML 抓取 m3u8
+    async function vipFetchDetail(src, id) {
+        const isHtml = (src === 'ffzy' || src === 'heimuer');
+        let url;
+        if (isHtml) {
+            const base = (API_SITES[src] && API_SITES[src].detail) || (API_SITES[src] && API_SITES[src].api);
+            url = base + '/index.php/vod/detail/id/' + id + '.html';
+        } else {
+            const base = (API_SITES[src] && API_SITES[src].api) || '';
+            url = base + (API_CONFIG.detail && API_CONFIG.detail.path || '/api.php/provide/vod/?ac=videolist&ids=') + id;
+        }
+        const opts = {
+            url: url,
+            method: 'GET',
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36' },
+            timeout_secs: 15,
+            response_as_text: true
+        };
+        const resp = await tauriInvoke('make_http_request', { options: opts });
+        if (!resp || !(resp.status >= 200 && resp.status < 300)) {
+            throw new Error('详情请求失败：' + (resp && resp.status));
+        }
+        const body = resp.body || '';
+        if (isHtml) {
+            let matches = [];
+            if (src === 'ffzy') matches = body.match(/\$(https?:\/\/[^"'\s]+?\/\d{8}\/\d+_[a-f0-9]+\/index\.m3u8)/g) || [];
+            if (matches.length === 0) matches = body.match(/\$(https?:\/\/[^"'\s]+?\.m3u8)/g) || [];
+            const uniq = [];
+            const set = {};
+            matches.forEach(function (m) {
+                let link = m.substring(1);
+                const p = link.indexOf('(');
+                if (p > 0) link = link.substring(0, p);
+                if (!set[link]) { set[link] = true; uniq.push(link); }
+            });
+            return uniq;
+        }
+        // JSON：vod_play_url -> $$$ 分线路 -> # 分集 -> $ 取第二段
+        let data;
+        try { data = JSON.parse(body); } catch (e) { return []; }
+        const detail = (data && data.list && data.list[0]) || {};
+        const play = detail.vod_play_url || '';
+        if (!play) return [];
+        const firstSource = play.split('$$$')[0] || '';
+        return firstSource.split('#').map(function (ep) {
+            const parts = ep.split('$');
+            return parts.length > 1 ? parts[1] : '';
+        }).filter(function (u) { return u && /^https?:\/\//.test(u); });
     }
 
     function removeResolveDialog() {
@@ -591,8 +754,8 @@
         init: loadCastSdk,
         toggle: toggle,
         toggleDlna: toggleDlna,
-        pickAndCastLocalVideo: pickAndCastLocalVideo,
-        openResolveDialog: openResolveDialog,
+        pickAndPlayLocalVideo: pickAndPlayLocalVideo,
+        openResolvePlay: openResolvePlay,
         stopDlna: stopDlna,
         runDiagnostics: runDiagnostics,
         icon: CAST_ICON,
