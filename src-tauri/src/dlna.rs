@@ -2980,6 +2980,12 @@ async fn fetch_segment_cached(seg: String, upstream: Arc<Upstream>) -> Result<Ve
     if let Some(data) = pop_prime_segment(&seg) {
         return Ok(data);
     }
+    // 会话级分片数据缓存：跨重连复用已下载分片（VOD 分片不可变，URL 全局唯一）
+    if let Ok(map) = TS_SEGMENT_CACHE.lock() {
+        if let Some(data) = map.get(&seg) {
+            return Ok(data.clone());
+        }
+    }
     let mut fetched = fetch_segment_bytes(&seg, &upstream).await;
     for _ in 0..SEGMENT_FETCH_RETRIES {
         if fetched.is_ok() {
@@ -2987,6 +2993,12 @@ async fn fetch_segment_cached(seg: String, upstream: Arc<Upstream>) -> Result<Ve
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
         fetched = fetch_segment_bytes(&seg, &upstream).await;
+    }
+    // 写入会话缓存：电视重连后同一分片不再重复请求 CDN
+    if let Ok(data) = &fetched {
+        if let Ok(mut map) = TS_SEGMENT_CACHE.lock() {
+            map.insert(seg.clone(), data.clone());
+        }
     }
     fetched
 }
@@ -3011,11 +3023,35 @@ struct TsStreamState {
     connections: u32,
     resume_hits: u32,
     started_at: Option<std::time::Instant>, // 会话首次连接时刻（供给速率分母）
+    // ---- 跨重连缓存（VOD 清单不变，重连时无需重新请求 CDN）----
+    media_url: String,           // 已解析的媒体清单地址
+    segments: Vec<String>,       // 完整有序分片列表
+    endlist: bool,               // VOD 标记
 }
 
 static TS_STREAM_STATES: Lazy<Mutex<HashMap<String, TsStreamState>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 const TS_STREAM_STATE_MAX: usize = 4;
+
+/// 会话级分片数据缓存：跨重连复用已下载的分片字节。
+/// 电视重连时从断点续传，锚点分片的剩余部分需要重发——
+/// 如果缓存里有就不用重新请求 CDN（弱 CDN 路径上省 2~18 秒）。
+/// 按 token 分键，总量上限 16MB（LRU 淘汰最旧分片）。
+static TS_SEGMENT_CACHE: Lazy<Mutex<HashMap<String, Vec<u8>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+const TS_SEGMENT_CACHE_MAX_BYTES: usize = 16 * 1000 * 1000;
+
+fn ts_seg_cache_evict(map: &mut HashMap<String, Vec<u8>>) {
+    let total: usize = map.values().map(|d| d.len()).sum();
+    if total <= TS_SEGMENT_CACHE_MAX_BYTES { return; }
+    // 淘汰最早插入的（HashMap 无序，用 drain 逐个移除直到够小）
+    let keys: Vec<String> = map.keys().cloned().collect();
+    let mut removed = 0usize;
+    for key in keys {
+        if total - removed <= TS_SEGMENT_CACHE_MAX_BYTES { break; }
+        if let Some(d) = map.remove(&key) { removed += d.len(); }
+    }
+}
 
 fn ts_state_touch(token: &str) -> Option<TsStreamState> {
     let mut map = TS_STREAM_STATES.lock().ok()?;
@@ -3082,10 +3118,28 @@ async fn serve_live_ts(
     // 结果是电视连上来后一个字节都收不到，只能无限转圈：
     // 用户看不到错因，投屏梯度也不会落到下一档。
     let prepared = async {
+        // VOD 会话缓存：电视重连时不再重新请求 CDN 解析清单。
+        // 每轮 resolve+fetch 是 2 次 CDN 往返，弱 CDN 路径上耗时 4~18s，
+        // 重连 10 次浪费 40~180s——缓存后重连立即开始取流。
+        if let Some(st) = TS_STREAM_STATES.lock().ok().and_then(|m| m.get(&token).cloned()) {
+            if st.endlist && !st.media_url.is_empty() && !st.segments.is_empty() {
+                return Ok((st.media_url.clone(), st.segments.clone(), st.endlist));
+            }
+        }
         let media_url = resolve_media_playlist(&target, &upstream).await?;
         let (pending, endlist) = fetch_media_playlist(&media_url, &upstream).await?;
         if pending.is_empty() {
             return Err("媒体清单里没有可用分片".to_string());
+        }
+        // 缓存到会话状态（仅 VOD：直播清单会变，不缓存）
+        if endlist {
+            if let Ok(mut map) = TS_STREAM_STATES.lock() {
+                if let Some(st) = map.get_mut(&token) {
+                    st.media_url = media_url.clone();
+                    st.segments = pending.clone();
+                    st.endlist = endlist;
+                }
+            }
         }
         Ok((media_url, pending, endlist))
     }
