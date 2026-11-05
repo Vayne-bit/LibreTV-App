@@ -3380,13 +3380,12 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
     // 单连接串行时，任一分片的下载慢都会直接饿死电视缓冲（转圈）；
     // 并行预取把有效供给拉回多连接水平（与浏览器里 hls.js 的行为一致）。
     let mut pending: std::collections::VecDeque<String> = pending.into_iter().collect();
-    // AbortOnDrop：serve_live_ts 无论从哪条路径返回（电视断开/错误/播完），
-    // 未完成的预取任务都随 inflight 的 drop 自动取消——
-    // 否则旧连接的最多 6 个下载继续占带宽，新连接又开 6 个抓同样的分片，
-    // 12 次连接的带宽就这样被自己瓜分（外部审查实证）。
-    // 在途预取：不再随连接结束而取消（1.5.7 的 AbortOnDrop 会把正下到一半的
-    // 锚点分片一起杀掉，下一连接从 0 重下——电视连接耐心短于重下耗时时形成
-    // 活锁，真机 33.0MB 冻结实证）。改为连接结束时移交进会话孤儿池（见循环后）。
+    // 在途预取的生命周期 = 会话，不是连接（1.5.8）。1.5.7 的 AbortOnDrop 随连接
+    // 结束取消全部在途任务，初衷是防止「旧连接的 6 个下载 + 新连接的 6 个下载」
+    // 瓜分带宽；但真机实证它杀死了正下到一半的锚点分片——下一连接从 0 重下，
+    // 电视单次连接的耐心短于重下耗时 → 活锁（total_bytes 冻结在 33.0MB、82 次
+    // 连接、无错误无超时）。现在连接结束时把剩余任务移交进会话孤儿池，
+    // 带宽收口点改为：池替换 / 会话重置 / 会话淘汰 / 开新投屏。
     let mut reattach_count: u32 = 0; // 本连接从孤儿池继承的在途下载数（诊断用）
     let mut orphan_pool: HashMap<String, tokio::task::JoinHandle<Result<Vec<u8>, String>>> =
         TS_STREAM_STATES
