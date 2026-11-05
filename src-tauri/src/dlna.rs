@@ -158,24 +158,29 @@ static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
 /// 背景：沙箱环境禁止编译产物直连外网（connect 一律 os error 10013），
 /// 多源端到端模拟用「Node 镜像回环」替代出网传输层——master 跟随、相对地址
 /// 解析、分片拉取、TS 拼接等被测逻辑全部照旧真实。生产构建此函数是空操作。
-#[cfg(not(test))]
-fn mirror_url(url: &str) -> &str {
-    url
-}
-
-#[cfg(test)]
 fn mirror_url(url: &str) -> String {
-    let mirror = match std::env::var("CAST_MIRROR_BASE") {
-        Ok(base) if !base.trim().is_empty() => base,
-        _ => return url.to_string(),
-    };
-    if url.starts_with("http://127.0.0.1")
-        || url.starts_with("http://localhost")
-        || !(url.starts_with("http://") || url.starts_with("https://"))
+    // 生产构建：原样返回（空操作）。测试构建：CAST_MIRROR_BASE 设置时把
+    // 上游 URL 改写到本机镜像（沙箱禁外联，见函数上方注释）。
+    // 用 cfg 块而非成对函数——成对的 #[cfg(test)] fn 会触发孤儿属性守卫。
+    #[cfg(not(test))]
     {
-        return url.to_string();
+        url.to_string() // 生产：原样返回（空操作）
     }
-    format!("{}/{}", mirror.trim_end_matches('/'), url)
+    #[allow(unreachable_code)]
+    #[cfg(test)]
+    {
+        let mirror = match std::env::var("CAST_MIRROR_BASE") {
+            Ok(base) if !base.trim().is_empty() => base,
+            _ => return url.to_string(),
+        };
+        if url.starts_with("http://127.0.0.1")
+            || url.starts_with("http://localhost")
+            || !(url.starts_with("http://") || url.starts_with("https://"))
+        {
+            return url.to_string();
+        }
+        format!("{}/{}", mirror.trim_end_matches('/'), url)
+    }
 }
 
 // ---------- Tauri 命令 ----------
@@ -1666,12 +1671,10 @@ async fn start_stream_proxy(
         is_samsung: samsung,
         ad_uris,
     });
-    #[cfg(test)]
     tauri::async_runtime::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, _peer)) => {
-                    #[cfg(test)]
                     let upstream = upstream.clone();
                     tauri::async_runtime::spawn(async move {
                         if let Err(e) = handle_proxy_conn(stream, upstream).await {
@@ -2199,8 +2202,7 @@ async fn handle_local_file_conn(
             .read(&mut buffer[received..])
             .await
             .map_err(|e| format!("读取请求失败: {}", e))?;
-        #[cfg(test)]
-            if n == 0 {
+        if n == 0 {
             break;
         }
         received += n;
@@ -2412,8 +2414,7 @@ async fn handle_proxy_conn(mut stream: tokio::net::TcpStream, upstream: Arc<Upst
             .read(&mut buffer[received..])
             .await
             .map_err(|e| format!("读取请求失败: {}", e))?;
-        #[cfg(test)]
-            if n == 0 {
+        if n == 0 {
             break;
         }
         received += n;
@@ -4863,6 +4864,140 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         let _ = server3.await;
         let body3 = &stream3[stream3.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(0)..];
         assert_eq!(body3, &full[..], "无 Range 重连应从头完整下发");
+    }
+
+    /// 源码级守卫：生产代码里不允许出现「孤儿 #[cfg(test)]」（后面跟的不是 println）。
+    /// 背景：清理调试探针时两次留下孤儿属性——release 构建把属性附着的下一条
+    /// 语句整个剥除：一次剥掉了 let mut buffer（v1.5.1 CI 双端编译失败），
+    /// 一次剥掉了代理 accept 循环的 spawn（v1.5.2 代理全盲，电视 716）。
+    /// 这类错误 debug/test 构建全绿、编译也不报错，只有源码审查能拦住。
+    #[test]
+    fn no_dangling_cfg_test_attributes() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let src = std::fs::read_to_string(format!("{}/src/dlna.rs", manifest))
+            .expect("读取 dlna.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        // 测试模块（mod tests / mod cast_e2e）内部合法，不受限
+        let tests_start = lines
+            .iter()
+            .position(|l| l.contains("mod tests {"))
+            .expect("找不到测试模块");
+        let mut problems = Vec::new();
+        for i in 0..tests_start {
+            if lines[i].trim() == "#[cfg(test)]" {
+                let next = lines.get(i + 1).map(|l| l.trim()).unwrap_or("");
+                // 合法形态：调试 println、mod 声明、与 #[cfg(not(test))] 的成对函数变体
+                let prev_pair = i > 0 && lines[i - 1].contains("cfg(not(test))");
+                let allowed = next.starts_with("println!")
+                    || next.starts_with("mod ")
+                    || next.starts_with('{')  // cfg 块：属性只作用于花括号内部，安全
+                    || prev_pair;
+                if !allowed {
+                    problems.push(format!("行 {}: #[cfg(test)] 后跟的是「{}」", i + 1, next));
+                }
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "生产代码存在孤儿 #[cfg(test)]（release 会剥除其下一条语句）:\n{}",
+            problems.join("\n")
+        );
+    }
+
+    /// 守卫：start_stream_proxy 的 accept 循环必须真的在工作——
+    /// 连接代理端口并确认收到响应（v1.5.2 的孤儿属性把 accept 循环整个
+    /// 剥除后编译照常通过，代理变成「监听但从不接受」的死端口，电视全部 716）。
+    #[tokio::test]
+    async fn proxy_accept_loop_actually_accepts() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // 上游：返回固定清单
+        let up = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = up.accept().await else { break };
+                tauri::async_runtime::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let (body, ct): (&[u8], &str) = if req.contains(".m3u8") {
+                        (
+                            b"#EXTM3U\n#EXTINF:5,\nseg1.ts\n#EXT-X-ENDLIST\n",
+                            "application/vnd.apple.mpegurl",
+                        )
+                    } else {
+                        (b"SEG", "video/mp2t")
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        ct,
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+
+        let target = format!("http://{}/index.m3u8", up_addr);
+        let token = "accept-guard".to_string();
+        let upstream = Arc::new(Upstream {
+            referer: None,
+            user_agent: None,
+            cookie: None,
+            token: token.clone(),
+            is_samsung: false,
+            ad_uris: Vec::new(),
+        });
+        // preferred_ip 127.0.0.1：测试内连接走回环
+        let (entry, _ts_entry) = start_stream_proxy(
+            target,
+            token,
+            None,
+            None,
+            None,
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            false,
+            Vec::new(),
+        )
+        .await
+        .expect("start_stream_proxy 应成功");
+
+        // 连接代理端口并读响应：accept 循环若被剥除，这里会超时
+        let (host, port, path) = parse_http_url(&entry).expect("entry 应可解析");
+        let mut sock = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect((host.as_str(), port)),
+        )
+        .await
+        .expect("连接代理超时（accept 循环未工作？）")
+        .expect("连接失败");
+        let req = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            path,
+            host_header(&host, port)
+        );
+        sock.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut chunk))
+                .await
+                .expect("读响应超时")
+                .unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            resp.extend_from_slice(&chunk[..n]);
+        }
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.starts_with("HTTP/1.1 200"),
+            "代理应返回清单: {}",
+            text.chars().take(120).collect::<String>()
+        );
+        assert!(text.contains("#EXTM3U"), "代理应转发上游清单内容");
     }
 
     #[test]
