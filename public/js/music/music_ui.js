@@ -383,11 +383,18 @@ function musicRowClickRouter(e, root, context) {
     if (dl) { musicDownloadByKey(dl.dataset.musicDl); return; }
     const queue = e.target.closest('[data-music-queue]');
     if (queue) { musicQueueByKey(queue.dataset.musicQueue); return; }
-    const play = e.target.closest('[data-music-play]');
-    if (play) {
-        const item = musicFindItemByKey(play.dataset.musicPlay, context);
-        if (item) musicSearchPlayAll(item);
-        return;
+    // 动作按钮（★ 下载 ＋ 收藏 ♥）之外，点行内任意位置（标题/歌手/封面）即播放
+    const row = e.target.closest('[data-music-key]');
+    if (!row) return;
+    const key = row.dataset.musicKey;
+    const item = musicFindItemByKey(key, context);
+    if (!item) return;
+    if (context === 'favorites' || !musicSearchState.results.length) {
+        // 收藏视图或无搜索结果：单曲入队并播放
+        musicQueueAppend(item);
+        musicPlayerPlayAt(musicState.queue.length - 1);
+    } else {
+        musicSearchPlayAll(item);
     }
 }
 

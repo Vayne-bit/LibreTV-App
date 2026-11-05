@@ -70,6 +70,14 @@ async function musicPlayerPlayAt(index) {
     }
 
     if (!source || !source.url) {
+        // 多源替代（FuoEvolve/Parachord 的核心特性）：该源无音源时
+        // 在其它启用源里搜同名歌曲，找到可用替代就接着播
+        const alt = await musicPlayerFindAlternative(item);
+        if (alt) {
+            showToast('「' + (item.title || '') + '」已从「' + alt.sourceName + '」找到替代音源', 'success');
+            musicPlayerPlayResolved(alt.item, alt.source, index);
+            return;
+        }
         if (typeof showToast === 'function') showToast('「' + (item.title || '该曲目') + '」暂无可用音源（付费内容或源未提供）', 'warning');
         musicPlayerAdvanceAfterFail();
         return;
@@ -107,6 +115,71 @@ function musicPlayerHandleLoadFail() {
     musicPlayer.failStreak += 1;
     if (typeof showToast === 'function') showToast('播放失败（' + (musicState.queue[musicState.index] || {}).title + '），尝试下一首', 'warning');
     musicPlayerAdvanceAfterFail();
+}
+
+// 在其它启用源里搜同名歌曲并解析音源（多源替代）
+async function musicPlayerFindAlternative(item) {
+    const sources = typeof MusicPlugin !== 'undefined' && MusicPlugin.getEnabledMusicSources
+        ? MusicPlugin.getEnabledMusicSources().filter(s => typeof s.search === 'function' && s.platform !== item.platform)
+        : [];
+    if (!sources.length) return null;
+    const query = (item.title || '').trim();
+    if (!query) return null;
+    for (const source of sources) {
+        try {
+            const result = await source.search(query, 1, 'music');
+            if (!result || !Array.isArray(result.data)) continue;
+            // 标题+歌手模糊匹配（归一化后包含即算命中）
+            const norm = str => String(str || '').replace(/[\s\p{P}]/gu, '').toLowerCase();
+            const target = norm(item.title);
+            const targetArtist = norm(item.artist);
+            const match = result.data.find(candidate => {
+                const ct = norm(candidate.title);
+                const ca = norm(candidate.artist);
+                return (ct.includes(target) || target.includes(ct))
+                    && (ca.includes(targetArtist) || targetArtist.includes(ca) || !targetArtist);
+            });
+            if (!match) continue;
+            const resolved = await source.getMediaSource(
+                Object.assign({}, match, { platform: source.platform }), 'standard');
+            if (resolved && resolved.url) {
+                return {
+                    item: Object.assign({}, match, { platform: source.platform }),
+                    source: resolved,
+                    sourceName: source.platform
+                };
+            }
+        } catch (e) { /* 该源搜索/解析失败，试下一个 */ }
+    }
+    return null;
+}
+
+// 已有解析结果的播放注入（替代源播放走这里，跳过重复解析）
+function musicPlayerPlayResolved(item, source, queueIndex) {
+    // 替代源曲目替换队列当前位置（保持队列结构，只换内容与平台）
+    if (queueIndex >= 0 && queueIndex < musicState.queue.length) {
+        musicState.queue[queueIndex] = Object.assign({}, item);
+        saveMusicState();
+    }
+    const audio = musicPlayerEnsure();
+    audio.pause();
+    musicState.currentSource = source;
+    audio.src = source.url;
+    const p = audio.play();
+    if (p && typeof p.catch === 'function') {
+        p.catch(() => { musicState.playing = false; });
+    }
+    if (typeof musicPlayerUI !== 'undefined' && musicPlayerUI.onTrackChange) {
+        musicPlayerUI.onTrackChange(item, queueIndex);
+    }
+    if (typeof musicLyricsLoad === 'function') musicLyricsLoad(item);
+    if (typeof navigator !== 'undefined' && navigator.mediaSession) {
+        try {
+            navigator.mediaSession.metadata = new MediaMetadata({
+                title: item.title || '未知曲名', artist: item.artist || ''
+            });
+        } catch (e) { /* 忽略 */ }
+    }
 }
 
 function musicPlayerAdvanceAfterFail() {
