@@ -311,6 +311,14 @@ pub async fn cast_to_device(
                         warm_ts_stream(warm_target, warm_upstream).await
                     });
                     let ts_token = generate_session_token();
+                    // 新投屏 = 全新会话：旧会话（及其孤儿池里的在途下载）一并作废，
+                    // 否则上一次投屏遗留的 CDN 下载会与新投屏瓜分带宽
+                    // （外部审查 1.5.7 第①条的场景，在会话级池下于开新投屏时收口）。
+                    if let Ok(mut map) = TS_STREAM_STATES.lock() {
+                        for (_, st) in map.drain() {
+                            ts_abort_inflight(st);
+                        }
+                    }
                     let (_, ts_entry) = start_stream_proxy(
                         url.clone(),
                         ts_token.clone(),
@@ -748,7 +756,10 @@ pub async fn dlna_diagnostics(
     // 断点续传命中 = 重连后从电视上次收到的字节位置继续（不再从 0 重发）。
     let ts_token = LAST_TS_TOKEN.lock().map(|guard| guard.clone()).unwrap_or_default();
     if !ts_token.is_empty() {
-        let state = TS_STREAM_STATES.lock().ok().and_then(|m| m.get(&ts_token).cloned());
+        let state = TS_STREAM_STATES
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&ts_token).map(ts_session_snap));
         match state {
             Some(st) if st.connections > 0 => {
                 let elapsed = st
@@ -761,13 +772,17 @@ pub async fn dlna_diagnostics(
                     String::new()
                 };
                 report.push_str(&format!(
-                    "  TS 会话: 取流连接 {} 次（断点续传 {} 次），已下发 {:.1} MB（{} 个分片序列{}）\n",
+                    "  TS 会话: 取流连接 {} 次（断点续传 {} 次，继承在途下载 {} 个），已下发 {:.1} MB（{} 个分片序列{}）\n",
                     st.connections,
                     st.resume_hits,
+                    st.reattach_count,
                     st.total_bytes as f64 / 1048576.0,
                     st.served.len(),
                     speed
                 ));
+                if st.resume_hits > 0 && st.reattach_count == 0 && st.connections > 6 {
+                    report.push_str("  判读: 电视频繁重连但预取从未跨连接继承——每次重连都在从零重下锚点分片（活锁特征，请反馈此报告）\n");
+                }
                 if st.resume_hits == 0 && st.connections > 2 {
                     report.push_str("  判读: 电视多次重连但从未命中断点续传——旧版本 APK 请升级后重试\n");
                 } else if elapsed > 10.0 && st.total_bytes > 0 {
@@ -2531,8 +2546,11 @@ async fn handle_proxy_conn(mut stream: tokio::net::TcpStream, upstream: Arc<Upst
                     TS_STREAM_STATES
                         .lock()
                         .ok()
-                        .and_then(|m| m.get(&upstream.token).cloned())
-                        .map(|st| n <= st.total_bytes && !st.served.is_empty())
+                        .and_then(|m| {
+                            m.get(&upstream.token)
+                                .map(|st| (st.total_bytes, !st.served.is_empty()))
+                        })
+                        .map(|(total, has_served)| n <= total && has_served)
                         .unwrap_or(false)
                 })
                 .unwrap_or(false);
@@ -3017,7 +3035,7 @@ async fn fetch_segment_cached(seg: String, upstream: Arc<Upstream>) -> Result<Ve
 /// 会话状态：分片有序表（URL, 该分片写入的字节数）+ 累计字节数。
 /// 续传时在表里定位电视要的字节偏移 → 从对应分片的对应字节继续写，
 /// 响应 206 + Content-Range: bytes N-/*（总长未知，HLS 拼接流无法预知）。
-#[derive(Default, Clone)]
+#[derive(Default)]
 struct TsStreamState {
     served: Vec<(String, u64)>,
     total_bytes: u64,
@@ -3028,6 +3046,17 @@ struct TsStreamState {
     media_url: String,           // 已解析的媒体清单地址
     segments: Vec<String>,       // 完整有序分片列表
     endlist: bool,               // VOD 标记
+    // ---- 跨连接在途下载池（孤儿池）----
+    // 三星等渐进式取流端每 ~0.4MB 断开重连一次（原生节奏）。连接结束时若把
+    // 在途预取全部 abort（1.5.7 的 AbortOnDrop），正下到一半的锚点分片永远
+    // 进不了缓存，下一连接只能从 0 重下；电视单次连接的耐心 < 冷分片重下
+    // 耗时（弱网单连接 95KB/s 时 0.7MB≈7s），每次重连都倒在半路 → 活锁：
+    // total_bytes 冻结、重连数十次、无错误无超时（1.5.7 真机 33.0MB/82 连接
+    // 精确冻在 Σ(0..35) 实证）。改为移交：连接结束时剩余在途任务进会话池
+    // （不取消），下一连接按清单顺序继承同分片的在途下载——下载进度跨连接
+    // 单调推进，重连不再丢工作。
+    orphan: HashMap<String, tokio::task::JoinHandle<Result<Vec<u8>, String>>>,
+    reattach_count: u32,         // 诊断：跨连接继承在途下载的累计次数
 }
 
 static TS_STREAM_STATES: Lazy<Mutex<HashMap<String, TsStreamState>>> =
@@ -3054,11 +3083,28 @@ fn ts_seg_cache_evict(map: &mut HashMap<String, Vec<u8>>) {
     }
 }
 
-fn ts_state_touch(token: &str) -> Option<TsStreamState> {
-    let mut map = TS_STREAM_STATES.lock().ok()?;
-    let state = map.entry(token.to_string()).or_default();
-    state.connections += 1;
-    Some(state.clone())
+/// 续传/诊断用的会话只读快照。
+/// TsStreamState 持有不可克隆的 JoinHandle（孤儿池），不能再 #[derive(Clone)]——
+/// 需要会话数据的地方在锁内按需拷贝标量字段。
+#[derive(Default, Clone)]
+struct TsSessionSnap {
+    served: Vec<(String, u64)>,
+    total_bytes: u64,
+    connections: u32,
+    resume_hits: u32,
+    reattach_count: u32,
+    started_at: Option<std::time::Instant>,
+}
+
+fn ts_session_snap(st: &TsStreamState) -> TsSessionSnap {
+    TsSessionSnap {
+        served: st.served.clone(),
+        total_bytes: st.total_bytes,
+        connections: st.connections,
+        resume_hits: st.resume_hits,
+        reattach_count: st.reattach_count,
+        started_at: st.started_at,
+    }
 }
 
 fn ts_state_evict_extra(map: &mut HashMap<String, TsStreamState>) {
@@ -3069,11 +3115,38 @@ fn ts_state_evict_extra(map: &mut HashMap<String, TsStreamState>) {
             .min_by_key(|(_, st)| st.connections)
             .map(|(k, _)| k.clone())
         {
-            map.remove(&key);
+            if let Some((_, old)) = map.remove_entry(&key) {
+                // 被淘汰会话的在途下载一并取消：其 token 已死，任务结果无人消费，
+                // 留着只会继续占带宽（外部审查 1.5.7 第①条的场景）
+                ts_abort_inflight(old);
+            }
         } else {
             break;
         }
     }
+}
+
+/// 中止一个会话持有的全部在途下载任务。
+/// JoinHandle 被 drop 不会 abort 任务（tokio 语义：任务脱管继续跑），
+/// 所以凡是「确定不再需要结果」的场合都必须显式 abort。
+fn ts_abort_inflight(mut st: TsStreamState) {
+    for (_, h) in st.orphan.drain() {
+        h.abort();
+    }
+}
+
+/// 把本连接剩余的在途下载移交给会话孤儿池。
+/// 替换语义：旧池里未被继承的条目被 abort——它们要么早已完成入缓存
+/// （fetch_segment_cached 成功即写缓存，结果句柄只是回执），要么已落后于
+/// 当前播放位置（电视回跳），继续跑没有意义。
+fn ts_park_inflight(
+    st: &mut TsStreamState,
+    parked: Vec<(String, tokio::task::JoinHandle<Result<Vec<u8>, String>>)>,
+) {
+    for (_, h) in st.orphan.drain() {
+        h.abort();
+    }
+    st.orphan.extend(parked);
 }
 
 /// 解析 Range 头里的起始字节（bytes=N- / bytes=N-M），不合法返回 None。
@@ -3093,7 +3166,7 @@ fn parse_range_start(range: &Option<String>) -> Option<u64> {
 
 /// 在已下发序列里定位电视要的字节偏移：
 /// 返回 (分片下标, 片内偏移)；下标 == served.len() 表示恰好完整下发完，从其后继续。
-fn locate_resume(state: &TsStreamState, n: u64) -> Option<(usize, u64)> {
+fn locate_resume(state: &TsSessionSnap, n: u64) -> Option<(usize, u64)> {
     let mut acc = 0u64;
     for (idx, (_url, size)) in state.served.iter().enumerate() {
         if n < acc + *size {
@@ -3122,9 +3195,11 @@ async fn serve_live_ts(
         // VOD 会话缓存：电视重连时不再重新请求 CDN 解析清单。
         // 每轮 resolve+fetch 是 2 次 CDN 往返，弱 CDN 路径上耗时 4~18s，
         // 重连 10 次浪费 40~180s——缓存后重连立即开始取流。
-        if let Some(st) = TS_STREAM_STATES.lock().ok().and_then(|m| m.get(&token).cloned()) {
-            if st.endlist && !st.media_url.is_empty() && !st.segments.is_empty() {
-                return Ok((st.media_url.clone(), st.segments.clone(), st.endlist));
+        if let Ok(map) = TS_STREAM_STATES.lock() {
+            if let Some(st) = map.get(&token) {
+                if st.endlist && !st.media_url.is_empty() && !st.segments.is_empty() {
+                    return Ok((st.media_url.clone(), st.segments.clone(), st.endlist));
+                }
             }
         }
         let media_url = resolve_media_playlist(&target, &upstream).await?;
@@ -3183,7 +3258,15 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
     //      用户新投屏是全新 token，不会走到这里。
     //   c. bytes=0- / Range 落在会话之外 / 首次连接——全新下发
     let requested_offset = parse_range_start(&range);
-    let session = TS_STREAM_STATES.lock().ok().and_then(|m| m.get(&token).cloned());
+    // 续传计划只读 served/total_bytes——TsStreamState 含不可克隆的 JoinHandle，
+    // 这里在锁内拷贝这两个字段（TsSessionSnap 的子集，沿用同名字段访问）。
+    let session = TS_STREAM_STATES.lock().ok().and_then(|m| {
+        m.get(&token).map(|st| TsSessionSnap {
+            served: st.served.clone(),
+            total_bytes: st.total_bytes,
+            ..TsSessionSnap::default()
+        })
+    });
     let has_session_progress = session
         .as_ref()
         .map(|st| !st.served.is_empty() && st.total_bytes > 0)
@@ -3244,6 +3327,10 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
         // Range 落在会话之外（对不上锚点）或 bytes=0-：全新下发（重置状态）
         if resume_plan.is_none() {
             if let Ok(mut map) = TS_STREAM_STATES.lock() {
+                // 旧会话作废：其孤儿池里的在途下载一并取消（结果无人消费）
+                if let Some((_, old)) = map.remove_entry(&token) {
+                    ts_abort_inflight(old);
+                }
                 map.insert(
                     token.clone(),
                     TsStreamState { connections: 1, started_at: Some(Instant::now()), ..Default::default() },
@@ -3297,13 +3384,22 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
     // 未完成的预取任务都随 inflight 的 drop 自动取消——
     // 否则旧连接的最多 6 个下载继续占带宽，新连接又开 6 个抓同样的分片，
     // 12 次连接的带宽就这样被自己瓜分（外部审查实证）。
-    struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
-    impl<T> Drop for AbortOnDrop<T> {
-        fn drop(&mut self) { self.0.abort(); }
-    }
+    // 在途预取：不再随连接结束而取消（1.5.7 的 AbortOnDrop 会把正下到一半的
+    // 锚点分片一起杀掉，下一连接从 0 重下——电视连接耐心短于重下耗时时形成
+    // 活锁，真机 33.0MB 冻结实证）。改为连接结束时移交进会话孤儿池（见循环后）。
+    let mut reattach_count: u32 = 0; // 本连接从孤儿池继承的在途下载数（诊断用）
+    let mut orphan_pool: HashMap<String, tokio::task::JoinHandle<Result<Vec<u8>, String>>> =
+        TS_STREAM_STATES
+            .lock()
+            .ok()
+            .and_then(|mut map| map.get_mut(&token).map(|st| std::mem::take(&mut st.orphan)))
+            .unwrap_or_default();
     let mut inflight: std::collections::VecDeque<
-        (String, AbortOnDrop<Result<Vec<u8>, String>>),
+        (String, tokio::task::JoinHandle<Result<Vec<u8>, String>>),
     > = std::collections::VecDeque::new();
+    // 写出循环的退出原因：电视断开/整部播完 → Ok；连续分片失败 → Err。
+    // 不能在循环里直接 return——必须先把手里的在途任务移交孤儿池再退出。
+    let mut end_result: Result<(), String> = Ok(());
     loop {
         // 填满预取窗口
         while inflight.len() < TS_PREFETCH_DEPTH {
@@ -3313,13 +3409,22 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
             if !served.insert(seg.clone()) {
                 continue; // 直播轮询时跳过已服务的分片
             }
-            let upstream_task = upstream.clone();
-            inflight.push_back((
-                seg.clone(),
-                AbortOnDrop(tokio::spawn(async move { fetch_segment_cached(seg, upstream_task).await })),
-            ));
+            // 优先继承上一连接留下的同分片在途下载（孤儿池）：
+            // 它可能已经下了大半，接手等完即可，不再从 0 重打 CDN。
+            let handle = match orphan_pool.remove(&seg) {
+                Some(h) => {
+                    reattach_count += 1;
+                    h
+                }
+                None => {
+                    let upstream_task = upstream.clone();
+                    let seg_task = seg.clone();
+                    tokio::spawn(async move { fetch_segment_cached(seg_task, upstream_task).await })
+                }
+            };
+            inflight.push_back((seg, handle));
         }
-        let Some((seg, mut handle)) = inflight.pop_front() else {
+        let Some((seg, handle)) = inflight.pop_front() else {
             // 本批分片已全部喂完
             if endlist {
                 break; // VOD：整部播完
@@ -3335,7 +3440,7 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
             }
             continue;
         };
-        let data = match (&mut handle.0).await {
+        let data = match handle.await {
             Ok(Ok(data)) => {
                 consecutive_failures = 0;
                 data
@@ -3351,10 +3456,11 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
                         "TS 连续 {} 个分片失败，已放弃本条流（最后一片: {} — {}）",
                         consecutive_failures, seg, e
                     ));
-                    return Err(format!(
+                    end_result = Err(format!(
                         "连续 {} 个分片失败，放弃本条流（最后一片: {}）",
                         consecutive_failures, seg
                     ));
+                    break;
                 }
                 // 单片坏不中断整条流：跳过继续喂下一片。
                 // 断流会让电视重连并从头开始，那才是「投一会儿就中断」的来源。
@@ -3366,7 +3472,8 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
                 SKIPPED_SEGMENT_COUNT.fetch_add(1, Ordering::Relaxed);
                 if consecutive_failures >= MAX_CONSECUTIVE_SEGMENT_FAILURES {
                     record_proxy_error(format!("TS 预取任务异常，已放弃本条流（分片: {}）", seg));
-                    return Err(format!("预取任务异常，放弃本条流（分片: {}）", seg));
+                    end_result = Err(format!("预取任务异常，放弃本条流（分片: {}）", seg));
+                    break;
                 }
                 continue;
             }
@@ -3395,10 +3502,35 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
         }
         // 写失败只可能是电视主动断开（切集/退出投屏），是正常结束。
         if stream.write_all(out).await.is_err() || stream.flush().await.is_err() {
-            return Ok(());
+            break;
         }
     }
-    Ok(())
+    // ---- 在途任务移交（孤儿池）----
+    // 电视随时会断开重连（三星每 ~0.4MB 一次）。此刻 inflight 里最多 6 个
+    // 下载正跑着——把它们连同进度一起移交进会话，下一连接按清单顺序继承；
+    // 取消它们的代价是活锁（1.5.7 真机：33.0MB 冻结、82 次连接、0 错误）。
+    // 会话不存在（被重置/淘汰）时结果无人消费，显式 abort 防止任务脱管空跑。
+    let parked: Vec<(String, tokio::task::JoinHandle<Result<Vec<u8>, String>>)> =
+        inflight.drain(..).collect();
+    match TS_STREAM_STATES.lock() {
+        Ok(mut map) => match map.get_mut(token.as_str()) {
+            Some(st) => {
+                ts_park_inflight(st, parked);
+                st.reattach_count += reattach_count;
+            }
+            None => {
+                for (_, h) in parked {
+                    h.abort();
+                }
+            }
+        },
+        Err(_) => {
+            for (_, h) in parked {
+                h.abort();
+            }
+        }
+    }
+    end_result
 }
 
 /// 这个分片是不是广告分片。
@@ -4911,6 +5043,80 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}",
             }
         }
         out
+    }
+
+    #[tokio::test]
+    async fn ts_park_inflight_replaces_and_aborts_old_tasks() {
+        // 移交语义：再次移交时旧池条目必须被显式 abort（JoinHandle drop 不会
+        // 取消任务），新池条目原样保留——这是活锁修复的核心保证。
+        let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+        let t1 = tokio::spawn(async move {
+            // 模拟在途下载：长睡眠。被 abort 则永远走不到 send。
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let _ = tx1.send("completed");
+            Ok(Vec::<u8>::new())
+        });
+        let mut st = TsStreamState::default();
+        ts_park_inflight(&mut st, vec![("seg-1".to_string(), t1)]);
+        assert_eq!(st.orphan.len(), 1);
+
+        // 第二次移交（替换语义）：seg-1 的任务被取消，seg-2 入池
+        let t2 = tokio::spawn(async { Ok(Vec::<u8>::new()) });
+        ts_park_inflight(&mut st, vec![("seg-2".to_string(), t2)]);
+        assert_eq!(st.orphan.len(), 1);
+        assert!(st.orphan.contains_key("seg-2"));
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            rx1.try_recv().is_err(),
+            "旧池任务被 abort 后不应跑完（说明 abort 没生效）"
+        );
+        assert_eq!(st.reattach_count, 0);
+        for (_, h) in st.orphan.drain() {
+            h.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn ts_abort_inflight_cancels_session_tasks() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+        let t = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let _ = tx.send("completed");
+            Ok(Vec::<u8>::new())
+        });
+        let mut st = TsStreamState::default();
+        st.orphan.insert("seg-x".to_string(), t);
+        // 会话重置路径的调用形态：整状态交进来，任务必须被取消
+        ts_abort_inflight(st);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(rx.try_recv().is_err(), "会话作废后其任务不应继续跑");
+    }
+
+    #[tokio::test]
+    async fn ts_state_evict_aborts_orphans_of_evicted_sessions() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+        let t = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let _ = tx.send("completed");
+            Ok(Vec::<u8>::new())
+        });
+        let mut map: HashMap<String, TsStreamState> = HashMap::new();
+        // 最不活跃的会话（连接数最小）持有孤儿任务，其余会话连接数更高
+        let mut victim = TsStreamState::default();
+        victim.connections = 1;
+        victim.orphan.insert("seg-victim".to_string(), t);
+        map.insert("victim".to_string(), victim);
+        for i in 0..TS_STREAM_STATE_MAX {
+            let mut st = TsStreamState::default();
+            st.connections = 9;
+            map.insert(format!("busy-{}", i), st);
+        }
+        ts_state_evict_extra(&mut map);
+        assert_eq!(map.len(), TS_STREAM_STATE_MAX);
+        assert!(!map.contains_key("victim"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(rx.try_recv().is_err(), "被淘汰会话的孤儿任务应被 abort");
     }
 
     #[tokio::test]
