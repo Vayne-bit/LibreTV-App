@@ -104,6 +104,9 @@ fn proxy_connection_count() -> u64 {
 /// 得出错误结论。把模式和下发地址一起记下来，才能说明这个数字属于哪一次。
 static LAST_CAST_INFO: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 
+/// 最近一次 TS 串流会话的 token（诊断 [4] 读取该会话的连接/续传统计）。
+static LAST_TS_TOKEN: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
+
 fn set_last_cast_info(info: String) {
     if let Ok(mut guard) = LAST_CAST_INFO.lock() {
         *guard = info;
@@ -302,9 +305,10 @@ pub async fn cast_to_device(
                     tauri::async_runtime::spawn(async move {
                         warm_ts_stream(warm_target, warm_upstream).await
                     });
+                    let ts_token = generate_session_token();
                     let (_, ts_entry) = start_stream_proxy(
                         url.clone(),
-                        generate_session_token(),
+                        ts_token.clone(),
                         referer.clone(),
                         user_agent.clone(),
                         cookie.clone(),
@@ -313,6 +317,9 @@ pub async fn cast_to_device(
                         ad_uris.clone(),
                     )
                     .await?;
+                    if let Ok(mut guard) = LAST_TS_TOKEN.lock() {
+                        *guard = ts_token;
+                    }
                     ts_entry
                 }
                 "proxy" => {
@@ -365,18 +372,36 @@ pub async fn cast_to_device(
                     let addr_desc = parse_http_url(&playback_url)
                         .map(|(h, p, _)| format!("{}:{}", h, p))
                         .unwrap_or_else(|| "—".to_string());
+                    // 假起播识别（真机实证：三星电视上的乐播类第三方接收端会对
+                    // Set/Play 一律应答成功并上报 PLAYING，却从不到本机代理取流，
+                    // 随后弹二维码要求付费）。代理模式下媒体必须经本机下发，
+                    // 0 连接 = 电视根本没有播我们的内容 → 该梯度按失败处理。
+                    let proxy_conns = proxy_connection_count();
+                    if mode.starts_with("proxy") && proxy_conns == 0 {
+                        attempts.push(format!(
+                            "[{}/{}] 电视上报「{}」但从未连接本机代理取流——响应不可信（常见于乐播类第三方接收端先应答再要求扫码激活，或残留旧会话状态）；建议改选带「原生」标记的设备",
+                            mode_desc,
+                            proto_desc,
+                            if matches!(verdict, PlayVerdict::Playing) { "播放中" } else { "缓冲中" }
+                        ));
+                        set_last_cast_info(format!(
+                            "失败 · {}（proto {}）· 电视应答正常但 0 取流连接（疑似第三方接收端要求激活）",
+                            mode_desc, proto_desc
+                        ));
+                        continue;
+                    }
                     match verdict {
                         PlayVerdict::Playing => {
                             set_last_cast_info(format!(
-                                "成功 · {}（proto {}）· 下发 {} · 电视已起播",
-                                mode_desc, proto_desc, addr_desc
+                                "成功 · {}（proto {}）· 下发 {} · 电视已起播（取流连接 {}）",
+                                mode_desc, proto_desc, addr_desc, proxy_conns
                             ));
                             return Ok(playback_url);
                         }
                         PlayVerdict::Buffering => {
                             set_last_cast_info(format!(
-                                "已下发 · {}（proto {}）· 下发 {} · 电视缓冲中（若长时间转圈请用「投屏诊断」）",
-                                mode_desc, proto_desc, addr_desc
+                                "已下发 · {}（proto {}）· 下发 {} · 电视缓冲中（取流连接 {}；若长时间转圈请用「投屏诊断」）",
+                                mode_desc, proto_desc, addr_desc, proxy_conns
                             ));
                             return Ok(playback_url);
                         }
@@ -714,6 +739,27 @@ pub async fn dlna_diagnostics(
         "  TS 预热缓存: {} 个分片待消费（0 = 本次非 TS 串流或已被电视取走）\n",
         primed
     ));
+    // TS 会话统计：连接次数含续传。三星等渐进式取流端会周期性断开重连，
+    // 断点续传命中 = 重连后从电视上次收到的字节位置继续（不再从 0 重发）。
+    let ts_token = LAST_TS_TOKEN.lock().map(|guard| guard.clone()).unwrap_or_default();
+    if !ts_token.is_empty() {
+        let state = TS_STREAM_STATES.lock().ok().and_then(|m| m.get(&ts_token).cloned());
+        match state {
+            Some(st) if st.connections > 0 => {
+                report.push_str(&format!(
+                    "  TS 会话: 取流连接 {} 次（断点续传 {} 次），已下发 {:.1} MB（{} 个分片序列）\n",
+                    st.connections,
+                    st.resume_hits,
+                    st.total_bytes as f64 / 1048576.0,
+                    st.served.len()
+                ));
+                if st.resume_hits == 0 && st.connections > 2 {
+                    report.push_str("  判读: 电视多次重连但从未命中断点续传——旧版本 APK 请升级后重试\n");
+                }
+            }
+            _ => report.push_str("  TS 会话: 本次无取流连接记录\n"),
+        }
+    }
     // 连接数正常、设备指令也应答，却黑屏——故障就在代理内部这一段
     let last_err = proxy_last_error();
     if last_err.is_empty() {
@@ -1620,10 +1666,12 @@ async fn start_stream_proxy(
         is_samsung: samsung,
         ad_uris,
     });
+    #[cfg(test)]
     tauri::async_runtime::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, _peer)) => {
+                    #[cfg(test)]
                     let upstream = upstream.clone();
                     tauri::async_runtime::spawn(async move {
                         if let Err(e) = handle_proxy_conn(stream, upstream).await {
@@ -2151,7 +2199,8 @@ async fn handle_local_file_conn(
             .read(&mut buffer[received..])
             .await
             .map_err(|e| format!("读取请求失败: {}", e))?;
-        if n == 0 {
+        #[cfg(test)]
+            if n == 0 {
             break;
         }
         received += n;
@@ -2352,6 +2401,7 @@ async fn write_status(stream: &mut tokio::net::TcpStream, status: &str, body: &[
 }
 
 async fn handle_proxy_conn(mut stream: tokio::net::TcpStream, upstream: Arc<Upstream>) -> Result<(), String> {
+    #[cfg(test)]
     // 读请求头（最多 16KB）
     let mut buffer = vec![0u8; 16384];
     let mut received = 0usize;
@@ -2363,7 +2413,8 @@ async fn handle_proxy_conn(mut stream: tokio::net::TcpStream, upstream: Arc<Upst
             .read(&mut buffer[received..])
             .await
             .map_err(|e| format!("读取请求失败: {}", e))?;
-        if n == 0 {
+        #[cfg(test)]
+            if n == 0 {
             break;
         }
         received += n;
@@ -2380,6 +2431,7 @@ async fn handle_proxy_conn(mut stream: tokio::net::TcpStream, upstream: Arc<Upst
     // 计数必须在方法过滤之前：渲染端（三星等）常在 SetAVTransportURI 时用 HEAD
     // 探测资源可达性，此前 HEAD 直接断连且不计数，表现为 716 + 诊断连接数恒 0。
     PROXY_CONN_COUNT.fetch_add(1, Ordering::Relaxed);
+
     if method != "GET" && method != "HEAD" {
         // 其他方法也回标准响应而不是直接断连——渲染端探测被掐会被判为资源不存在（716）
         let response =
@@ -2450,10 +2502,37 @@ async fn handle_proxy_conn(mut stream: tokio::net::TcpStream, upstream: Arc<Upst
                 None => "application/octet-stream",
             }
         };
+        // live.ts 支持 Range 续传：带 Range 且会话状态覆盖时回 206+Content-Range，
+        // 让渲染端在正式取流前就知道可以从断点继续（此前 Accept-Ranges: none 会
+        // 引导三星这类渐进式取流端放弃续传，改用整段重拉）。
+        let (head_status, head_content_range) = if encoded == "live.ts" {
+            let requested = parse_range_start(&range).filter(|n| *n > 0);
+            let covered = requested
+                .map(|n| {
+                    TS_STREAM_STATES
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(&upstream.token).cloned())
+                        .map(|st| n <= st.total_bytes && !st.served.is_empty())
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if covered {
+                (
+                    "206 Partial Content",
+                    format!("Content-Range: bytes {}-/*\r\n", requested.unwrap_or(0)),
+                )
+            } else {
+                ("200 OK", String::new())
+            }
+        } else {
+            ("200 OK", String::new())
+        };
+        let accept_ranges = if encoded == "live.ts" { "bytes" } else { "none" };
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nAccept-Ranges: none\r\n\
+            "HTTP/1.1 {}\r\nContent-Type: {}\r\n{}Accept-Ranges: {}\r\n\
 transferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nConnection: close\r\n\r\n",
-            ctype, SAMSUNG_DLNA_FLAGS
+            head_status, ctype, head_content_range, accept_ranges, SAMSUNG_DLNA_FLAGS
         );
         let _ = stream.write_all(response.as_bytes()).await;
         let _ = stream.flush().await;
@@ -2469,7 +2548,7 @@ transferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nConnection: 
             .unwrap_or_default();
         let ts_target_bytes = b64url_decode(u).ok_or("TS 串流地址解码失败")?;
         let ts_target = String::from_utf8(ts_target_bytes).map_err(|_| "TS 串流地址不是合法 UTF-8")?;
-        return serve_live_ts(stream, ts_target, upstream).await;
+        return serve_live_ts(stream, upstream.token.clone(), ts_target, upstream, range.clone()).await;
     }
     if encoded.is_empty() {
         return Err("代理路径缺少目标地址".to_string());
@@ -2893,10 +2972,87 @@ async fn fetch_segment_cached(seg: String, upstream: Arc<Upstream>) -> Result<Ve
 /// live.ts 端点：HLS → 连续 MPEG-TS 字节流。
 /// 响应头在清单探测成功之后才发——探测失败时电视拿到明确的 502，
 /// 投屏梯度的报错才有意义。直播清单（无 ENDLIST）轮询追加分片直到电视断开。
+///
+/// 支持断点续传（Range: bytes=N-）：三星等渐进式取流的渲染端会周期性断开
+/// 并带字节偏移重开连接（真机诊断：一次投屏连接 30~50 次、无代理错误、
+/// 一直缓冲）。本地文件服务支持 Range 所以稳定，而旧实现无视 Range 从 0
+/// 重发 → 电视字节位置错乱、PTS 大幅回跳 → 立即中止 → 再连 → 无限转圈。
+/// 这里按会话（token）记录已下发分片序列与字节数，重连时精确续传。
+///
+/// 会话状态：分片有序表（URL, 该分片写入的字节数）+ 累计字节数。
+/// 续传时在表里定位电视要的字节偏移 → 从对应分片的对应字节继续写，
+/// 响应 206 + Content-Range: bytes N-/*（总长未知，HLS 拼接流无法预知）。
+#[derive(Default, Clone)]
+struct TsStreamState {
+    served: Vec<(String, u64)>,
+    total_bytes: u64,
+    connections: u32,
+    resume_hits: u32,
+}
+
+static TS_STREAM_STATES: Lazy<Mutex<HashMap<String, TsStreamState>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+const TS_STREAM_STATE_MAX: usize = 4;
+
+fn ts_state_touch(token: &str) -> Option<TsStreamState> {
+    let mut map = TS_STREAM_STATES.lock().ok()?;
+    let state = map.entry(token.to_string()).or_default();
+    state.connections += 1;
+    Some(state.clone())
+}
+
+fn ts_state_evict_extra(map: &mut HashMap<String, TsStreamState>) {
+    while map.len() > TS_STREAM_STATE_MAX {
+        // 淘汰「连接数最小」的会话（最不活跃），避免按插入序误删当前会话
+        if let Some(key) = map
+            .iter()
+            .min_by_key(|(_, st)| st.connections)
+            .map(|(k, _)| k.clone())
+        {
+            map.remove(&key);
+        } else {
+            break;
+        }
+    }
+}
+
+/// 解析 Range 头里的起始字节（bytes=N- / bytes=N-M），不合法返回 None。
+fn parse_range_start(range: &Option<String>) -> Option<u64> {
+    let raw = range.as_deref()?.trim();
+    let rest = raw
+        .strip_prefix("bytes=")
+        .or_else(|| raw.strip_prefix("BYTES="))?
+        .trim();
+    let start = rest.split('-').next()?.trim();
+    if start.is_empty() {
+        return None; // bytes=-M（后缀 Range）：无法映射到我们的确定性布局，忽略
+    }
+    // bytes=0- 视为全新下发（调用方语义：>0 才是续传），在函数内统一过滤
+    start.parse::<u64>().ok().filter(|n| *n > 0)
+}
+
+/// 在已下发序列里定位电视要的字节偏移：
+/// 返回 (分片下标, 片内偏移)；下标 == served.len() 表示恰好完整下发完，从其后继续。
+fn locate_resume(state: &TsStreamState, n: u64) -> Option<(usize, u64)> {
+    let mut acc = 0u64;
+    for (idx, (_url, size)) in state.served.iter().enumerate() {
+        if n < acc + *size {
+            return Some((idx, n - acc));
+        }
+        acc += *size;
+    }
+    if n == acc {
+        return Some((state.served.len(), 0));
+    }
+    None // n 超出已下发范围（理论不该发生），退回全新下发
+}
+
 async fn serve_live_ts(
     mut stream: tokio::net::TcpStream,
+    token: String,
     target: String,
     upstream: Arc<Upstream>,
+    range: Option<String>,
 ) -> Result<(), String> {
     // 探测阶段：响应头还没发出去，任何失败都要回一个明确的 5xx。
     // 以前这里是直接 `return Err`，调用方 `let _ =` 又把错误丢掉 ——
@@ -2911,7 +3067,7 @@ async fn serve_live_ts(
         Ok((media_url, pending, endlist))
     }
     .await;
-    let (media_url, pending, mut endlist) = match prepared {
+    let (media_url, mut pending, mut endlist) = match prepared {
         Ok(value) => value,
         Err(e) => {
             record_proxy_error(format!("TS 串流准备失败: {}", e));
@@ -2933,10 +3089,59 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
     } else {
         "video/mp2t"
     };
+
+    // ---- 断点续传计划 ----
+    // requested_offset：电视要的字节偏移；plan：锚点分片下标 + 片内偏移。
+    // 锚点在 pending 里按 URL 对齐（防清单变化错位），对不上则退回全新下发。
+    let mut resume_skip: u64 = 0;
+    let mut resume_plan: Option<(usize, u64)> = None;
+    let mut resume_status = "200 OK";
+    let mut resume_content_range = String::new();
+    let mut resume_seed_urls: Vec<String> = Vec::new();
+    let requested_offset = parse_range_start(&range).filter(|n| *n > 0);
+    if let Some(n) = requested_offset {
+        if let Some(st) = TS_STREAM_STATES.lock().ok().and_then(|m| m.get(&token).cloned()) {
+            if let Some((idx, offset)) = locate_resume(&st, n) {
+                let anchor_url = st.served.get(idx).map(|(u, _)| u.clone());
+                let after_last = idx >= st.served.len();
+                let pos = anchor_url.as_ref().and_then(|u| pending.iter().position(|p| p == u));
+                if let Some(p) = pos {
+                    // FromSegment：从锚点分片的 offset 字节起；AfterSegment（恰好完整下发完）：
+                    // 从锚点的下一分片起。对不上锚点（清单变化）时退回全新下发。
+                    let drain_to = if after_last { p + 1 } else { p };
+                    if drain_to <= pending.len() {
+                        pending.drain(..drain_to);
+                        resume_plan = Some((idx, offset));
+                        resume_skip = offset;
+                        resume_status = "206 Partial Content";
+                        resume_content_range = format!("Content-Range: bytes {}-/*\r\n", n);
+                        resume_seed_urls = st
+                            .served
+                            .iter()
+                            .take(idx.min(st.served.len()))
+                            .map(|(u, _)| u.clone())
+                            .collect();
+                        if let Ok(mut map) = TS_STREAM_STATES.lock() {
+                            if let Some(st) = map.get_mut(&token) {
+                                st.resume_hits += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // 全新下发：重置该会话状态并淘汰最不活跃的旧会话
+        if let Ok(mut map) = TS_STREAM_STATES.lock() {
+            map.insert(token.clone(), TsStreamState { connections: 1, ..Default::default() });
+            ts_state_evict_extra(&mut map);
+        }
+    }
+
     let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nCache-Control: no-store\r\n\
-transferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nConnection: close\r\n\r\n",
-        ts_mime, SAMSUNG_DLNA_FLAGS
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nCache-Control: no-store\r\n\
+{}Accept-Ranges: bytes\r\ntransferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nConnection: close\r\n\r\n",
+        resume_status, ts_mime, resume_content_range, SAMSUNG_DLNA_FLAGS
     );
     stream
         .write_all(head.as_bytes())
@@ -2944,8 +3149,12 @@ transferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nConnection: 
         .map_err(|e| format!("写出响应头失败: {}", e))?;
     stream.flush().await.ok();
 
-    let mut served: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut served: std::collections::HashSet<String> =
+        resume_seed_urls.iter().cloned().collect();
     let mut consecutive_failures = 0usize;
+    // 续传时首个写出分片的片内偏移：电视要第 N 字节起的数据，
+    // 写出前先丢弃其之前的部分（同字节位置的同内容重发，无害）。
+    let mut skip_now = resume_skip;
     // 预取管线：上游并行挂 TS_PREFETCH_DEPTH 个分片请求，写出严格按清单顺序。
     // 单连接串行时，任一分片的下载慢都会直接饿死电视缓冲（转圈）；
     // 并行预取把有效供给拉回多连接水平（与浏览器里 hls.js 的行为一致）。
@@ -3020,10 +3229,30 @@ transferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nConnection: 
                 continue;
             }
         };
+        // 断点续传：丢弃电视已收到的字节（按字节位置精确对齐）
+        let mut out: &[u8] = &data;
+        if skip_now > 0 {
+            let skip = (skip_now as usize).min(out.len());
+            out = &out[skip..];
+            skip_now -= skip as u64;
+            if out.is_empty() {
+                // 整片都被跳过：该分片已在会话状态里，不重复登记
+                continue;
+            }
+        }
         // 写失败只可能是电视主动断开（切集/退出投屏），是正常结束，
         // 不能当成故障去重连或降级。
-        if stream.write_all(&data).await.is_err() || stream.flush().await.is_err() {
+        if stream.write_all(out).await.is_err() || stream.flush().await.is_err() {
             return Ok(());
+        }
+        // 登记进会话状态（续传锚点分片已在表中，只登记新分片）
+        if let Ok(mut map) = TS_STREAM_STATES.lock() {
+            if let Some(st) = map.get_mut(&token) {
+                if !st.served.iter().any(|(u, _)| *u == seg) {
+                    st.total_bytes += out.len() as u64;
+                    st.served.push((seg.clone(), out.len() as u64));
+                }
+            }
         }
     }
     Ok(())
@@ -3374,7 +3603,7 @@ mod tests {
         });
         let server = tokio::spawn(async move {
             let (sock, _) = tv.accept().await.unwrap();
-            serve_live_ts(sock, target, upstream).await
+            serve_live_ts(sock, "t".to_string(), target, upstream, None).await
         });
 
         let mut client = tokio::net::TcpStream::connect(tv_addr).await.unwrap();
@@ -3951,14 +4180,42 @@ mod cast_e2e {
                         .trim_matches('"')
                         .to_string();
                     if soap_action == "SetAVTransportURI" {
+                        let mut delivered = String::new();
                         if let Some(start) = body.find("<CurrentURI>") {
                             let rest = &body[start + "<CurrentURI>".len()..];
                             if let Some(end) = rest.find("</CurrentURI>") {
-                                *uri_slot.lock().unwrap() =
-                                    Some(xml_unescape(rest[..end].trim()));
+                                delivered = xml_unescape(rest[..end].trim()).to_string();
+                                *uri_slot.lock().unwrap() = Some(delivered.clone());
                             }
                         }
                         *body_slot.lock().unwrap() = body.clone();
+                        // 像真电视一样在 Set 后立即取流（真机会在验证窗口内连接代理；
+                        // 这也让 0 连接守卫在测试里语义正确——只有假接收端才会 0 连接）
+                        if !delivered.is_empty() {
+                            if let Some((host, port, path)) = parse_http_url(&delivered) {
+                                tauri::async_runtime::spawn(async move {
+                                    let connected = tokio::net::TcpStream::connect((host.as_str(), port)).await;
+
+                                    if let Ok(mut s) = connected
+                                    {
+                                        let req = format!(
+                                            "GET {} HTTP/1.1
+Host: {}
+Range: bytes=0-65535
+Connection: close
+
+",
+                                            path,
+                                            host_header(&host, port)
+                                        );
+                                        use tokio::io::AsyncWriteExt;
+                                        let _ = s.write_all(req.as_bytes()).await;
+                                        // 写完立即断开（FIN）：目的是让代理连接计数 +1；
+                                        // 不读响应，避免与代理的头部读取互相等待
+                                    }
+                                });
+                            }
+                        }
                     }
                     // 响应体：控制类指令回通用应答；GetTransportInfo 按脚本回传输状态
                     let resp_body = if soap_action == "GetTransportInfo" {
@@ -4108,7 +4365,7 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         });
         let server = tokio::spawn(async move {
             let (sock, _) = tv.accept().await.unwrap();
-            serve_live_ts(sock, target, upstream).await
+            serve_live_ts(sock, "t".to_string(), target, upstream, None).await
         });
 
         let mut client = tokio::net::TcpStream::connect(tv_addr).await.unwrap();
@@ -4437,5 +4694,186 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}",
             max_gap,
             sync_ok,
         )
+    }
+
+    // ---- Range 断点续传（模拟三星渐进式取流） ----
+    // 场景：连接 1 读到第 X 字节后断开；连接 2 带 Range: bytes=X- 重连。
+    // 断言：连接 2 返回 206 + Content-Range，且正文与「完整流」的第 X 字节起
+    // 逐字节一致（拼接流的字节布局是确定性的）。
+
+    /// 上游：清单 3 片，各片内容不同且大小不同（1880/940/2820 字节）。
+    async fn spawn_range_upstream() -> std::net::SocketAddr {
+        use tokio::io::AsyncWriteExt;
+        let up = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = up.local_addr().unwrap();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = up.accept().await else { break };
+                tauri::async_runtime::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let (body, ct): (&[u8], &str) = if path.contains("index.m3u8") {
+                        (
+                            b"#EXTM3U\n#EXTINF:5,\nseg1.ts\n#EXTINF:5,\nseg2.ts\n#EXTINF:5,\nseg3.ts\n#EXT-X-ENDLIST\n",
+                            "application/vnd.apple.mpegurl",
+                        )
+                    } else if path.contains("seg1") {
+                        (Box::leak(vec![b'A'; 1880].into_boxed_slice()), "video/mp2t")
+                    } else if path.contains("seg2") {
+                        (Box::leak(vec![b'B'; 940].into_boxed_slice()), "video/mp2t")
+                    } else {
+                        (Box::leak(vec![b'C'; 2820].into_boxed_slice()), "video/mp2t")
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        ct,
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        addr
+    }
+
+    fn range_upstream_handle() -> Arc<Upstream> {
+        Arc::new(Upstream {
+            referer: None,
+            user_agent: None,
+            cookie: None,
+            token: "rt".to_string(),
+            is_samsung: false,
+            ad_uris: Vec::new(),
+        })
+    }
+
+    /// 读恰好 want 字节（不足则读到对端关闭，返回实际读数）。
+    async fn read_exact_or_eof(sock: &mut tokio::net::TcpStream, want: usize) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut out = Vec::with_capacity(want);
+        let mut chunk = [0u8; 4096];
+        while out.len() < want {
+            let n = sock.read(&mut chunk).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            let take = n.min(want - out.len());
+            out.extend_from_slice(&chunk[..take]);
+            if out.len() >= want {
+                break;
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn live_ts_range_resume_is_byte_exact() {
+        // 完整参考流：三片拼接 = A*1880 + B*940 + C*2820 = 5640 字节
+        let mut full: Vec<u8> = Vec::new();
+        full.extend(std::iter::repeat(b'A').take(1880));
+        full.extend(std::iter::repeat(b'B').take(940));
+        full.extend(std::iter::repeat(b'C').take(2820));
+
+        let up_addr = spawn_range_upstream().await;
+        let target = format!("http://{}/index.m3u8", up_addr);
+        let token = "range-token-1".to_string();
+        let upstream = range_upstream_handle();
+
+        let tv = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tv_addr = tv.local_addr().unwrap();
+
+        // 连接 1（无 Range）：整条读到 EOF，验证服务端全流正确
+        let mut client1 = tokio::net::TcpStream::connect(tv_addr).await.unwrap();
+        let (sock1, _) = tv.accept().await.unwrap();
+        let server1 = tokio::spawn(serve_live_ts(
+            sock1,
+            token.clone(),
+            target.clone(),
+            upstream.clone(),
+            None,
+        ));
+        let mut stream1: Vec<u8> = Vec::new();
+        let mut chunk1 = [0u8; 8192];
+        loop {
+            let n = client1.read(&mut chunk1).await.unwrap_or(0);
+            if n == 0 { break; }
+            stream1.extend_from_slice(&chunk1[..n]);
+        }
+        let _ = server1.await;
+        let head_end1 = stream1.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(0);
+        let head1_text = String::from_utf8_lossy(&stream1[..head_end1]).to_string();
+        assert!(head1_text.starts_with("HTTP/1.1 200"), "首连应 200: {}", head1_text);
+        assert!(head1_text.contains("Accept-Ranges: bytes"), "应声明支持 Range");
+        let body1 = &stream1[head_end1..];
+        assert_eq!(body1, &full[..], "首连全流应与参考流逐字节一致");
+
+        // 连接 2（Range: bytes=2000- 续传）：206 + Content-Range，正文与完整流第 2000 字节起逐字节一致
+        let mut client2 = tokio::net::TcpStream::connect(tv_addr).await.unwrap();
+        let (sock2, _) = tv.accept().await.unwrap();
+        let server2 = tokio::spawn(serve_live_ts(
+            sock2,
+            token.clone(),
+            target.clone(),
+            upstream.clone(),
+            Some("bytes=2000-".to_string()),
+        ));
+        let mut stream2: Vec<u8> = Vec::new();
+        let mut chunk2 = [0u8; 8192];
+        loop {
+            let n = client2.read(&mut chunk2).await.unwrap_or(0);
+            if n == 0 { break; }
+            stream2.extend_from_slice(&chunk2[..n]);
+        }
+        let _ = server2.await;
+        let head_end2 = stream2.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(0);
+        let head2_text = String::from_utf8_lossy(&stream2[..head_end2]).to_string();
+        assert!(
+            head2_text.starts_with("HTTP/1.1 206"),
+            "续传应 206: {}",
+            head2_text
+        );
+        assert!(
+            head2_text.contains("Content-Range: bytes 2000-/*"),
+            "应带 Content-Range: {}",
+            head2_text
+        );
+        let body2 = &stream2[head_end2..];
+        assert_eq!(body2, &full[2000..], "续传内容应与完整流逐字节一致");
+
+        // 连接 3（无 Range）：状态重置，从头全新下发
+        let mut client3 = tokio::net::TcpStream::connect(tv_addr).await.unwrap();
+        let (sock3, _) = tv.accept().await.unwrap();
+        let server3 = tokio::spawn(serve_live_ts(
+            sock3,
+            token.clone(),
+            target.clone(),
+            upstream,
+            None,
+        ));
+        let mut stream3: Vec<u8> = Vec::new();
+        let mut chunk3 = [0u8; 8192];
+        loop {
+            let n = client3.read(&mut chunk3).await.unwrap_or(0);
+            if n == 0 { break; }
+            stream3.extend_from_slice(&chunk3[..n]);
+        }
+        let _ = server3.await;
+        let body3 = &stream3[stream3.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(0)..];
+        assert_eq!(body3, &full[..], "无 Range 重连应从头完整下发");
+    }
+
+    #[test]
+    fn parse_range_start_variants() {
+        assert_eq!(parse_range_start(&Some("bytes=0-".to_string())), None, "bytes=0- 视为全新下发");
+        assert_eq!(parse_range_start(&Some("bytes=12345-".to_string())), Some(12345));
+        assert_eq!(parse_range_start(&Some("bytes=100-200".to_string())), Some(100));
+        assert_eq!(parse_range_start(&Some("bytes=-500".to_string())), None, "后缀 Range 无法映射，忽略");
+        assert_eq!(parse_range_start(&Some("bytes=abc-".to_string())), None);
+        assert_eq!(parse_range_start(&None), None);
+        assert_eq!(parse_range_start(&Some("bytes=".to_string())), None);
     }
 }

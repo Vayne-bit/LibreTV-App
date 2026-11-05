@@ -313,15 +313,26 @@
         overlay.style.cssText = 'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;';
         const panel = document.createElement('div');
         panel.style.cssText = 'background:#1e1e1e;color:#eee;border-radius:12px;padding:20px;min-width:260px;max-width:85vw;max-height:70vh;overflow:auto;';
-        panel.innerHTML = '<div style="font-size:15px;margin-bottom:12px;">选择投屏设备</div>';
-        devices.forEach(function (device) {
-            const protocol = device.protocol === 'airplay' ? 'AirPlay' : 'DLNA';
+        // 三星电视常同时出现多个接收端：9197 端口的 DMR 是原生 DLNA（无第三方介入），
+        // 其余（乐播类 SDK 注册的）可能先应答再弹扫码收费。原生排最前并加标记，
+        // 让用户一眼选对。
+        const isNativeSamsung = d => /:9197\//.test(d.control_url || '');
+        const sorted = devices.slice().sort((a, b) => {
+            const an = isNativeSamsung(a) ? 0 : 1, bn = isNativeSamsung(b) ? 0 : 1;
+            return an - bn;
+        });
+        panel.innerHTML = '<div style="font-size:15px;margin-bottom:6px;">选择投屏设备</div>' +
+            '<div style="font-size:12px;opacity:.6;margin-bottom:12px;">同一台电视出现多个入口时，优先选带「原生」标记的——第三方接收端（乐播类）可能要求扫码激活后才能投</div>';
+        sorted.forEach(function (device) {
+            const native = isNativeSamsung(device);
+            const protocol = native ? '三星原生DLNA'
+                : (device.protocol === 'airplay' ? 'AirPlay' : 'DLNA');
             const button = document.createElement('button');
             button.type = 'button';
-            button.textContent = (device.name || device.control_url) + '  〔' + protocol + '〕';
-            button.style.cssText = 'display:block;width:100%;text-align:left;padding:10px 12px;margin:4px 0;background:#2b2b2b;color:#eee;border:1px solid #3a3a3a;border-radius:8px;font-size:14px;cursor:pointer;word-break:break-all;';
+            button.textContent = (native ? '★ ' : '') + (device.name || device.control_url) + '  〔' + protocol + '〕';
+            button.style.cssText = 'display:block;width:100%;text-align:left;padding:10px 12px;margin:4px 0;background:' + (native ? '#33302b' : '#2b2b2b') + ';color:#eee;border:1px solid ' + (native ? '#8a6d3b' : '#3a3a3a') + ';border-radius:8px;font-size:14px;cursor:pointer;word-break:break-all;';
             button.onmouseenter = function () { button.style.background = '#3a3a3a'; };
-            button.onmouseleave = function () { button.style.background = '#2b2b2b'; };
+            button.onmouseleave = function () { button.style.background = native ? '#33302b' : '#2b2b2b'; };
             button.onclick = function () {
                 removeDeviceChooser();
                 onDeviceChosen(device);
