@@ -2998,6 +2998,7 @@ async fn fetch_segment_cached(seg: String, upstream: Arc<Upstream>) -> Result<Ve
     if let Ok(data) = &fetched {
         if let Ok(mut map) = TS_SEGMENT_CACHE.lock() {
             map.insert(seg.clone(), data.clone());
+            ts_seg_cache_evict(&mut map);
         }
     }
     fetched
@@ -3292,8 +3293,16 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
     // 单连接串行时，任一分片的下载慢都会直接饿死电视缓冲（转圈）；
     // 并行预取把有效供给拉回多连接水平（与浏览器里 hls.js 的行为一致）。
     let mut pending: std::collections::VecDeque<String> = pending.into_iter().collect();
+    // AbortOnDrop：serve_live_ts 无论从哪条路径返回（电视断开/错误/播完），
+    // 未完成的预取任务都随 inflight 的 drop 自动取消——
+    // 否则旧连接的最多 6 个下载继续占带宽，新连接又开 6 个抓同样的分片，
+    // 12 次连接的带宽就这样被自己瓜分（外部审查实证）。
+    struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+    impl<T> Drop for AbortOnDrop<T> {
+        fn drop(&mut self) { self.0.abort(); }
+    }
     let mut inflight: std::collections::VecDeque<
-        (String, tokio::task::JoinHandle<Result<Vec<u8>, String>>),
+        (String, AbortOnDrop<Result<Vec<u8>, String>>),
     > = std::collections::VecDeque::new();
     loop {
         // 填满预取窗口
@@ -3307,10 +3316,10 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
             let upstream_task = upstream.clone();
             inflight.push_back((
                 seg.clone(),
-                tokio::spawn(async move { fetch_segment_cached(seg, upstream_task).await }),
+                AbortOnDrop(tokio::spawn(async move { fetch_segment_cached(seg, upstream_task).await })),
             ));
         }
-        let Some((seg, handle)) = inflight.pop_front() else {
+        let Some((seg, mut handle)) = inflight.pop_front() else {
             // 本批分片已全部喂完
             if endlist {
                 break; // VOD：整部播完
@@ -3326,7 +3335,7 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
             }
             continue;
         };
-        let data = match handle.await {
+        let data = match (&mut handle.0).await {
             Ok(Ok(data)) => {
                 consecutive_failures = 0;
                 data
@@ -3362,6 +3371,18 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
                 continue;
             }
         };
+        // 佈局登记移到写之前：分片大小在下载时已知，与写出成功与否无关。
+        // 以前在 write_all 之后登记——电视断在写一半时，已送出的部分没有
+        // 被记录，重连 Range > total_bytes → locate_resume 回 None → 重置
+        // 从 0 重发 → PTS 回跳 → 中止 → 无限循环（外部审查实证的根因）。
+        if let Ok(mut map) = TS_STREAM_STATES.lock() {
+            if let Some(st) = map.get_mut(&token) {
+                if !st.served.iter().any(|(u, _)| *u == seg) {
+                    st.total_bytes += data.len() as u64;
+                    st.served.push((seg.clone(), data.len() as u64));
+                }
+            }
+        }
         // 断点续传：丢弃电视已收到的字节（按字节位置精确对齐）
         let mut out: &[u8] = &data;
         if skip_now > 0 {
@@ -3369,23 +3390,12 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
             out = &out[skip..];
             skip_now -= skip as u64;
             if out.is_empty() {
-                // 整片都被跳过：该分片已在会话状态里，不重复登记
                 continue;
             }
         }
-        // 写失败只可能是电视主动断开（切集/退出投屏），是正常结束，
-        // 不能当成故障去重连或降级。
+        // 写失败只可能是电视主动断开（切集/退出投屏），是正常结束。
         if stream.write_all(out).await.is_err() || stream.flush().await.is_err() {
             return Ok(());
-        }
-        // 登记进会话状态（续传锚点分片已在表中，只登记新分片）
-        if let Ok(mut map) = TS_STREAM_STATES.lock() {
-            if let Some(st) = map.get_mut(&token) {
-                if !st.served.iter().any(|(u, _)| *u == seg) {
-                    st.total_bytes += out.len() as u64;
-                    st.served.push((seg.clone(), out.len() as u64));
-                }
-            }
         }
     }
     Ok(())
