@@ -2401,7 +2401,6 @@ async fn write_status(stream: &mut tokio::net::TcpStream, status: &str, body: &[
 }
 
 async fn handle_proxy_conn(mut stream: tokio::net::TcpStream, upstream: Arc<Upstream>) -> Result<(), String> {
-    #[cfg(test)]
     // 读请求头（最多 16KB）
     let mut buffer = vec![0u8; 16384];
     let mut received = 0usize;
