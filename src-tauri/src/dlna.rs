@@ -751,15 +751,34 @@ pub async fn dlna_diagnostics(
         let state = TS_STREAM_STATES.lock().ok().and_then(|m| m.get(&ts_token).cloned());
         match state {
             Some(st) if st.connections > 0 => {
+                let elapsed = st
+                    .started_at
+                    .map(|t| t.elapsed().as_secs_f64())
+                    .unwrap_or(0.0);
+                let speed = if elapsed > 1.0 && st.total_bytes > 0 {
+                    format!("，平均供给 {:.0} KB/s", st.total_bytes as f64 / 1024.0 / elapsed)
+                } else {
+                    String::new()
+                };
                 report.push_str(&format!(
-                    "  TS 会话: 取流连接 {} 次（断点续传 {} 次），已下发 {:.1} MB（{} 个分片序列）\n",
+                    "  TS 会话: 取流连接 {} 次（断点续传 {} 次），已下发 {:.1} MB（{} 个分片序列{}）\n",
                     st.connections,
                     st.resume_hits,
                     st.total_bytes as f64 / 1048576.0,
-                    st.served.len()
+                    st.served.len(),
+                    speed
                 ));
                 if st.resume_hits == 0 && st.connections > 2 {
                     report.push_str("  判读: 电视多次重连但从未命中断点续传——旧版本 APK 请升级后重试\n");
+                } else if elapsed > 10.0 && st.total_bytes > 0 {
+                    let kbps = st.total_bytes as f64 / 1024.0 / elapsed;
+                    if kbps < 250.0 {
+                        report.push_str(&format!(
+                            "  判读: 平均供给 {:.0} KB/s 低于常见内容码率（250~375 KB/s），电视缓冲会被喝干——\n\
+                             \x20 属网络供给不足：靠近路由器/换 5GHz Wi-Fi/换播放源试试\n",
+                            kbps
+                        ));
+                    }
                 }
             }
             _ => report.push_str("  TS 会话: 本次无取流连接记录\n"),
@@ -2913,7 +2932,10 @@ async fn fetch_segment_bytes(url: &str, upstream: &Upstream) -> Result<Vec<u8>, 
 const TS_PRIME_SEGMENTS: usize = 2;
 
 /// 预取窗口深度：同时在上游挂着的分片请求数。写出仍严格按清单顺序。
-const TS_PREFETCH_DEPTH: usize = 3;
+// 深度 6 的依据（真机 1.5.3 诊断）：弱网单连接吞吐可低至 46 KB/s，
+// 3 连 ≈ 138 KB/s 低于常见 2~3 Mbps 内容码率，电视缓冲被喝干即中止。
+// 6 连 ≈ 276 KB/s 起步，与 App 内 hls.js 的并行度对齐。内存代价 ~6MB。
+const TS_PREFETCH_DEPTH: usize = 6;
 
 /// 预热缓存：分片 URL → 已拉取的字节。投屏发起时填充，serve_live_ts 消费
 /// （取出即删）。下一次投屏会整体清空，不会跨会话积累。
@@ -2988,6 +3010,7 @@ struct TsStreamState {
     total_bytes: u64,
     connections: u32,
     resume_hits: u32,
+    started_at: Option<std::time::Instant>, // 会话首次连接时刻（供给速率分母）
 }
 
 static TS_STREAM_STATES: Lazy<Mutex<HashMap<String, TsStreamState>>> =
@@ -3098,43 +3121,99 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
     let mut resume_status = "200 OK";
     let mut resume_content_range = String::new();
     let mut resume_seed_urls: Vec<String> = Vec::new();
-    let requested_offset = parse_range_start(&range).filter(|n| *n > 0);
-    if let Some(n) = requested_offset {
-        if let Some(st) = TS_STREAM_STATES.lock().ok().and_then(|m| m.get(&token).cloned()) {
+    // 续传偏移的三个来源（优先级从高到低）：
+    //   a. Range: bytes=N-（N>0）——电视明确要第 N 字节起
+    //   b. 无 Range 的同会话重连——从会话已下发末尾继续。电视换连接不换位置：
+    //      重置会让进度清零回到 0:00（真机实测「转圈回到起点」的来源之一）。
+    //      用户新投屏是全新 token，不会走到这里。
+    //   c. bytes=0- / Range 落在会话之外 / 首次连接——全新下发
+    let requested_offset = parse_range_start(&range);
+    let session = TS_STREAM_STATES.lock().ok().and_then(|m| m.get(&token).cloned());
+    let has_session_progress = session
+        .as_ref()
+        .map(|st| !st.served.is_empty() && st.total_bytes > 0)
+        .unwrap_or(false);
+    // VOD 重播检测：会话已把清单全部分片下发完、电视又无 Range 重连
+    // = 用户按了重播，重置后从头下发（而不是续传到「已播完的末尾」）
+    let replay_vod = endlist
+        && session
+            .as_ref()
+            .map(|st| st.served.len() >= pending.len() && st.total_bytes > 0)
+            .unwrap_or(false);
+    let resume_offset = match requested_offset {
+        Some(n) if n > 0 => Some(n),
+        Some(_) => None, // bytes=0-：电视明确要完整重载，走全新下发
+        None if has_session_progress && !replay_vod => {
+            session.as_ref().map(|st| st.total_bytes)
+        }
+        None => None,
+    };
+    if let Some(n) = resume_offset {
+        if let Some(st) = session.clone() {
             if let Some((idx, offset)) = locate_resume(&st, n) {
-                let anchor_url = st.served.get(idx).map(|(u, _)| u.clone());
                 let after_last = idx >= st.served.len();
-                let pos = anchor_url.as_ref().and_then(|u| pending.iter().position(|p| p == u));
-                if let Some(p) = pos {
-                    // FromSegment：从锚点分片的 offset 字节起；AfterSegment（恰好完整下发完）：
-                    // 从锚点的下一分片起。对不上锚点（清单变化）时退回全新下发。
-                    let drain_to = if after_last { p + 1 } else { p };
-                    if drain_to <= pending.len() {
-                        pending.drain(..drain_to);
-                        resume_plan = Some((idx, offset));
-                        resume_skip = offset;
-                        resume_status = "206 Partial Content";
-                        resume_content_range = format!("Content-Range: bytes {}-/*\r\n", n);
-                        resume_seed_urls = st
-                            .served
-                            .iter()
-                            .take(idx.min(st.served.len()))
-                            .map(|(u, _)| u.clone())
-                            .collect();
-                        if let Ok(mut map) = TS_STREAM_STATES.lock() {
-                            if let Some(st) = map.get_mut(&token) {
-                                st.resume_hits += 1;
+                let anchor_url = if after_last {
+                    st.served.last().map(|(u, _)| u.clone())
+                } else {
+                    st.served.get(idx).map(|(u, _)| u.clone())
+                };
+                if let Some(anchor) = anchor_url {
+                    if let Some(p) = pending.iter().position(|q| *q == anchor) {
+                        let drain_to = if after_last { p + 1 } else { p };
+                        if drain_to <= pending.len() {
+                            pending.drain(..drain_to);
+                            resume_plan = Some((idx, offset));
+                            resume_skip = offset;
+                            resume_status = "206 Partial Content";
+                            resume_content_range = format!("Content-Range: bytes {}-/*
+", n);
+                            // 种子集只含「已完整下发」的分片（0..idx）。
+                            // 锚点分片（idx）是部分下发——剩余部分要写出，不能进去重集
+                            resume_seed_urls = st
+                                .served
+                                .iter()
+                                .take(idx.min(st.served.len()))
+                                .map(|(u, _)| u.clone())
+                                .collect();
+                            if let Ok(mut map) = TS_STREAM_STATES.lock() {
+                                if let Some(st) = map.get_mut(&token) {
+                                    st.resume_hits += 1;
+                                    st.connections += 1;
+                                }
                             }
                         }
                     }
                 }
             }
         }
+        // Range 落在会话之外（对不上锚点）或 bytes=0-：全新下发（重置状态）
+        if resume_plan.is_none() {
+            if let Ok(mut map) = TS_STREAM_STATES.lock() {
+                map.insert(
+                    token.clone(),
+                    TsStreamState { connections: 1, started_at: Some(Instant::now()), ..Default::default() },
+                );
+                ts_state_evict_extra(&mut map);
+            }
+        }
     } else {
-        // 全新下发：重置该会话状态并淘汰最不活跃的旧会话
+        // 首次连接（会话不存在）：登记新会话并淘汰最不活跃的旧会话
         if let Ok(mut map) = TS_STREAM_STATES.lock() {
-            map.insert(token.clone(), TsStreamState { connections: 1, ..Default::default() });
-            ts_state_evict_extra(&mut map);
+            if map.contains_key(&token) {
+                if let Some(st) = map.get_mut(&token) {
+                    st.connections += 1;
+                }
+            } else {
+                ts_state_evict_extra(&mut map);
+                map.insert(
+                    token.clone(),
+                    TsStreamState {
+                        connections: 1,
+                        started_at: Some(Instant::now()),
+                        ..Default::default()
+                    },
+                );
+            }
         }
     }
 
