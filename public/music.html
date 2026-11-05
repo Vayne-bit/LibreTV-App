@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="referrer" content="no-referrer">
+    <title>音乐 - LibreTV</title>
+    <link rel="icon" href="image/retrotv_5520.png">
+    <script src="js/version_data.js"></script>
+    <link rel="stylesheet" href="css/app.css">
+    <link rel="stylesheet" href="css/music.css">
+</head>
+<body>
+<div class="music-page">
+    <header class="music-header">
+        <div class="music-top">
+            <button type="button" class="music-back" onclick="window.location.href='index.html'" aria-label="返回首页">
+                <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15.5 4.5L8 12l7.5 7.5"/></svg>
+            </button>
+            <span class="music-logo">♪ LibreMusic</span>
+            <form id="musicSearchForm" class="music-search-form">
+                <input id="musicSearchInput" type="search" placeholder="搜索歌曲、歌手" autocomplete="off" enterkeyhint="search">
+                <button type="submit">搜索</button>
+            </form>
+        </div>
+        <div id="musicHotTags" class="hot-tags"></div>
+        <nav class="music-tabs" role="tablist">
+            <button type="button" data-music-tab="search" class="active">搜索</button>
+            <button type="button" data-music-tab="queue">队列</button>
+            <button type="button" data-music-tab="favorites">收藏</button>
+            <button type="button" data-music-tab="downloads">下载</button>
+            <button type="button" data-music-tab="plugins">音源</button>
+        </nav>
+    </header>
+
+    <main>
+        <section id="musicView-search" class="music-view">
+            <div id="searchResults"><div class="music-empty">输入歌名、歌手搜索；或点上面的热门标签试试</div></div>
+        </section>
+
+        <section id="musicView-queue" class="music-view hidden">
+            <div id="queueList"></div>
+        </section>
+
+        <section id="musicView-favorites" class="music-view hidden">
+            <div id="favList"></div>
+        </section>
+
+        <section id="musicView-downloads" class="music-view hidden">
+            <div id="dlList"></div>
+        </section>
+
+        <section id="musicView-plugins" class="music-view hidden">
+            <div class="plugin-import-box">
+                <div class="hint">
+                    导入音乐源插件扩展更多平台（兼容 MusicFree 插件格式：CommonJS，
+                    需实现 search / getMediaSource 等函数）。插件在页面同一 JS 上下文运行，
+                    只导入可信来源；本应用不内置任何解锁类音源，付费内容能否播放由源决定。
+                    网页版受浏览器 CORS 限制，内置源需在 App 内使用（走本机通道，无跨域限制）。
+                </div>
+                <textarea id="pluginImportText" placeholder="粘贴插件 JS 全文…"></textarea>
+                <button type="button" id="pluginImportBtn">导入插件</button>
+            </div>
+            <div id="pluginList" style="margin-top:12px;"></div>
+        </section>
+    </main>
+
+    <!-- 歌词面板 -->
+    <div id="lyricsPanel" class="lyrics-panel hidden">
+        <div class="lyrics-head">
+            <span class="t" id="lyricsTitle">歌词</span>
+            <button type="button" id="lyricsCloseBtn">关闭</button>
+        </div>
+        <div id="lyricsList" class="lyrics-list"><div class="lyric-empty">暂无歌词</div></div>
+    </div>
+
+    <!-- 底部播放条 -->
+    <div class="music-bar">
+        <div class="music-bar-main">
+            <div id="barCover" class="bar-cover no-art">♪</div>
+            <div class="bar-main-info" id="barInfo" style="cursor:pointer;">
+                <div class="bar-title" id="barTitle">未在播放</div>
+                <div class="bar-artist" id="barArtist"></div>
+            </div>
+            <div class="bar-ctrl">
+                <button type="button" class="bar-btn" id="barPrevBtn" aria-label="上一首">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M7 6h2v12H7zM20 6l-10 6 10 6z"/></svg>
+                </button>
+                <button type="button" class="bar-btn primary" id="barPlayBtn" aria-label="播放/暂停"></button>
+                <button type="button" class="bar-btn" id="barNextBtn" aria-label="下一首">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M15 6h2v12h-2zM4 6l10 6-10 6z"/></svg>
+                </button>
+                <button type="button" class="bar-btn" id="barLyricBtn" aria-label="歌词">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 11h16M4 16h10"/></svg>
+                </button>
+            </div>
+        </div>
+        <div class="bar-progress-row">
+            <span class="time" id="musicProgressCur">0:00</span>
+            <input type="range" id="musicProgress" min="0" max="600" value="0" step="1" aria-label="播放进度">
+            <span class="time" id="musicProgressDur">0:00</span>
+        </div>
+    </div>
+</div>
+
+<script src="js/common.js"></script>
+<script src="js/music/music_core.js"></script>
+<script src="js/music/music_plugins.js"></script>
+<script src="js/music/music_lyrics.js"></script>
+<script src="js/music/music_download.js"></script>
+<script src="js/music/music_player.js"></script>
+<script src="js/music/music_search.js"></script>
+<script src="js/music/music_ui.js"></script>
+<script>
+(function () {
+    'use strict';
+    // music.html 不加载 ui.js：这里给一个轻量 toast 兜底（ui.js 若在场则不覆盖）
+    if (typeof window.showToast !== 'function') {
+        window.showToast = function (message, type) {
+            let el = document.getElementById('musicToast');
+            if (!el) {
+                el = document.createElement('div');
+                el.id = 'musicToast';
+                el.style.cssText = 'position:fixed;top:14%;left:50%;transform:translateX(-50%);z-index:99;' +
+                    'background:rgba(30,30,38,.96);color:#eee;padding:10px 18px;border-radius:10px;font-size:13px;' +
+                    'max-width:80vw;box-shadow:0 6px 24px rgba(0,0,0,.4);pointer-events:none;transition:opacity .25s;';
+                document.body.appendChild(el);
+            }
+            el.textContent = String(message || '');
+            el.style.color = type === 'error' ? '#ff8a8a' : (type === 'success' ? '#8affc1' : (type === 'warning' ? '#ffd28a' : '#eee'));
+            el.style.opacity = '1';
+            clearTimeout(el._timer);
+            el._timer = setTimeout(() => { el.style.opacity = '0'; }, 2400);
+        };
+    }
+    // 初始化顺序：插件（内置源）→ 持久化状态 → UI → 恢复队列（不自动播，等用户点）
+    MusicPlugin.loadStoredMusicPlugins();
+    loadMusicState();
+    musicUIBind();
+    musicUIRenderPlayerBar();
+    musicUISetView('search');
+    document.getElementById('barInfo').addEventListener('click', function () {
+        var panel = document.getElementById('lyricsPanel');
+        panel.classList.toggle('hidden');
+        if (!panel.classList.contains('hidden')) musicLyricsRender();
+    });
+    // 播放条进度条量程随时长校准
+    if (typeof musicPlayerUI !== 'undefined' && musicPlayerUI.onTimeUpdate) {
+        var rawOnTime = musicPlayerUI.onTimeUpdate;
+        musicPlayerUI.onTimeUpdate = function (current, duration) {
+            var bar = document.getElementById('musicProgress');
+            if (bar && duration > 0 && !bar.matches(':active')) bar.max = String(Math.ceil(duration));
+            rawOnTime(current, duration);
+        };
+    }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,76 @@
+/* ============ 音乐页样式 ============ */
+
+.music-page { min-height: 100dvh; background: var(--safe-bg, #101014); color: #e8e8ee; padding-bottom: 92px; }
+.music-header { position: sticky; top: 0; z-index: 20; background: rgba(16,16,20,.92); backdrop-filter: blur(10px); padding: 10px 12px 6px; }
+.music-top { display: flex; align-items: center; gap: 10px; }
+.music-back { background: none; border: none; color: #bbb; padding: 6px; cursor: pointer; }
+.music-logo { font-weight: 700; font-size: 16px; display: flex; align-items: center; gap: 6px; }
+.music-search-form { flex: 1; display: flex; gap: 8px; }
+.music-search-form input { flex: 1; background: #1c1c22; border: 1px solid #2c2c34; color: #eee; border-radius: 20px; padding: 8px 14px; font-size: 14px; outline: none; }
+.music-search-form input:focus { border-color: #fb7299; }
+.music-search-form button { background: #fb7299; border: none; color: #fff; border-radius: 20px; padding: 0 16px; cursor: pointer; font-size: 14px; }
+
+.hot-tags { display: flex; gap: 8px; overflow-x: auto; padding: 8px 2px 4px; scrollbar-width: none; }
+.hot-tags::-webkit-scrollbar { display: none; }
+.hot-tags .chip { flex: none; background: #1c1c22; border: 1px solid #2c2c34; color: #bbb; border-radius: 14px; padding: 4px 12px; font-size: 12px; cursor: pointer; }
+.hot-tags .chip.active, .hot-tags .chip:active { border-color: #fb7299; color: #fb7299; }
+
+.music-tabs { display: flex; gap: 4px; padding: 6px 2px; }
+.music-tabs button { flex: 1; background: none; border: none; color: #999; font-size: 13px; padding: 7px 0; border-radius: 8px; cursor: pointer; }
+.music-tabs button.active { background: #22222a; color: #fb7299; font-weight: 600; }
+
+.music-view { padding: 4px 10px; }
+.music-empty { color: #777; text-align: center; padding: 36px 0; font-size: 13px; }
+.music-more { display: block; width: 100%; background: none; border: 1px solid #2c2c34; color: #aaa; border-radius: 10px; padding: 9px; margin: 8px 0; cursor: pointer; font-size: 13px; }
+
+.music-row { display: flex; align-items: center; gap: 10px; padding: 8px 4px; border-radius: 10px; }
+.music-row.playing { background: rgba(251,114,153,.08); }
+.music-row.playing .music-row-title { color: #fb7299; }
+.music-row-play { width: 30px; text-align: center; color: #888; cursor: pointer; flex: none; }
+.music-row.playing .music-row-num { color: #fb7299; }
+.music-row-art { width: 44px; height: 44px; border-radius: 8px; flex: none; background: #222 center/cover no-repeat; }
+.music-row-art.no-art { background-image: none; display: flex; align-items: center; justify-content: center; color: #555; }
+.music-row-art.no-art::before { content: '♪'; font-size: 18px; }
+.music-row-main { flex: 1; min-width: 0; }
+.music-row-title { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.music-row-sub { font-size: 12px; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
+.music-src { margin-left: 6px; padding: 1px 6px; border: 1px solid #33333c; border-radius: 8px; font-size: 10px; color: #777; }
+.music-tag { margin-left: 6px; padding: 1px 6px; border-radius: 8px; font-size: 10px; background: rgba(251,114,153,.15); color: #fb7299; }
+.music-row-actions { display: flex; gap: 2px; flex: none; }
+.music-row-btn { background: none; border: none; color: #888; padding: 6px; cursor: pointer; font-size: 14px; }
+.music-row-btn.danger { color: #e05c5c; }
+.music-row-btn:active { color: #fb7299; }
+
+.music-progress { height: 3px; background: #2c2c34; border-radius: 2px; overflow: hidden; margin-top: 6px; }
+.music-progress i { display: block; height: 100%; background: #fb7299; }
+
+/* 播放条 */
+.music-bar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 30; background: rgba(20,20,26,.97); border-top: 1px solid #26262e; padding: 8px 12px calc(8px + env(safe-area-inset-bottom)); }
+.music-bar-main { display: flex; align-items: center; gap: 10px; }
+.bar-cover { width: 44px; height: 44px; border-radius: 8px; flex: none; background: #26262e center/cover no-repeat; display: flex; align-items: center; justify-content: center; color: #555; }
+.bar-cover.no-art { background-image: none; }
+.bar-main-info { flex: 1; min-width: 0; }
+.bar-title { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar-artist { font-size: 12px; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
+.bar-ctrl { display: flex; align-items: center; gap: 4px; }
+.bar-btn { background: none; border: none; color: #ccc; padding: 8px; cursor: pointer; }
+.bar-btn.primary { color: #fb7299; }
+.bar-progress-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.bar-progress-row .time { font-size: 11px; color: #777; flex: none; min-width: 34px; text-align: center; }
+.music-bar input[type="range"] { flex: 1; accent-color: #fb7299; height: 3px; }
+
+/* 歌词面板 */
+.lyrics-panel { position: fixed; inset: 0; z-index: 40; background: rgba(12,12,16,.98); display: flex; flex-direction: column; }
+.lyrics-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; }
+.lyrics-head .t { font-weight: 600; }
+.lyrics-head button { background: none; border: none; color: #999; font-size: 14px; cursor: pointer; }
+.lyrics-list { flex: 1; overflow-y: auto; padding: 10px 20px 80px; text-align: center; }
+.lyric-line { padding: 8px 0; color: #777; font-size: 15px; line-height: 1.6; transition: color .2s; }
+.lyric-line.active { color: #fb7299; font-size: 17px; }
+.lyric-empty { text-align: center; color: #666; padding-top: 40%; }
+
+/* 插件管理 */
+.plugin-import-box textarea { width: 100%; box-sizing: border-box; min-height: 90px; background: #1c1c22; border: 1px solid #2c2c34; color: #ddd; border-radius: 10px; padding: 10px; font-size: 12px; font-family: monospace; resize: vertical; }
+.plugin-import-box .hint { font-size: 11px; color: #777; margin: 6px 0; line-height: 1.6; }
+.plugin-import-box button { width: 100%; background: #fb7299; border: none; color: #fff; border-radius: 10px; padding: 10px; cursor: pointer; font-size: 14px; margin-top: 8px; }
+.music-plugin-row { display: flex; align-items: center; gap: 10px; padding: 9px 4px; border-bottom: 1px solid #1e1e24; }
