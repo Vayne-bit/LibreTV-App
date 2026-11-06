@@ -110,6 +110,8 @@ function pickSwitchSourceEpisode(itemName, itemIndex) {
     closeSwitchSourceModal();
 
     // 切源后保持同名剧集的同一集号，并沿用当前播放进度
+    // 持久化放在改全局之前且全部兜底：配额异常时不能留下「全局状态已改、
+    // 持久化没写」的半套状态（下次进页会回到旧源旧集，与当前播放不一致）
     currentVideoTitle = row.vod_name || currentVideoTitle;
     currentEpisodes = row.episodes.slice();
     currentEpisodeNames = row.episodeNames.slice();
@@ -117,16 +119,18 @@ function pickSwitchSourceEpisode(itemName, itemIndex) {
     episodesReversed = false;
     // 倒序状态要跟着落盘：存储里的 true 会让下次进页恢复成倒序，
     // 而用户此刻看到的列表是正序——视图与持久化状态打架
-    try { localStorage.setItem('episodesReversed', 'false'); } catch (e) { /* 存不下就算了 */ }
-    localStorage.setItem('currentEpisodes', JSON.stringify(currentEpisodes));
-    localStorage.setItem('currentEpisodeNames', JSON.stringify(currentEpisodeNames));
-    localStorage.setItem('currentEpisodeIndex', currentEpisodeIndex);
     const info = { ...(switchSourceContext().info || {}) };
     info.sourceCode = row.source_code;
     info.sourceName = row.source_name || '';
     info.vodId = row.vod_id || '';
     info.episodeNames = undefined;
-    localStorage.setItem('currentVideoInfo', JSON.stringify(info));
+    try {
+        localStorage.setItem('episodesReversed', 'false');
+        localStorage.setItem('currentEpisodes', JSON.stringify(currentEpisodes));
+        localStorage.setItem('currentEpisodeNames', JSON.stringify(currentEpisodeNames));
+        localStorage.setItem('currentEpisodeIndex', currentEpisodeIndex);
+        localStorage.setItem('currentVideoInfo', JSON.stringify(info));
+    } catch (e) { /* 存不下就算了：全局状态与本次播放仍一致 */ }
 
     const newUrl = new URL(window.location.href);
     newUrl.searchParams.set('url', url);

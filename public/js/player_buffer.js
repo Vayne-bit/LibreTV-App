@@ -219,7 +219,6 @@ function switchSourceForStall() {
     if (bufferState.switches >= BUFFER_STALL_SWITCH_MAX) return false;
     if (now - bufferState.lastSwitchAt < BUFFER_STALL_SWITCH_COOLDOWN_MS) return false;
     if (!shouldSwitchForStall()) return false;
-    let launched = false;
     try {
         autoRelinkAndPlay({ reason: 'stall' }).then(result => {
             // 换源没真正发生（已在换源中/没找到候选/预算用尽）时不能消耗预算：
@@ -234,12 +233,12 @@ function switchSourceForStall() {
                 bufferState.stalls = [];
                 bufferState.suggested = false;
             }
-        }).catch(() => { launched = false; });
-        launched = true;
+        }).catch(() => {
+            // 异步失败：预算在 then 之外无法同步回收，靠 switches 计数兜底
+        });
     } catch (e) {
         return false;
     }
-    if (!launched) return false;
     bufferState.lastSwitchAt = now;
     bufferState.switches += 1;
     return true;

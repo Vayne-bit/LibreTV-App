@@ -82,10 +82,9 @@
     // ---------- 工具 ----------
 
     function fmt(t) {
-        t = Math.max(0, Math.floor(t || 0));
-        const m = Math.floor(t / 60);
-        const s = t % 60;
-        return m + ':' + (s < 10 ? '0' : '') + s;
+        // 复用 player_utils.formatTime（player.html 里先于本文件加载）：
+        // 旧实现超一小时会显示 75:00，formatTime 显示 1:15:00
+        return formatTime(t);
     }
 
     function toast(msg) {
@@ -318,6 +317,12 @@
         if (art.playing && art.pause) art.pause(); // 长按即暂停，停在要标记的画面上
         // 打开面板时先试一次自动识别：识别到广告块就省掉手动框起止这两步
         detectedAd = detectAdBlock();
+        // 播放器重建后旧面板节点已脱离 DOM（模块级单例还指着它）——
+        // 不检查 isConnected 的话面板永远弹不出来（视频倒是暂停了）
+        if (dialogEl && !dialogEl.isConnected) {
+            try { dialogEl.remove(); } catch (e) { /* 已不在文档 */ }
+            dialogEl = null;
+        }
         if (!dialogEl) {
             dialogEl = buildDialog();
             dialogTimeEl = dialogEl.querySelector('[data-time]');
@@ -391,7 +396,16 @@
             return;
         }
         const playEnd = Math.round((art.currentTime || 0) * 10) / 10;
-        if (playEnd - pendingStart < MIN_SEGMENT_SEC) {
+        // 时长校验必须同轴比较：pendingStart 在 markStart 已换算成原始时间轴，
+        // playEnd 此刻还是播放时间轴——自动过滤删过分片时两条轴有偏差，
+        // 混轴比较会把合法标记误判成「区间太短」。先换算再比较。
+        const playlist = currentPlaylist();
+        const removed = (typeof getRemovedSegmentIds === 'function') ? getRemovedSegmentIds(currentPlaylistUrl()) : null;
+        let e = playEnd;
+        if (playlist && removed && removed.size) {
+            e = playbackToOriginalTime(playlist, playEnd, removed);
+        }
+        if (e - pendingStart < MIN_SEGMENT_SEC) {
             toast('区间太短（不足 ' + MIN_SEGMENT_SEC + ' 秒），像是误触，已忽略');
             return;
         }
@@ -399,13 +413,6 @@
         if (!key) {
             toast('拿不到当前剧集信息，无法保存标记');
             return;
-        }
-        // 手动标记的是播放时间轴，存之前换算成原始时间轴（与自动标记同一格式）
-        const playlist = currentPlaylist();
-        const removed = (typeof getRemovedSegmentIds === 'function') ? getRemovedSegmentIds(currentPlaylistUrl()) : null;
-        let e = playEnd;
-        if (playlist && removed && removed.size) {
-            e = playbackToOriginalTime(playlist, playEnd, removed);
         }
         const s = pendingStart;
         const segs = segmentsFor(key).slice();

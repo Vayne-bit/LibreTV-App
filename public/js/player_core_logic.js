@@ -1,5 +1,10 @@
 // Player Core Logic & Initialization
 
+// 页面级监听（keydown/episodes click/beforeunload…）在 initializePageContent 里绑定
+// 且无幂等守卫——两个入口（DOMContentLoaded/passwordVerified）都可能触发它，
+// 重入会让按键/点集双发。初始化只跑一次，后续密码验证事件无需重复初始化。
+let pageContentInitialized = false;
+
 document.addEventListener('DOMContentLoaded', function () {
     if (!isPasswordVerified()) return;
     initializePageContent();
@@ -19,6 +24,8 @@ function readJsonArray(key) {
 }
 
 function initializePageContent() {
+    if (pageContentInitialized) return;
+    pageContentInitialized = true;
     const urlParams = new URLSearchParams(window.location.search);
     let videoUrl = urlParams.get('url');
     const title = urlParams.get('title');

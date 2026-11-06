@@ -67,6 +67,12 @@ let pendingVideoSeekNotice = '';
 let pendingVideoSeekTimer = null;
 let slowLoadTimer = null;
 let screenWakeLock = null;
+let screenWakeLockRequest = null;
+// hls 错误恢复预算（模块级：initPlayer 的 video:playing 回调要重置它们，
+// 原先声明在 playM3u8 局部作用域里，重置写到了隐式全局上、计数器从不归零——
+// 长片第 4 次可恢复错误后直接 return，既不恢复也不报错，流静默冻住）
+let hlsFatalRecoverCount = 0;
+let hlsBufferAppendErrors = 0;
 
 function clearPendingVideoSeek() {
     pendingVideoSeek = 0;
@@ -168,8 +174,9 @@ function playM3u8(video, url, instance) {
     });
     // 缓存命中时要按当前带宽估算「这些字节真下要多久」，否则 hls.js 会以为网速暴涨而乱升码率
     if (typeof bindSegmentCacheHls === 'function') bindSegmentCacheHls(hls);
-    let fatalRecoverCount = 0;
-    let bufferAppendErrorCount = 0;
+    // 错误恢复预算用模块级计数（见声明处注释），新播放会话重新计满
+    hlsFatalRecoverCount = 0;
+    hlsBufferAppendErrors = 0;
     // 多码率源只有解析完 master playlist 才知道有哪些清晰度，这里同步给角标
     hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
         const levels = (data && data.levels) || [];
@@ -186,13 +193,13 @@ function playM3u8(video, url, instance) {
     });
     hls.on(Hls.Events.ERROR, (event, data) => {
         if (data.details === 'bufferAppendError') {
-            bufferAppendErrorCount++;
-            if (!playbackStarted && bufferAppendErrorCount >= 3) hls.recoverMediaError();
+            hlsBufferAppendErrors++;
+            if (!playbackStarted && hlsBufferAppendErrors >= 3) hls.recoverMediaError();
             return;
         }
         if (!data.fatal) return;
-        fatalRecoverCount++;
-        if (fatalRecoverCount > 3) {
+        hlsFatalRecoverCount++;
+        if (hlsFatalRecoverCount > 3) {
             if (!playbackStarted) handleSourceFailure();
             return;
         }
@@ -490,6 +497,9 @@ function initPlayer(videoUrl) {
     // 一个 hls 实例——双份声音、双倍带宽，而缓冲统计还绑在已成孤儿的旧实例上。
     if (art) {
         try { destroyStreamEngines(art); } catch (e) { /* 引擎本就不在 */ }
+        // 卡顿监测绑定在旧实例上（bufferState.bound 已置 true），不 teardown 的话
+        // 新实例的 setupPlayerBuffer 会静默早退——监测/统计全部失灵
+        try { if (typeof teardownPlayerBuffer === 'function') teardownPlayerBuffer(); } catch (e) { /* 未绑定 */ }
         try { art.destroy(); } catch (e) { /* 已销毁 */ }
         art = null;
     }
@@ -589,8 +599,8 @@ function initPlayer(videoUrl) {
         // 稳定起播说明恢复成功：错误恢复预算重新计满。
         // 以前只增不减，长片里三次互不相关的可恢复错误之后，第四次错误
         // 直接进「片源失效」流程，即使恢复手段仍然有效。
-        fatalRecoverCount = 0;
-        bufferAppendErrorCount = 0;
+        hlsFatalRecoverCount = 0;
+        hlsBufferAppendErrors = 0;
     });
 
     art.on('video:pause', () => {

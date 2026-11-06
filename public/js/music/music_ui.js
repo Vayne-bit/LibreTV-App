@@ -288,6 +288,9 @@ function musicUIBind() {
             if (play) { musicDlPlayOffline(play.dataset.musicDlPlay); return; }
             const del = e.target.closest('[data-music-dl-delete]');
             if (del) {
+                // 下载中删除：置 cancelled——否则任务完成时会把记录写回（删除又复活）
+                const task = typeof musicDlTasks !== 'undefined' ? musicDlTasks.get(del.dataset.musicDlDelete) : null;
+                if (task && task.status === 'downloading') task.cancelled = true;
                 musicDlDelete(del.dataset.musicDlDelete).then(() => {
                     showToast('已删除', 'success');
                     musicUIRenderDownloads();

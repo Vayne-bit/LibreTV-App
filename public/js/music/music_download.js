@@ -105,9 +105,13 @@ async function musicDownloadTrack(item) {
     }
     if (!source || !source.url) return { ok: false, reason: '暂无可用音源（付费内容或源未提供）' };
 
-    const task = { status: 'downloading', received: 0, total: 0, error: '', item };
+    // cancelled 标志：下载中用户删除该曲目时置位——入库前检查，否则删除后
+    // 任务完成又把记录写回来（视频侧 player_download 的 cancelEpisodeDownload
+    // 已正确处理，音乐侧此前漏掉了这层）
+    const task = { status: 'downloading', received: 0, total: 0, error: '', item, cancelled: false };
     musicDlTasks.set(key, task);
     musicDlNotify();
+    let blob = null;
     try {
         // WebView fetch 直取。实测（2026-11-05）：酷狗 sharefs 签名直链无 UA/Referer
         // 要求（206 + audio/mpeg），<audio>/<fetch> 均可直接访问；
@@ -138,6 +142,7 @@ async function musicDownloadTrack(item) {
             blob = await resp.blob();
         }
         if (!blob || !blob.size) throw new Error('文件内容为空');
+        if (task.cancelled) return { ok: false, reason: '该曲目已删除，下载已取消' };
         const ext = (/(\.\w{2,5})(?:\?|$)/.exec(source.url) || [])[1] || '.mp3';
         await musicDlPut({
             key,

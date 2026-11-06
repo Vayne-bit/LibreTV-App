@@ -784,14 +784,6 @@
         }
     }
 
-    function formatCastPosition(secs) {
-        const s = Math.floor(secs || 0);
-        const h = Math.floor(s / 3600);
-        const m = Math.floor((s % 3600) / 60);
-        const ss = String(s % 60).padStart(2, '0');
-        return (h ? h + ':' : '') + m + ':' + ss;
-    }
-
     async function recoverCastViaRelink(status) {
         const art = activeArt;
         try {
@@ -840,7 +832,7 @@
                 protocol: 'dlna'
             };
             notice(art, '已切换到「' + (picked.item.source_name || '新源') + '」，从 '
-                + formatCastPosition(positionSecs) + ' 继续投屏…');
+                + formatTime(positionSecs) + ' 继续投屏…');
             castUrlToDevice(device, url, typeof currentReferer === 'function' ? currentReferer() : null, false, positionSecs);
         } catch (e) {
             console.warn('cast recovery failed', e);

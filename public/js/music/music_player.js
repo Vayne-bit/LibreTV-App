@@ -5,7 +5,9 @@
 
 const musicPlayer = {
     audio: null,
-    failStreak: 0 // 连续播放失败数：连续 3 首失败停止自动前进，避免坏队列无限跳
+    failStreak: 0, // 连续播放失败数：连续 3 首失败停止自动前进，避免坏队列无限跳
+    playToken: 0, // 切歌防陈旧令牌：快速连点时丢弃过期的解析结果
+    objectUrl: null // 离线播放的 ObjectURL（切歌时 revoke，防句柄泄漏）
 };
 
 function musicPlayerEnsure() {
@@ -27,17 +29,46 @@ function musicPlayerEnsure() {
         musicState.playing = true;
         musicPlayer.failStreak = 0;
         if (typeof musicPlayerUI !== 'undefined' && musicPlayerUI.onPlayState) musicPlayerUI.onPlayState(true);
+        musicPlayerSyncMediaSessionState();
     });
     audio.addEventListener('pause', () => {
         musicState.playing = false;
         if (typeof musicPlayerUI !== 'undefined' && musicPlayerUI.onPlayState) musicPlayerUI.onPlayState(false);
+        musicPlayerSyncMediaSessionState();
     });
     audio.addEventListener('error', () => {
         // 当前没有地址（还没播）时 error 是正常空转，不处理
         if (!audio.src) return;
         musicPlayerHandleLoadFail();
     });
+    musicPlayerBindMediaSessionHandlers(audio);
     return audio;
+}
+
+// 切歌前回收上一首离线播放的 ObjectURL（每曲一个 Blob URL，不回收会泄漏）
+function musicPlayerRevokeObjectUrl() {
+    if (musicPlayer.objectUrl) {
+        try { URL.revokeObjectURL(musicPlayer.objectUrl); } catch (e) { /* 已释放 */ }
+        musicPlayer.objectUrl = null;
+    }
+}
+
+// 锁屏/耳机按键（MediaSession）：只设 metadata 的话这些按键完全不工作
+function musicPlayerBindMediaSessionHandlers(audio) {
+    if (typeof navigator === 'undefined' || !navigator.mediaSession || !navigator.mediaSession.setActionHandler) return;
+    try {
+        navigator.mediaSession.setActionHandler('play', () => { audio.play().catch(() => {}); });
+        navigator.mediaSession.setActionHandler('pause', () => { audio.pause(); });
+        navigator.mediaSession.setActionHandler('previoustrack', () => { musicPlayerPlayPrev(); });
+        navigator.mediaSession.setActionHandler('nexttrack', () => { musicPlayerPlayNext(false); });
+    } catch (e) { /* 部分动作不受支持属预期 */ }
+}
+
+function musicPlayerSyncMediaSessionState() {
+    if (typeof navigator === 'undefined' || !navigator.mediaSession) return;
+    try {
+        navigator.mediaSession.playbackState = musicState.playing ? 'playing' : 'paused';
+    } catch (e) { /* 忽略 */ }
 }
 
 // 解析并播放队列中指定下标的曲目
@@ -49,6 +80,9 @@ async function musicPlayerPlayAt(index) {
     const item = queue[index];
     const audio = musicPlayerEnsure();
     audio.pause();
+    // 防陈旧令牌：await 期间用户又点了别的歌时，本次的解析结果直接丢弃
+    // （歌词模块有同样的守卫；缺失它会造成「连点后播回旧曲目」）
+    const token = ++musicPlayer.playToken;
 
     if (typeof musicPlayerUI !== 'undefined' && musicPlayerUI.onLoading) musicPlayerUI.onLoading(item);
     pushMusicRecent(item);
@@ -58,21 +92,25 @@ async function musicPlayerPlayAt(index) {
         // 优先用离线库
         if (typeof musicDlGetBlob === 'function') {
             const local = await musicDlGetBlob(musicKey(item));
+            if (token !== musicPlayer.playToken) return; // 用户已切走
             if (local && local.blob) {
                 source = { url: URL.createObjectURL(local.blob), offline: true };
             }
         }
         if (!source) {
             source = await MusicPlugin.resolveMusicSource(item, 'standard');
+            if (token !== musicPlayer.playToken) return; // 用户已切走
         }
     } catch (e) {
         source = null;
+        if (token !== musicPlayer.playToken) return;
     }
 
     if (!source || !source.url) {
         // 多源替代（FuoEvolve/Parachord 的核心特性）：该源无音源时
         // 在其它启用源里搜同名歌曲，找到可用替代就接着播
         const alt = await musicPlayerFindAlternative(item);
+        if (token !== musicPlayer.playToken) return; // 用户已切走
         if (alt) {
             showToast('「' + (item.title || '') + '」已从「' + alt.sourceName + '」找到替代音源', 'success');
             musicPlayerPlayResolved(alt.item, alt.source, index);
@@ -84,6 +122,8 @@ async function musicPlayerPlayAt(index) {
     }
 
     musicState.currentSource = source;
+    musicPlayerRevokeObjectUrl();
+    if (source.offline && source.url.startsWith('blob:')) musicPlayer.objectUrl = source.url;
     // <audio> 无法带自定义请求头：先直接播；Tauri 环境下带 headers 的源走 Blob 兜底
     audio.src = source.url;
     const playResult = audio.play();
@@ -107,6 +147,7 @@ async function musicPlayerPlayAt(index) {
                 album: item.album || '',
                 artwork: item.artwork ? [{ src: item.artwork, sizes: '240x240' }] : []
             });
+            musicPlayerSyncMediaSessionState();
         } catch (e) { /* MediaSession 不支持不影响播放 */ }
     }
 }
@@ -164,6 +205,8 @@ function musicPlayerPlayResolved(item, source, queueIndex) {
     const audio = musicPlayerEnsure();
     audio.pause();
     musicState.currentSource = source;
+    musicPlayerRevokeObjectUrl();
+    if (source.offline && source.url.startsWith('blob:')) musicPlayer.objectUrl = source.url;
     audio.src = source.url;
     const p = audio.play();
     if (p && typeof p.catch === 'function') {

@@ -2004,7 +2004,10 @@ pub async fn start_local_file_server(
     ensure_local_file_server(app.clone(), preferred_ip).await?;
     let token = generate_session_token();
     let (url, loopback_url) = {
-        let mut guard = LOCAL_FILE.lock().unwrap();
+        // 中毒锁取回内部值：持锁线程 panic 不该让本地文件服务永久失效
+        let mut guard = LOCAL_FILE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match guard.as_mut() {
             Some(state) => {
                 state.files.insert(token.clone(), ref_entry);
@@ -2238,7 +2241,9 @@ pub async fn search_airplay_devices(timeout_ms: Option<u64>) -> Result<Vec<DlnaD
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(3000).clamp(500, 8000));
     // 取/建 mDNS 守护进程（绑定 5353，单例复用，避免重复占用多播端口）
     let daemon = {
-        let mut g = MDNS.lock().unwrap();
+        let mut g = MDNS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if g.is_none() {
             match ServiceDaemon::new() {
                 Ok(d) => *g = Some(d),
@@ -2333,7 +2338,11 @@ async fn ensure_local_file_server(
     app: tauri::AppHandle,
     preferred_ip: Option<IpAddr>,
 ) -> Result<(), String> {
-    if LOCAL_FILE.lock().unwrap().is_some() {
+    if LOCAL_FILE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some()
+    {
         return Ok(());
     }
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0")
@@ -2354,7 +2363,9 @@ async fn ensure_local_file_server(
     };
     let base = format!("http://{}:{}", ip, port);
     {
-        let mut guard = LOCAL_FILE.lock().unwrap();
+        let mut guard = LOCAL_FILE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         *guard = Some(LocalFileState {
             base: base.clone(),
             files: HashMap::new(),
@@ -2422,7 +2433,9 @@ async fn handle_local_file_conn(
     }
     let token = segs[1];
     let entry: Option<LocalFileRef> = {
-        let guard = LOCAL_FILE.lock().unwrap();
+        let guard = LOCAL_FILE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.as_ref().and_then(|s| s.files.get(token)).cloned()
     };
     let entry = match entry {
@@ -2461,7 +2474,21 @@ async fn handle_local_file_conn(
             let fname = extract_fname_from_content_uri(&uri);
             let mime = local_file_mime_from_name(&fname);
             // content:// 经 fs 插件 content resolver 取文件描述符，包装成可 seek 的异步文件
-            let fp: FilePath = uri.parse().unwrap();
+            let fp: FilePath = match uri.parse() {
+                Ok(fp) => fp,
+                Err(_) => {
+                    let body = b"local file: bad content uri";
+                    let _ = stream.write_all(b"HTTP/1.1 500 Internal Server Error
+Content-Type: text/plain
+Connection: close
+Content-Length: 28
+
+").await;
+                    let _ = stream.write_all(body).await;
+                    let _ = stream.flush().await;
+                    return Ok(());
+                }
+            };
             let app2 = app.clone();
             // tauri-plugin-fs 2.7+ 的 open() 按值接收 OpenOptions；
             // builder 的 setter 返回 &mut OpenOptions，需 clone 成拥有值再传入。
