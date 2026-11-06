@@ -3052,31 +3052,32 @@ fn notify_entry(e: &SegHandle) {
     notify.notify_waiters();
 }
 
-/// 流式拉一个分片进共享缓冲。首块之前失败可安全重试（无字节追加，重试不会
-/// 重复数据）；收到字节后失败不重试（重试会把缓冲前缀重复一遍），标 failed
-/// 由连接侧决定跳过/重下。
+/// 流式拉一个分片进共享缓冲。失败恢复策略（三层，从便宜到贵）：
+/// 1) 首块之前失败：安全整体重试（无字节追加，重试不会重复数据）；
+/// 2) 收到半截后失败：用上游 Range 从已收长度续接补齐（CDN 支持 206 时
+///    零成本愈合，布局表无需校正）；
+/// 3) 续接也失败：标 failed，由连接侧决定跳过——跳过时连接侧必须把布局
+///    表的片长校正为实际下发数（否则空洞会让后续分片累计偏移整体错位）。
 async fn stream_segment_into(seg: String, upstream: Arc<Upstream>, entry: SegHandle) {
     let mut attempt = 0usize;
     loop {
         match stream_segment_once(&seg, &upstream, &entry).await {
             Ok(()) => {
-                {
-                    let mut e = lock_entry(&entry);
-                    if e.data.is_empty() {
-                        // 空分片直接当失败：写进流里只会让电视的解复用器多等一个包
-                        e.failed = Some("分片内容为空".to_string());
-                    } else {
-                        e.done = true;
-                    }
-                }
-                notify_entry(&entry);
+                finish_segment(&entry, None);
                 return;
             }
             Err(err) => {
                 let has_data = lock_entry(&entry).data.len() > 0;
-                if has_data || attempt >= SEGMENT_FETCH_RETRIES {
-                    lock_entry(&entry).failed = Some(err);
-                    notify_entry(&entry);
+                if has_data {
+                    // 半截失败：先试 Range 续接补齐
+                    match stream_segment_resume(&seg, &upstream, &entry).await {
+                        Ok(()) => finish_segment(&entry, None),
+                        Err(e2) => finish_segment(&entry, Some(format!("{}；半截续接失败: {}", err, e2))),
+                    }
+                    return;
+                }
+                if attempt >= SEGMENT_FETCH_RETRIES {
+                    finish_segment(&entry, Some(err));
                     return;
                 }
                 attempt += 1;
@@ -3084,6 +3085,22 @@ async fn stream_segment_into(seg: String, upstream: Arc<Upstream>, entry: SegHan
             }
         }
     }
+}
+
+/// 收尾：置 done（有数据）或 failed（无数据/带原因），并唤醒等待者。
+fn finish_segment(entry: &SegHandle, fail: Option<String>) {
+    {
+        let mut e = lock_entry(entry);
+        if let Some(reason) = fail {
+            e.failed = Some(reason);
+        } else if e.data.is_empty() {
+            // 空分片直接当失败：写进流里只会让电视的解复用器多等一个包
+            e.failed = Some("分片内容为空".to_string());
+        } else {
+            e.done = true;
+        }
+    }
+    notify_entry(entry);
 }
 
 async fn stream_segment_once(
@@ -3104,9 +3121,48 @@ async fn stream_segment_once(
             e.total = Some(len);
         }
         drop(e);
-        notify_entry(&entry);
+        notify_entry(entry);
     }
-    let mut body = response;
+    drain_body_into(response, entry).await
+}
+
+/// 半截续接：带 `Range: bytes={已收长度}-` 从断点继续拉同一个分片。
+/// 只在 206 且 Content-Range 起点吻合时才接续——200（忽略 Range 返回全量）
+/// 会把缓冲前缀重复一遍，必须拒绝；416 等其余状态同样拒绝。
+async fn stream_segment_resume(
+    url: &str,
+    upstream: &Upstream,
+    entry: &SegHandle,
+) -> Result<(), String> {
+    let have = lock_entry(entry).data.len() as u64;
+    let response = tokio::time::timeout(
+        UPSTREAM_IDLE_TIMEOUT,
+        upstream_get(url, upstream)
+            .header(reqwest::header::RANGE, format!("bytes={}-", have))
+            .send(),
+    )
+    .await
+    .map_err(|_| "半截续接请求超时".to_string())?
+    .map_err(|e| format!("半截续接请求失败: {}", e))?;
+    if response.status().as_u16() != 206 {
+        return Err(format!("上游不支持半截续接（HTTP {}）", response.status().as_u16()));
+    }
+    let start_matches = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("bytes "))
+        .and_then(|v| v.split('-').next())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        == Some(have);
+    if !start_matches {
+        return Err("续接响应 Content-Range 起点与已收长度不吻合".to_string());
+    }
+    drain_body_into(response, entry).await
+}
+
+/// 把响应体逐块追加进缓冲并通知等待者（首块延迟 = 网络块到达延迟）。
+async fn drain_body_into(mut body: reqwest::Response, entry: &SegHandle) -> Result<(), String> {
     loop {
         match tokio::time::timeout(UPSTREAM_IDLE_TIMEOUT, body.chunk()).await {
             Err(_) => return Err("分片数据读取超时".to_string()),
@@ -3115,7 +3171,7 @@ async fn stream_segment_once(
                     let mut e = lock_entry(entry);
                     e.data.extend_from_slice(&chunk);
                 }
-                notify_entry(&entry);
+                notify_entry(entry);
             }
             Ok(Ok(None)) => return Ok(()),
             Ok(Err(e)) => return Err(format!("读取分片数据失败: {}", e)),
@@ -3159,9 +3215,7 @@ fn ensure_pipeline_entry(
 /// 凡是「确定不再需要结果」的场合都必须显式 abort。
 fn ts_abort_pipeline(mut st: TsStreamState) {
     for (_, entry) in st.pipeline.drain() {
-        if let Some(h) = lock_entry(&entry).task.take() {
-            h.abort();
-        }
+        ts_cancel_entry_task(&entry);
     }
 }
 
@@ -3177,10 +3231,53 @@ fn ts_prune_pipeline(st: &mut TsStreamState, keep: &std::collections::HashSet<St
         .collect();
     for k in doomed {
         if let Some(entry) = st.pipeline.remove(&k) {
-            if let Some(h) = lock_entry(&entry).task.take() {
-                h.abort();
-            }
+            ts_cancel_entry_task(&entry);
         }
+    }
+}
+
+/// 取消一个条目的下载任务。被中止的任务不会再置 done/failed——必须由这里
+/// 代标记失败并唤醒等待者，否则还抱着该 Arc 的连接会永远等在 notify 上
+/// （外部审查推演的场景：回跳超过保留窗口时被修剪的分片）。
+fn ts_cancel_entry_task(entry: &SegHandle) {
+    let cancelled = {
+        let mut e = lock_entry(entry);
+        if !e.done && e.failed.is_none() {
+            e.failed = Some("下载任务已取消（窗口修剪/会话作废）".to_string());
+            true
+        } else {
+            false
+        }
+    };
+    if let Some(h) = lock_entry(entry).task.take() {
+        h.abort();
+    }
+    if cancelled {
+        notify_entry(entry);
+    }
+}
+
+/// 布局表校正：把分片 seg 的登记长度改为实际下发的 delivered 字节；
+/// delivered == 0 时整条移除并回退 total_bytes。
+///
+/// 为什么必须校正：登记用的是上游 Content-Length（完整片长），但失败分片
+/// 被跳过后，字节流里只有已下发的部分——表里的空洞会让后续每个分片的
+/// 累计偏移整体错位，电视下次带 Range: bytes=N- 重连时对应到错位的片内
+/// 位置，TS 包对不齐 188 字节边界，解码器直接报错（外部审查实证）。
+/// Content-Length 撒谎（实收与登记不符）也用同一路径校正。
+fn ts_fix_served_size(st: &mut TsStreamState, seg: &str, delivered: u64) {
+    let Some(idx) = st.served.iter().position(|(u, _)| u == seg) else {
+        return; // 未登记（如一片未收到、total 未知）——无需校正
+    };
+    if delivered == 0 {
+        let (_, old) = st.served.remove(idx);
+        st.total_bytes = st.total_bytes.saturating_sub(old);
+    } else if st.served[idx].1 != delivered {
+        st.total_bytes = st
+            .total_bytes
+            .saturating_sub(st.served[idx].1)
+            .saturating_add(delivered);
+        st.served[idx].1 = delivered;
     }
 }
 
@@ -3220,7 +3317,10 @@ struct TsStreamState {
 
 static TS_STREAM_STATES: Lazy<Mutex<HashMap<String, TsStreamState>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-const TS_STREAM_STATE_MAX: usize = 4;
+/// 会话上限（兜底防泄漏）。生产路径上开新投屏会清空全部旧会话，同时在用的
+/// 最多 1~2 个；此上限主要服务于并行跑的单元测试（多个测试各自持有会话），
+/// 太小会在测试中途淘汰活跃会话（曾导致随机的跨测试失败）。
+const TS_STREAM_STATE_MAX: usize = 16;
 
 /// 续传/诊断用的会话只读快照。
 /// 需要会话数据的地方在锁内按需拷贝标量字段（管道里的任务句柄不适合整体克隆）。
@@ -3515,9 +3615,7 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
                         .unwrap_or(false);
                     if bad {
                         if let Some(entry) = st.pipeline.remove(&anchor) {
-                            if let Some(h) = lock_entry(&entry).task.take() {
-                                h.abort();
-                            }
+                            ts_cancel_entry_task(&entry);
                         }
                     }
                 }
@@ -3527,9 +3625,11 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
     // 写出循环的退出原因：电视断开/整部播完 → Ok；连续分片失败 → Err。
     let mut end_result: Result<(), String> = Ok(());
     /// 一个分片的写出行结果。
+    /// Failed 携带实际下发字节数——失败分片会被跳过，布局表必须校正到
+    /// 实际下发数，否则字节流里的空洞会让后续分片的累计偏移整体错位。
     enum SegOutcome {
         Done,
-        Failed(String),
+        Failed(String, u64),
         WriteBroken, // 电视断开（正常结束）
     }
     loop {
@@ -3615,7 +3715,7 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
                     if has_data_len > 0 {
                         break Some(has_data_len);
                     }
-                    break 'seg SegOutcome::Failed(reason);
+                    break 'seg SegOutcome::Failed(reason, pos);
                 }
                 notified.await;
             };
@@ -3657,14 +3757,22 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
                 }
                 if let Some(reason) = failed {
                     // 半截失败：已写出的部分保留，按坏分片计数/跳过（旧策略）
-                    break 'seg SegOutcome::Failed(reason);
+                    break 'seg SegOutcome::Failed(reason, pos);
                 }
                 notified.await;
             }
         };
         match outcome {
             SegOutcome::WriteBroken => break,
-            SegOutcome::Failed(reason) => {
+            SegOutcome::Failed(reason, delivered) => {
+                // 布局表校正：失败分片被跳过，字节流里只有 delivered 字节——
+                // 表里注册的却是完整片长，空洞会让后续所有分片的累计偏移
+                // 与实际字节流错位（电视续传点对应错位、TS 边界错乱）。
+                if let Ok(mut map) = TS_STREAM_STATES.lock() {
+                    if let Some(st) = map.get_mut(&token) {
+                        ts_fix_served_size(st, &seg, delivered);
+                    }
+                }
                 consecutive_failures += 1;
                 SKIPPED_SEGMENT_COUNT.fetch_add(1, Ordering::Relaxed);
                 if consecutive_failures >= MAX_CONSECUTIVE_SEGMENT_FAILURES {
@@ -3687,32 +3795,15 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
             }
             SegOutcome::Done => {
                 consecutive_failures = 0;
-                // 实际长度与登记不符（Content-Length 撒谎）：修正布局表。
-                // 此刻后续分片尚未登记，累计偏移仍一致（续传定位正确）。
-                let real = lock_entry(&entry).data.len() as u64;
-                if let Some(total) = {
-                    let e = lock_entry(&entry);
-                    e.total
-                } {
-                    if real != total {
-                        if let Ok(mut map) = TS_STREAM_STATES.lock() {
-                            if let Some(st) = map.get_mut(&token) {
-                                if let Some(last) = st.served.last_mut() {
-                                    if last.0 == seg {
-                                        st.total_bytes =
-                                            st.total_bytes.saturating_sub(last.1).saturating_add(real);
-                                        last.1 = real;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
                 // 按播放位置修剪管道：保留当前读窗 + 最近 12 个已下发分片
                 // （续传锚点窗口）。旧 TS_SEGMENT_CACHE 用 HashMap 随机顺序
                 // 淘汰，可能误删正被续传需要的锚点分片。
                 if let Ok(mut map) = TS_STREAM_STATES.lock() {
                     if let Some(st) = map.get_mut(&token) {
+                        // 实际长度与登记不符（Content-Length 撒谎）同样校正：
+                        // 表格长度必须等于字节流里的实际长度，续传定位才对得上。
+                        let real = lock_entry(&entry).data.len() as u64;
+                        ts_fix_served_size(st, &seg, real);
                         let mut keep: std::collections::HashSet<String> =
                             window.iter().map(|(u, _)| u.clone()).collect();
                         for (u, _) in st.served.iter().rev().take(12) {
@@ -5305,7 +5396,7 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}",
 
     #[tokio::test]
     async fn ts_prune_pipeline_keeps_only_window() {
-        // 在途任务不在 keep 集合里：被移除且 abort；keep 集合里的原样保留
+        // 在途任务不在 keep 集合里：被移除、标记失败并 abort；keep 集合里的原样保留
         let (keep_entry, mut rx_keep) = pipeline_victim();
         let (doomed_entry, mut rx_doomed) = pipeline_victim();
         // keep_entry 的任务立即 abort 会干扰断言，这里换成已完成的条目
@@ -5315,15 +5406,220 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         lock_entry(&keep_entry).done = true;
         let mut st = TsStreamState::default();
         st.pipeline.insert("keep-1".to_string(), keep_entry);
-        st.pipeline.insert("doomed-1".to_string(), doomed_entry);
+        st.pipeline.insert("doomed-1".to_string(), doomed_entry.clone());
         let mut keep = std::collections::HashSet::new();
         keep.insert("keep-1".to_string());
         ts_prune_pipeline(&mut st, &keep);
         assert!(st.pipeline.contains_key("keep-1"), "窗口内条目保留");
         assert!(!st.pipeline.contains_key("doomed-1"), "窗口外条目移除");
+        // 被取消的条目必须代标记失败：否则还抱着该 Arc 的连接会永远等下去
+        assert!(
+            lock_entry(&doomed_entry).failed.is_some(),
+            "被修剪的条目应标记失败以唤醒等待者"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(rx_doomed.try_recv().is_err(), "被移除条目的下载任务应被 abort");
         assert!(rx_keep.try_recv().is_err());
+    }
+
+    /// 造一个「分片半截就断」的 mock 上游（seg2 首请求发 300/1000 字节后关闭），
+    /// `resume_ok` 决定第二次带 Range 的请求回 206 补齐还是 404 拒绝。
+    /// 返回 (监听地址, 续接请求计数)。
+    async fn spawn_partial_upstream(resume_ok: bool) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncWriteExt;
+        let up = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = up.local_addr().unwrap();
+        let resumes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ctr = resumes.clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = up.accept().await else { break };
+                let ctr = ctr.clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    if path.contains("index.m3u8") {
+                        let body = b"#EXTM3U\n#EXTINF:1,\nseg1.ts\n#EXTINF:1,\nseg2.ts\n\
+                                     #EXTINF:1,\nseg3.ts\n#EXT-X-ENDLIST\n";
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        let _ = sock.write_all(body).await;
+                        return;
+                    }
+                    if path.contains("seg2") {
+                        if req.contains("range: bytes=300-") {
+                            ctr.fetch_add(1, Ordering::SeqCst);
+                            if resume_ok {
+                                let body = vec![b'B'; 700];
+                                let head = format!(
+                                    "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp2t\r\n\
+                                     Content-Range: bytes 300-999/1000\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                let _ = sock.write_all(head.as_bytes()).await;
+                                let _ = sock.write_all(&body).await;
+                            } else {
+                                let body = b"no-resume";
+                                let head = format!(
+                                    "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                let _ = sock.write_all(head.as_bytes()).await;
+                                let _ = sock.write_all(body).await;
+                            }
+                            return;
+                        }
+                        // 首请求：声明 1000 字节，只发 300 就关闭
+                        let head = "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\n\
+                                    Content-Length: 1000\r\nConnection: close\r\n\r\n";
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        let _ = sock.write_all(&vec![b'B'; 300]).await;
+                        let _ = sock.flush().await;
+                        return; // socket drop → 半截 EOF
+                    }
+                    let (marker, code): (u8, &str) = if path.contains("seg1") {
+                        (b'A', "200 OK")
+                    } else {
+                        (b'C', "200 OK")
+                    };
+                    let size = if marker == b'A' { 500 } else { 400 };
+                    let body = vec![marker; size];
+                    let head = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        code,
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&body).await;
+                });
+            }
+        });
+        (addr, resumes)
+    }
+
+    /// 外部审查实证的 bug 回归（场景 1）：半截失败上游支持 Range 续接时，
+    /// 管道应带 `Range: bytes={已收}-` 补齐整片——字节流无空洞、布局表
+    /// 保持完整片长，续传偏移不受影响。
+    #[tokio::test]
+    async fn partial_failure_heals_via_range_resume() {
+        use tokio::io::AsyncReadExt as _;
+        let (up_addr, resumes) = spawn_partial_upstream(true).await;
+        let target = format!("http://{}/index.m3u8", up_addr);
+        let upstream = Arc::new(Upstream {
+            referer: None,
+            user_agent: None,
+            cookie: None,
+            token: "heal-token-1".to_string(),
+            is_samsung: false,
+            ad_uris: Vec::new(),
+        });
+        let tv = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tv_addr = tv.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(tv_addr).await.unwrap();
+        let (sock, _) = tv.accept().await.unwrap();
+        let server = tokio::spawn(serve_live_ts(
+            sock,
+            "heal-token-1".to_string(),
+            target,
+            upstream,
+            None,
+        ));
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        let _ = server.await;
+        let body_pos = out.windows(4).position(|w| w == b"\r\n\r\n").expect("头体分界") + 4;
+        let body = &out[body_pos..];
+        // 500×A + 1000×B（300 直发 + 700 续接）+ 400×C：无空洞
+        assert_eq!(body.len(), 1900, "续接成功后字节流应是完整三片");
+        assert_eq!(&body[..500], &vec![b'A'; 500][..]);
+        assert_eq!(&body[500..1500], &vec![b'B'; 1000][..], "半截续接应补齐整片");
+        assert_eq!(&body[1500..], &vec![b'C'; 400][..]);
+        assert_eq!(resumes.load(Ordering::SeqCst), 1, "应恰好发过 1 次续接请求");
+        let snap = TS_STREAM_STATES
+            .lock()
+            .unwrap()
+            .get("heal-token-1")
+            .map(ts_session_snap)
+            .unwrap();
+        let sizes: Vec<u64> = snap.served.iter().map(|(_, sz)| *sz).collect();
+        assert_eq!(sizes, vec![500, 1000, 400], "布局表应保持完整片长");
+        assert_eq!(snap.total_bytes, 1900);
+    }
+
+    /// 外部审查实证的 bug 回归（场景 2）：上游不支持半截续接时，失败分片
+    /// 被跳过——布局表必须校正到实际下发数，否则后续分片累计偏移整体错位，
+    /// 电视下次重连的 Range 会落到错位的片内位置。
+    #[tokio::test]
+    async fn failed_segment_layout_is_corrected_for_resume() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (up_addr, resumes) = spawn_partial_upstream(false).await;
+        let target = format!("http://{}/index.m3u8", up_addr);
+        let upstream = Arc::new(Upstream {
+            referer: None,
+            user_agent: None,
+            cookie: None,
+            token: "fixup-token-1".to_string(),
+            is_samsung: false,
+            ad_uris: Vec::new(),
+        });
+        let tv = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tv_addr = tv.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(tv_addr).await.unwrap();
+        let (sock, _) = tv.accept().await.unwrap();
+        let server = tokio::spawn(serve_live_ts(
+            sock,
+            "fixup-token-1".to_string(),
+            target.clone(),
+            upstream.clone(),
+            None,
+        ));
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        let _ = server.await;
+        let body_pos = out.windows(4).position(|w| w == b"\r\n\r\n").expect("头体分界") + 4;
+        let body = &out[body_pos..];
+        // 500×A + 300×B（半截即失败，续接被 404 拒绝）+ 400×C
+        assert_eq!(body.len(), 1200, "失败分片只应有已下发的 300 字节");
+        assert_eq!(resumes.load(Ordering::SeqCst), 1, "应尝试过 1 次续接（被拒）");
+        let snap = TS_STREAM_STATES
+            .lock()
+            .unwrap()
+            .get("fixup-token-1")
+            .map(ts_session_snap)
+            .unwrap();
+        let sizes: Vec<u64> = snap.served.iter().map(|(_, sz)| *sz).collect();
+        assert_eq!(
+            sizes,
+            vec![500, 300, 400],
+            "失败分片的登记长度必须校正为实际下发数（否则偏移整体错位）"
+        );
+        assert_eq!(snap.total_bytes, 1200, "total_bytes 同步校正");
+
+        // 重连定位必须与「实际字节流」一致：bytes=900- 应落在 seg3 内偏移 100
+        // （若表仍是 500+1000，900 会错落到 seg2 的幽灵区间）
+        let mut client2 = tokio::net::TcpStream::connect(tv_addr).await.unwrap();
+        let (sock2, _) = tv.accept().await.unwrap();
+        let server2 = tokio::spawn(serve_live_ts(
+            sock2,
+            "fixup-token-1".to_string(),
+            target,
+            upstream,
+            Some("bytes=900-".to_string()),
+        ));
+        let mut out2 = Vec::new();
+        client2.read_to_end(&mut out2).await.unwrap();
+        let _ = server2.await;
+        let head2 = String::from_utf8_lossy(&out2[..out2.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p).unwrap_or(0)]).to_string();
+        assert!(head2.starts_with("HTTP/1.1 206"), "续传应 206: {}", head2);
+        let body2_pos = out2.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let body2 = &out2[body2_pos..];
+        assert_eq!(body2.len(), 300, "从实际字节流第 900 字节起应剩 300 字节");
+        assert!(body2.iter().all(|b| *b == b'C'), "第 900 字节应落在 seg3 内");
     }
 
     /// 核心回归（外部审查问题①+③）：
