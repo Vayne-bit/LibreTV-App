@@ -395,6 +395,7 @@
             if (pauseSelf && art.pause) art.pause();
             setCastingUi(art, true);
             setCastKeepAwake(true);
+            maybeNudgeBatteryOptimization();
             let msg = isAirPlay ? '已投屏到电视（AirPlay）' : '已投屏到电视';
             if (/Windows/i.test(navigator.userAgent) && !isAirPlay) {
                 msg += '；若电视一直加载不出，通常是防火墙拦了电视访问本机，请在防火墙「允许应用通过防火墙」中勾选本应用后重试';
@@ -716,6 +717,27 @@
         } catch (e) { /* 非安卓环境忽略 */ }
     }
 
+    // 熄屏投屏中断的主因之一是系统省电策略限制后台网络（小米/HyperOS 尤其激进，
+    // 前台服务也可能被限速）。投屏成功时若尚未豁免电池优化，引导一次（每天至多
+    // 一次，不反复打扰）；系统设置里手动设成「无限制」同样有效。
+    function maybeNudgeBatteryOptimization() {
+        try {
+            const bridge = typeof getAndroidBridge === 'function' ? getAndroidBridge() : null;
+            if (!bridge || typeof bridge.isIgnoringBatteryOptimizations !== 'function') return;
+            if (bridge.isIgnoringBatteryOptimizations()) return; // 已豁免，无需提示
+            const KEY = 'libretvBatteryNudgeAt';
+            const last = parseInt(localStorage.getItem(KEY) || '0', 10) || 0;
+            if (Date.now() - last < 24 * 3600 * 1000) return; // 每天至多提示一次
+            localStorage.setItem(KEY, String(Date.now()));
+            if (typeof showToast === 'function') {
+                showToast('熄屏后若投屏中断，多为系统省电限网；请在设置中允许本应用后台运行（无限制）', 'warning');
+            }
+            if (typeof bridge.requestIgnoreBatteryOptimization === 'function') {
+                bridge.requestIgnoreBatteryOptimization();
+            }
+        } catch (e) { /* 忽略：提示失败不影响投屏本身 */ }
+    }
+
     function stopDlna(deviceControlUrl) {
         if (!isTauri() || typeof tauriInvoke !== 'function') return;
         setCastKeepAwake(false);
@@ -748,11 +770,36 @@
     function buildDiagnosticsReport(rustReport, appVersion) {
         const version = appVersion ||
             (typeof window.APP_VERSION !== 'undefined' && window.APP_VERSION) || '未知';
+        // Android 侧补充段：屏幕亮灭时间轴 + 电池优化豁免状态——「熄屏后投屏
+        // 中断」排查的关键时间参照（与 Rust 侧连接轨迹对照即可定位）。
+        let androidExtra = '';
+        try {
+            const bridge = typeof getAndroidBridge === 'function' ? getAndroidBridge() : null;
+            if (bridge && typeof bridge.getScreenEventLog === 'function') {
+                const log = String(bridge.getScreenEventLog() || '').trim();
+                const battery = (typeof bridge.isIgnoringBatteryOptimizations === 'function')
+                    ? (bridge.isIgnoringBatteryOptimizations()
+                        ? '已豁免（正常）'
+                        : '未豁免 —— 熄屏后系统可能限制网络，请在系统设置中允许本应用后台运行/无限制')
+                    : '未知';
+                androidExtra += '\n[5] Android 电源状态\n' +
+                    '  电池优化豁免: ' + battery + '\n' +
+                    '  屏幕事件（最近 ' + (log ? log.split('\n').length : 0) + ' 条，熄屏断流排查用）:\n' +
+                    (log ? log.split('\n').map(function (l) { return '    ' + l; }).join('\n') : '    （无记录）') + '\n';
+            }
+        } catch (e) { /* 非安卓环境忽略 */ }
+        let report = rustReport || '';
+        if (androidExtra) {
+            // 把 Rust 报告的收尾行挪到补充段之后
+            const tail = '（以上全文复制发给开发者即可定位问题环节）\n';
+            if (report.indexOf(tail) >= 0) report = report.replace(tail, '');
+            report = report + androidExtra + '\n' + tail;
+        }
         return '=== LibreTV 投屏环境诊断 ===\n' +
             'App版本: ' + version + '\n' +
             '平台: ' + navigator.userAgent + '\n' +
             '时间: ' + new Date().toLocaleString() + '\n\n' +
-            (rustReport || '');
+            report;
     }
 
     function showDiagnosticsDialog(text) {

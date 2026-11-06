@@ -32,6 +32,12 @@ class MainActivity : TauriActivity() {
   // 投屏保活锁（WakeLock/WifiLock）与常驻通知的所有权已移入 CastKeepAliveService，
   // MainActivity 仅通过 keepAwake(true/false) 启停该前台服务。
 
+  // ---- 屏幕开关事件日志（投屏诊断用）----
+  // 「熄屏后投屏中断」排查的关键时间轴：把屏幕亮/灭时刻记下来，诊断报告里
+  // 与代理的连接轨迹对照，即可区分「熄屏导致网络被限」（灭屏后连接送出骤降）
+  // 还是上游/电视侧问题（时间对不上）。
+  private var screenReceiver: android.content.BroadcastReceiver? = null
+
   override fun onCreate(savedInstanceState: Bundle?) {
     WindowCompat.setDecorFitsSystemWindows(window, false)
     super.onCreate(savedInstanceState)
@@ -44,6 +50,31 @@ class MainActivity : TauriActivity() {
       }
     } catch (e: Exception) {
       // 无 WiFi 权限等场景下静默失败，投屏功能不可用但不影响 App 其他功能
+    }
+
+    // 屏幕亮灭时间戳（只记录，不做任何业务逻辑）
+    try {
+      val receiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: android.content.Context?, intent: android.content.Intent?) {
+          val label = when (intent?.action) {
+            android.content.Intent.ACTION_SCREEN_OFF -> "屏幕关闭"
+            android.content.Intent.ACTION_SCREEN_ON -> "屏幕点亮"
+            else -> return
+          }
+          recordScreenEvent(label)
+        }
+      }
+      val filter = android.content.IntentFilter().apply {
+        addAction(android.content.Intent.ACTION_SCREEN_OFF)
+        addAction(android.content.Intent.ACTION_SCREEN_ON)
+      }
+      // ACTION_SCREEN_ON/OFF 是受保护系统广播，兼容库注册在全部版本都安全
+      androidx.core.content.ContextCompat.registerReceiver(
+        this, receiver, filter, androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
+      )
+      screenReceiver = receiver
+    } catch (e: Exception) {
+      // 注册失败只影响诊断信息，不影响功能
     }
 
     window.statusBarColor = Color.TRANSPARENT
@@ -96,6 +127,14 @@ class MainActivity : TauriActivity() {
   override fun onWindowFocusChanged(hasFocus: Boolean) {
     super.onWindowFocusChanged(hasFocus)
     if (hasFocus && playerFullscreen) hideSystemBars()
+  }
+
+  override fun onDestroy() {
+    try {
+      screenReceiver?.let { unregisterReceiver(it) }
+    } catch (e: Exception) { /* 未注册成功等场景忽略 */ }
+    screenReceiver = null
+    super.onDestroy()
   }
 
   private fun hideSystemBars() {
@@ -154,10 +193,57 @@ class MainActivity : TauriActivity() {
     }
   }
 
+  /** 屏幕事件日志（时间戳字符串，最多 12 条，跨线程安全）。 */
+  private val screenEvents: MutableList<String> =
+    java.util.Collections.synchronizedList(ArrayList())
+
+  private fun recordScreenEvent(label: String) {
+    val ts = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())
+    synchronized(screenEvents) {
+      screenEvents.add("$ts $label")
+      while (screenEvents.size > 12) screenEvents.removeAt(0)
+    }
+  }
+
   inner class PlayerBridge {
     // 进入播放页时记录原始音量与亮度，退出时还原
     private var originalVolume = -1
     private var originalBrightness = Float.NaN
+
+    // 诊断用：屏幕亮灭时间轴（最近 12 条）
+    @JavascriptInterface
+    fun getScreenEventLog(): String {
+      return synchronized(screenEvents) { screenEvents.joinToString("\n") }
+    }
+
+    // 熄屏投屏中断的常见主因是系统省电限制后台网络（小米/HyperOS 尤其激进），
+    // 前台服务也可能被限速。检查是否已豁免电池优化。
+    @JavascriptInterface
+    fun isIgnoringBatteryOptimizations(): Boolean {
+      return try {
+        val pm = getSystemService(POWER_SERVICE) as android.os.PowerManager
+        pm.isIgnoringBatteryOptimizations(packageName)
+      } catch (e: Exception) {
+        true // 查询失败时视为已豁免，避免反复打扰
+      }
+    }
+
+    // 弹出系统「允许后台运行」对话框（需清单声明 REQUEST_IGNORE_BATTERY_OPTIMIZATIONS）；
+    // 厂商系统不支持直弹时退回电池优化设置列表页。
+    @JavascriptInterface
+    fun requestIgnoreBatteryOptimization() {
+      runOnUiThread {
+        try {
+          val intent = Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+          intent.data = android.net.Uri.parse("package:$packageName")
+          startActivity(intent)
+        } catch (e: Exception) {
+          try {
+            startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+          } catch (e2: Exception) { /* 都打不开就静默 */ }
+        }
+      }
+    }
 
     @JavascriptInterface
     fun setFullscreen(enabled: Boolean, landscape: Boolean) {

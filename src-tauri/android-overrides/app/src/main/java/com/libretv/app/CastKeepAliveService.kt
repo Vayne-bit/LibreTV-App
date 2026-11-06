@@ -29,6 +29,13 @@ class CastKeepAliveService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
 
+    // 熄屏断流修复（v1.5.12）：WIFI_MODE_FULL_HIGH_PERF 在 API 34 已标记弃用，
+    // 真机（Android 16 + HyperOS）熄屏后网络被限——两种锁都持有，覆盖全部场景：
+    // AOSP 的语义是「同时持有 LOW_LATENCY 与 HIGH_PERF 时，亮屏前台用
+    // LOW_LATENCY、其余情况用 HIGH_PERF」——单持 HIGH_PERF 在部分新系统上
+    // 可能被架空，双持是官方注释给出的组合形态。
+    private var wifiLockLowLatency: WifiManager.WifiLock? = null
+
     override fun onCreate() {
         super.onCreate()
         // 必须在 startForeground 之前确保 channel 已存在（Android 8+），否则崩溃。
@@ -90,6 +97,16 @@ class CastKeepAliveService : Service() {
                 setReferenceCounted(false)
                 acquire()
             }
+            // API 29+：同时持 LOW_LATENCY（亮屏前台场景）——与 HIGH_PERF 双持，
+            // 覆盖熄屏场景（见字段注释）。
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                wifiLockLowLatency = wifi.createWifiLock(
+                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "LibreTV:CastWifiLowLatency"
+                ).apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+            }
         } catch (e: Exception) {
             // 权限缺失等场景静默失败：投屏可能因省电中断，但不崩溃。
         }
@@ -99,9 +116,11 @@ class CastKeepAliveService : Service() {
         try {
             wakeLock?.let { if (it.isHeld) it.release() }
             wifiLock?.let { if (it.isHeld) it.release() }
+            wifiLockLowLatency?.let { if (it.isHeld) it.release() }
         } catch (e: Exception) { /* ignore */ }
         wakeLock = null
         wifiLock = null
+        wifiLockLowLatency = null
     }
 
     private fun createNotificationChannel() {

@@ -52,6 +52,10 @@ const permissions = {
   FOREGROUND_SERVICE: 'android.permission.FOREGROUND_SERVICE',
   FOREGROUND_SERVICE_CONNECTED_DEVICE: 'android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE',
   POST_NOTIFICATIONS: 'android.permission.POST_NOTIFICATIONS',
+  // 熄屏投屏中断修复：系统省电限制后台网络时，引导用户把本应用加入电池优化白名单
+  // （HyperOS/ColorOS 等尤其激进，仅靠前台服务+Wi-Fi 锁不足以保证熄屏后网络不被限速）。
+  // 本应用经 GitHub 直发，不受 Google Play 对该权限的上架政策约束。
+  REQUEST_IGNORE_BATTERY_OPTIMIZATIONS: 'android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS',
 };
 const missing = Object.values(permissions).filter((name) => !manifest.includes(name));
 if (missing.length > 0) {

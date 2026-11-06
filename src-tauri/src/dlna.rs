@@ -540,8 +540,14 @@ pub async fn dlna_diagnostics(
                 {
                     Ok(Ok((state, ts))) => {
                         if ts == "ERROR_OCCURRED" {
+                            // 措辞修正（v1.5.12）：流曾正常播过大半部片再进
+                            // ERROR_OCCURRED 的，几乎都是供流中断后电视缓冲耗尽
+                            // 自己放弃——不是格式问题。只有「从未起播」才优先
+                            // 怀疑兼容性。旧文案把用户往错误方向引。
                             report.push_str(&format!(
-                                "    控制指令应答: 正常，但传输状态异常（ERROR_OCCURRED={}）—— 电视拒收/无法解码当前媒体（编解码或容器格式问题）\n",
+                                "    控制指令应答: 正常，但传输状态异常（ERROR_OCCURRED={}）—— 电视已中止播放：\n\
+                                 \x20     若下方「TS 会话」显示已送出数 MB（曾正常播放），多为供流中断后缓冲耗尽（对照「最近连接轨迹」看断点前后的送出量与停顿）；\n\
+                                 \x20     只有当从未真正起播（下发 <2MB）时才优先怀疑编解码/容器格式\n",
                                 state
                             ));
                         } else {
@@ -762,12 +768,31 @@ pub async fn dlna_diagnostics(
             .and_then(|m| m.get(&ts_token).map(ts_session_snap));
         match state {
             Some(st) if st.connections > 0 => {
+                // 供给率按「活动期」计算（会话开始 → 最后一次连接），
+                // 不能用 now-started_at：电视中止播放后的静默等待会把均值
+                // 拉低，造成「供给不足」的误诊（外部审查指出）。
                 let elapsed = st
                     .started_at
                     .map(|t| t.elapsed().as_secs_f64())
                     .unwrap_or(0.0);
-                let speed = if elapsed > 1.0 && st.total_bytes > 0 {
-                    format!("，平均供给 {:.0} KB/s", st.total_bytes as f64 / 1024.0 / elapsed)
+                let idle_secs = st
+                    .last_conn_at
+                    .map(|t| t.elapsed().as_secs_f64())
+                    .unwrap_or(0.0);
+                let active_secs = match (st.started_at, st.last_conn_at) {
+                    (Some(s), Some(l)) if l > s => l.duration_since(s).as_secs_f64(),
+                    (Some(s), _) => s.elapsed().as_secs_f64().max(1.0),
+                    _ => elapsed.max(1.0),
+                };
+                let speed = if active_secs > 1.0 && st.total_bytes > 0 {
+                    let mut s = format!(
+                        "，活动期平均供给 {:.0} KB/s",
+                        st.total_bytes as f64 / 1024.0 / active_secs
+                    );
+                    if idle_secs > 30.0 {
+                        s.push_str(&format!("（已 {} 分钟无连接活动）", (idle_secs / 60.0) as u64));
+                    }
+                    s
                 } else {
                     String::new()
                 };
@@ -794,13 +819,23 @@ pub async fn dlna_diagnostics(
                     // 重连 = 优先怀疑位置/内容问题。
                     report.push_str("    判读提示: 「上一连接送出」持续 <0.5MB 且间隔 <3s = 电视缓冲饿死反复重连；送出正常仍频繁重连 = 查位置/内容\n");
                 }
+                if !st.slow_log.is_empty() {
+                    report.push_str("  慢分片（上游拉取 >5s）:\n");
+                    for line in &st.slow_log {
+                        report.push_str(&format!("    {}\n", line));
+                    }
+                    report.push_str("    判读: 慢分片集中在某时间段且当时「连接轨迹」送出骤降 = 上游/手机网络当时变慢；\n\
+                                     \x20     若始终无慢分片但仍断流 = 优先查系统省电限制（熄屏后尤为可疑）\n");
+                }
                 if st.resume_hits == 0 && st.connections > 2 {
                     report.push_str("  判读: 电视多次重连但从未命中断点续传——旧版本 APK 请升级后重试\n");
-                } else if elapsed > 10.0 && st.total_bytes > 0 {
-                    let kbps = st.total_bytes as f64 / 1024.0 / elapsed;
+                } else if idle_secs < 30.0 && active_secs > 10.0 && st.total_bytes > 0 {
+                    // 只在「仍有连接活动」时评估供给率：会话已静默（电视已放弃）
+                    // 时这个均值没有诊断意义。
+                    let kbps = st.total_bytes as f64 / 1024.0 / active_secs;
                     if kbps < 250.0 {
                         report.push_str(&format!(
-                            "  判读: 平均供给 {:.0} KB/s 低于常见内容码率（250~375 KB/s），电视缓冲会被喝干——\n\
+                            "  判读: 活动期供给 {:.0} KB/s 低于常见内容码率（250~375 KB/s），电视缓冲会被喝干——\n\
                              \x20 属网络供给不足：靠近路由器/换 5GHz Wi-Fi/换播放源试试\n",
                             kbps
                         ));
@@ -3070,11 +3105,13 @@ fn notify_entry(e: &SegHandle) {
 /// 3) 续接也失败：标 failed，由连接侧决定跳过——跳过时连接侧必须把布局
 ///    表的片长校正为实际下发数（否则空洞会让后续分片累计偏移整体错位）。
 async fn stream_segment_into(seg: String, upstream: Arc<Upstream>, entry: SegHandle) {
+    let t_start = Instant::now();
     let mut attempt = 0usize;
     loop {
         match stream_segment_once(&seg, &upstream, &entry).await {
             Ok(()) => {
                 finish_segment(&entry, None);
+                note_slow_segment(&upstream, &seg, &entry, t_start);
                 return;
             }
             Err(err) => {
@@ -3085,14 +3122,40 @@ async fn stream_segment_into(seg: String, upstream: Arc<Upstream>, entry: SegHan
                         Ok(()) => finish_segment(&entry, None),
                         Err(e2) => finish_segment(&entry, Some(format!("{}；半截续接失败: {}", err, e2))),
                     }
+                    note_slow_segment(&upstream, &seg, &entry, t_start);
                     return;
                 }
                 if attempt >= SEGMENT_FETCH_RETRIES {
                     finish_segment(&entry, Some(err));
+                    note_slow_segment(&upstream, &seg, &entry, t_start);
                     return;
                 }
                 attempt += 1;
                 tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+    }
+}
+
+/// 拉取耗时超过阈值的分片记入会话慢日志（与连接轨迹配合定位供给瓶颈：
+/// 「手机没上网」还是「上游本身慢」）。不重试路径、失败路径都记。
+fn note_slow_segment(upstream: &Upstream, seg: &str, entry: &SegHandle, t_start: Instant) {
+    let secs = t_start.elapsed().as_secs_f32();
+    if secs < SLOW_SEGMENT_LOG_SECS {
+        return;
+    }
+    let size_kb = lock_entry(entry).data.len() as f64 / 1024.0;
+    let tail: String = {
+        let chars: Vec<char> = seg.chars().collect();
+        let start = chars.len().saturating_sub(36);
+        chars[start..].iter().collect()
+    };
+    if let Ok(mut map) = TS_STREAM_STATES.lock() {
+        if let Some(st) = map.get_mut(upstream.token.as_str()) {
+            st.slow_log.push(format!("{} · {:.0}s · {:.0}KB", tail, secs, size_kb));
+            if st.slow_log.len() > 8 {
+                let drop_n = st.slow_log.len() - 8;
+                st.slow_log.drain(..drop_n);
             }
         }
     }
@@ -3331,6 +3394,9 @@ struct TsStreamState {
     conn_log: Vec<String>,
     last_conn_at: Option<std::time::Instant>,
     last_conn_total: u64, // 上次连入时的 total_bytes（算「上一连接送出量」）
+    /// 慢分片日志：上游拉取超过 SLOW_SEGMENT_LOG_SECS 的分片（尾部 URL + 耗时）。
+    /// 与连接轨迹配合，定位「是手机没上网」还是「上游本身就慢」。
+    slow_log: Vec<String>,
 }
 
 static TS_STREAM_STATES: Lazy<Mutex<HashMap<String, TsStreamState>>> =
@@ -3347,6 +3413,9 @@ const TS_STREAM_STATE_MAX: usize = if cfg!(test) { 16 } else { 4 };
 /// 分片失败被跳过时尾巴丢弃，分界因而永远落在包边界上。
 const TS_PACKET_SIZE: usize = 188;
 
+/// 上游分片拉取超过这么多秒就记进会话慢日志（诊断用）。
+const SLOW_SEGMENT_LOG_SECS: f32 = 5.0;
+
 /// 续传/诊断用的会话只读快照。
 /// 需要会话数据的地方在锁内按需拷贝标量字段（管道里的任务句柄不适合整体克隆）。
 #[derive(Default, Clone)]
@@ -3358,6 +3427,8 @@ struct TsSessionSnap {
     pipeline_hits: u32,
     started_at: Option<std::time::Instant>,
     conn_log: Vec<String>,
+    last_conn_at: Option<std::time::Instant>,
+    slow_log: Vec<String>,
 }
 
 fn ts_session_snap(st: &TsStreamState) -> TsSessionSnap {
@@ -3369,6 +3440,8 @@ fn ts_session_snap(st: &TsStreamState) -> TsSessionSnap {
         pipeline_hits: st.pipeline_hits,
         started_at: st.started_at,
         conn_log: st.conn_log.clone(),
+        last_conn_at: st.last_conn_at,
+        slow_log: st.slow_log.clone(),
     }
 }
 
@@ -3637,8 +3710,8 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
                 range_desc,
                 sent as f64 / 1048576.0,
             ));
-            if st.conn_log.len() > 8 {
-                let drop_n = st.conn_log.len() - 8;
+            if st.conn_log.len() > 12 {
+                let drop_n = st.conn_log.len() - 12;
                 st.conn_log.drain(..drop_n);
             }
             st.last_conn_at = Some(now);
@@ -3654,6 +3727,10 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
     // 结构性缺陷——旧连接卡在 await 冷分片时感知不到电视已断开，要等写失败
     // 才移交，那已是数秒之后）。取消统一收口：会话重置/淘汰/开新投屏。
     let mut pipeline_hits: u32 = 0; // 本连接复用既有缓冲的次数（诊断用）
+    // 本连接的送出量与最长「无数据可写」停顿（诊断用：区分缓冲饿死与
+    // 位置/内容问题——熄屏断流排查时看这两项即可）。
+    let mut conn_sent: u64 = 0;
+    let mut max_stall = Duration::ZERO;
     let mut window: std::collections::VecDeque<(String, SegHandle)> =
         std::collections::VecDeque::new();
     // 续传锚点若命中失败条目：丢弃重下——续传要的是「剩余完整字节」，
@@ -3771,7 +3848,13 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
                     }
                     break 'seg SegOutcome::Failed(reason, pos);
                 }
+                // 等待期间没有数据可写 = 潜在供给停顿
+                let t_wait = Instant::now();
                 notified.await;
+                let gap = t_wait.elapsed();
+                if gap > max_stall {
+                    max_stall = gap;
+                }
             };
             if let Some(total) = reg_total {
                 if let Ok(mut map) = TS_STREAM_STATES.lock() {
@@ -3806,6 +3889,7 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
                     let aligned = (c.len() / TS_PACKET_SIZE) * TS_PACKET_SIZE;
                     if aligned > 0 {
                         pos += aligned as u64;
+                        conn_sent += aligned as u64;
                         // 写失败只可能是电视主动断开（切集/退出投屏），是正常结束。
                         if stream.write_all(&c[..aligned]).await.is_err()
                             || stream.flush().await.is_err()
@@ -3830,6 +3914,7 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
                         }
                     };
                     if !tail.is_empty() {
+                        conn_sent += tail.len() as u64;
                         if stream.write_all(&tail).await.is_err()
                             || stream.flush().await.is_err()
                         {
@@ -3843,7 +3928,13 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
                     // 计数/跳过——delivered = pos 恒为 188 的整数倍。
                     break 'seg SegOutcome::Failed(reason, pos);
                 }
+                // 无数据可写：这里等多久 = 电视多久没收到字节（供给停顿）
+                let t_wait = Instant::now();
                 notified.await;
+                let gap = t_wait.elapsed();
+                if gap > max_stall {
+                    max_stall = gap;
+                }
             }
         };
         match outcome {
@@ -3902,10 +3993,22 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
     }
     // 连接结束：管道条目留在会话里（属于会话不属于连接），下一个连接直接接着读。
     // 任务取消统一收口在会话作废路径（重置/淘汰/开新投屏）。
-    if pipeline_hits > 0 {
+    if pipeline_hits > 0 || conn_sent > 0 {
         if let Ok(mut map) = TS_STREAM_STATES.lock() {
             if let Some(st) = map.get_mut(token.as_str()) {
                 st.pipeline_hits += pipeline_hits;
+                // 收尾轨迹行：本连接送出量与最长无数据停顿——熄屏断流排查
+                // 直接看这里（送出骤降+长停顿 = 网络被系统限制）。
+                st.conn_log.push(format!(
+                    "  ↳ #{} 结束: 送出 {:.2}MB · 最长停顿 {:.1}s",
+                    st.connections,
+                    conn_sent as f64 / 1048576.0,
+                    max_stall.as_secs_f32(),
+                ));
+                if st.conn_log.len() > 12 {
+                    let drop_n = st.conn_log.len() - 12;
+                    st.conn_log.drain(..drop_n);
+                }
             }
         }
     }
