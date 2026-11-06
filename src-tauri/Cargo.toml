@@ -33,6 +33,13 @@ urlencoding = "2.1.3"
 scraper = "0.19.0"
 # tauri-utils will be resolved by tauri and tauri-build
 # tauri-plugin-log = { version = "2.0.0-rc.1", features = ["colored"] } # Temporarily commented out to ensure compilation
+# 刻意不开 http2：reqwest 0.11 的 http2 是独立 feature（不在 rustls-tls 里，
+# 依赖树里的 h2 只是 hyper-rustls 带的编译产物，ALPN 由 reqwest 自己的 feature 决定），
+# 当前实际只协商 HTTP/1.1——这是 A/B 实测后的有意选择而非疏漏。
+# A/B 实证（同一 CDN、6 个分片并行取流，scripts/ab-h1-vs-h2.mjs）：
+#   h1 六条独立连接 = 1805ms / 3391KB/s；h2 单连接多路复用 = 23075ms / 265KB/s（慢 12.8 倍）
+# 该 CDN 的 h2 单连接被限速（~95KB/s/流，与真机手机侧观测的 95KB/s 同量级），
+# 多路复用把 6 路独立拥塞窗口合并成 1 路。要开 http2 前请先重跑该脚本对比。
 reqwest = { version = "0.11.27", features = ["json", "rustls-tls"], default-features = false } # 使用较新的 reqwest 版本
 tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] } # 使用较新的 tokio 版本
 if-addrs = "0.13" # 枚举本机 IPv4 网卡：Windows 多网卡（WSL/VMware/VPN）下 SSDP 必须逐网卡发 M-SEARCH
