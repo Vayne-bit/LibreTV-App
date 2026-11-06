@@ -20,7 +20,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use tauri_plugin_dialog::DialogExt;
@@ -86,6 +86,15 @@ fn record_proxy_error(err: String) {
     }
 }
 
+/// 墙钟毫秒（日志时间戳用）。Rust 无本地时区，日志里记 `t=毫秒`，
+/// 由 JS 在展示诊断报告时渲染成 HH:mm:ss（player_cast.js 负责替换）。
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn proxy_last_error() -> String {
     PROXY_LAST_ERROR
         .lock()
@@ -147,12 +156,75 @@ fn generate_session_token() -> String {
     format!("{:016x}{:016x}", v, !v)
 }
 
-static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
+/// 上游 HTTP 客户端（可整体重建）。
+///
+/// 为什么不是 `Lazy<reqwest::Client>`：熄屏/切网后，连接池里可能躺着已被
+/// 系统黑洞的连接（无 RST、无 FIN）——单发请求撞上就是一次完整超时。
+/// 真机 1.5.12 实证：亮屏后诊断 [3] 对同一源仍超时，而 PC 端同 URL
+/// 200/0.55s（CDN 无恙）→ 池内死连接是首要嫌疑。三层对策：
+///   1. `pool_idle_timeout(8s)`：空闲死连接在池里最多躺 8 秒；
+///   2. `tcp_keepalive(10s)`：内核层 10 秒开始探活，黑障连接很快出局；
+///   3. 网络变化时整体重建（Android 网络回调 → JS → reset_http_client 命令）。
+static HTTP_CLIENT: Lazy<Mutex<reqwest::Client>> = Lazy::new(|| Mutex::new(build_upstream_client()));
+
+/// 统一的客户端构造：连接超时收紧到 8s（池内死连接的最坏代价），
+/// 空闲超时 + TCP 保活双管齐下，避免死连接长期潜伏。
+fn build_upstream_client() -> reqwest::Client {
     reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(8))
+        .pool_idle_timeout(Duration::from_secs(8))
+        .tcp_keepalive(Duration::from_secs(10))
+        .tcp_nodelay(true)
         .build()
         .unwrap_or_default()
-});
+}
+
+/// 取当前全局客户端（Client 是 Arc 包装，clone 很便宜，共享同一连接池）。
+fn http() -> reqwest::Client {
+    HTTP_CLIENT
+        .lock()
+        .map(|c| c.clone())
+        .unwrap_or_else(|p| p.into_inner().clone())
+}
+
+/// 网络变化（熄屏恢复/切换 Wi-Fi/流量切换）时重建全局客户端，丢弃可能
+/// 已被黑洞的连接池。JS 侧由 Android 的默认网络回调触发。
+#[tauri::command]
+pub fn reset_http_client() {
+    if let Ok(mut c) = HTTP_CLIENT.lock() {
+        *c = build_upstream_client();
+    }
+}
+
+/// 投屏上游状态（JS 轮询，做「上游死了→自动换源→按位置恢复」）。
+/// abandoned=true 时 reason 为放弃原因，delivered_secs 为已实际下发的
+/// 内容秒数（按 EXTINF 累计），JS 换到新源后以此为续播位置重新投屏。
+#[derive(Serialize)]
+pub struct CastUpstreamStatus {
+    pub abandoned: bool,
+    pub reason: String,
+    pub delivered_secs: f64,
+    pub media_url: String,
+    pub total_segments: usize,
+}
+
+#[tauri::command]
+pub fn cast_upstream_status() -> Option<CastUpstreamStatus> {
+    let token = LAST_TS_TOKEN.lock().ok()?.clone();
+    if token.is_empty() {
+        return None;
+    }
+    let map = TS_STREAM_STATES.lock().ok()?;
+    let st = map.get(&token)?;
+    let delivered_secs: f64 = st.durations.iter().take(st.served.len()).sum();
+    Some(CastUpstreamStatus {
+        abandoned: st.abandoned.is_some(),
+        reason: st.abandoned.clone().unwrap_or_default(),
+        delivered_secs,
+        media_url: st.media_url.clone(),
+        total_segments: st.segments.len(),
+    })
+}
 
 /// 测试专用：CAST_MIRROR_BASE 设置时把所有上游 URL 改写到本机通用镜像。
 /// 背景：沙箱环境禁止编译产物直连外网（connect 一律 os error 10013），
@@ -583,7 +655,7 @@ pub async fn dlna_diagnostics(
         None => report.push_str("  （当前没有播放中的视频，跳过）\n"),
         Some(url) => {
             report.push_str(&format!("  地址: {}\n", url));
-            let mut req = HTTP
+            let mut req = http()
                 .get(&url)
                 .timeout(Duration::from_secs(6))
                 .header("User-Agent", DEFAULT_UPSTREAM_UA)
@@ -608,6 +680,33 @@ pub async fn dlna_diagnostics(
                         _ => "源站返回异常状态，可能是源站临时故障或限流",
                     };
                     report.push_str(&format!("  判读: {}\n", hint));
+
+                    // 全新客户端对照探测：池内死连接（熄屏/切网留下的黑障连接）
+                    // 会让「复用池」的请求超时，而全新连接立即成功——两者并列
+                    // 输出即可区分「池问题」与「网络/CDN 问题」（真机实证场景）。
+                    let mut fresh_req = build_upstream_client()
+                        .get(&url)
+                        .timeout(Duration::from_secs(6))
+                        .header("User-Agent", DEFAULT_UPSTREAM_UA)
+                        .header("Range", "bytes=0-1023");
+                    if let Some(ref_value) = referer.clone().filter(|s| !s.trim().is_empty()) {
+                        fresh_req = fresh_req.header("Referer", ref_value);
+                    }
+                    match fresh_req.send().await {
+                        Ok(r) => report.push_str(&format!(
+                            "  全新连接对照: HTTP {}（{}）\n",
+                            r.status().as_u16(),
+                            if r.status().is_success() {
+                                "成功——若上方复用池的请求失败，问题在连接池（已由 pool_idle_timeout/网络回调重建兜底）"
+                            } else {
+                                "同样异常——与池无关，是网络/CDN 问题"
+                            }
+                        )),
+                        Err(e) => report.push_str(&format!(
+                            "  全新连接对照: 失败（{}）—— 与池无关，是网络/CDN 问题\n",
+                            e
+                        )),
+                    }
 
                     // 分片级拉流测试：清单能拉 ≠ 分片能拉。TS 串流要逐片下载，
                     // 分片层被防盗链/限流/加密时清单测试照样全绿，电视端却黑屏转圈。
@@ -648,7 +747,7 @@ pub async fn dlna_diagnostics(
                                         "    - 分片清单读取: 失败 —— {}\n",
                                         e
                                     )),
-                                    Ok(Ok((segments, endlist))) => {
+                                    Ok(Ok((segments, _durations, endlist))) => {
                                         if segments.is_empty() {
                                             report.push_str("    - 分片清单为空（无可用分片）\n");
                                         } else {
@@ -724,7 +823,12 @@ pub async fn dlna_diagnostics(
                         }
                     }
                 }
-                Err(e) => report.push_str(&format!("  结果: 本机拉流失败 —— {}（DNS/网络/证书问题，电视同样拉不到）\n", e)),
+                Err(e) => report.push_str(&format!(
+                    "  结果: 本机（App 侧）拉流失败 —— {}\n\
+                     \x20 判读: 这只说明 App 此刻到源站不通（DNS/网络/池内死连接均可能，对照上方「全新连接对照」区分）；\n\
+                     \x20 电视直连是否可达与此无关，不能据此推断电视侧状态\n",
+                    e
+                )),
             }
         }
     }
@@ -768,18 +872,18 @@ pub async fn dlna_diagnostics(
             .and_then(|m| m.get(&ts_token).map(ts_session_snap));
         match state {
             Some(st) if st.connections > 0 => {
-                // 供给率按「活动期」计算（会话开始 → 最后一次连接），
-                // 不能用 now-started_at：电视中止播放后的静默等待会把均值
-                // 拉低，造成「供给不足」的误诊（外部审查指出）。
+                // 供给率按「活动期」计算（会话开始 → 最后一次真实写出）。
+                // 不能用 now-started_at：电视中止后的静默等待会把均值拉低；
+                // 也不能用 last_conn_at：连接可能一直挂着但早已没有数据流动
+                // （真机 #75 实证）——以 last_write_at 为准。
                 let elapsed = st
                     .started_at
                     .map(|t| t.elapsed().as_secs_f64())
                     .unwrap_or(0.0);
-                let idle_secs = st
-                    .last_conn_at
-                    .map(|t| t.elapsed().as_secs_f64())
-                    .unwrap_or(0.0);
-                let active_secs = match (st.started_at, st.last_conn_at) {
+                let idle_secs = st.last_write_at.map(|t| t.elapsed().as_secs_f64()).or_else(
+                    || st.last_conn_at.map(|t| t.elapsed().as_secs_f64()),
+                ).unwrap_or(0.0);
+                let active_secs = match (st.started_at, st.last_write_at) {
                     (Some(s), Some(l)) if l > s => l.duration_since(s).as_secs_f64(),
                     (Some(s), _) => s.elapsed().as_secs_f64().max(1.0),
                     _ => elapsed.max(1.0),
@@ -790,7 +894,7 @@ pub async fn dlna_diagnostics(
                         st.total_bytes as f64 / 1024.0 / active_secs
                     );
                     if idle_secs > 30.0 {
-                        s.push_str(&format!("（已 {} 分钟无连接活动）", (idle_secs / 60.0) as u64));
+                        s.push_str(&format!("（已 {} 分钟无数据写出）", (idle_secs / 60.0) as u64));
                     }
                     s
                 } else {
@@ -826,6 +930,12 @@ pub async fn dlna_diagnostics(
                     }
                     report.push_str("    判读: 慢分片集中在某时间段且当时「连接轨迹」送出骤降 = 上游/手机网络当时变慢；\n\
                                      \x20     若始终无慢分片但仍断流 = 优先查系统省电限制（熄屏后尤为可疑）\n");
+                }
+                if let Some(reason) = &st.abandoned {
+                    report.push_str(&format!(
+                        "  本条流已被放弃: {}（App 会尝试自动换源恢复；若未恢复请手动换源重投）\n",
+                        reason
+                    ));
                 }
                 if st.resume_hits == 0 && st.connections > 2 {
                     report.push_str("  判读: 电视多次重连但从未命中断点续传——旧版本 APK 请升级后重试\n");
@@ -986,7 +1096,7 @@ fn ssdp_search_locations(timeout: Duration) -> Result<Vec<String>, String> {
 
 /// 拉取设备描述 XML，解析友好名称与 AVTransport controlURL。
 async fn fetch_device_info(location: &str) -> Result<DlnaDevice, String> {
-    let xml = HTTP
+    let xml = http()
         .get(location)
         .timeout(Duration::from_secs(6))
         .send()
@@ -1302,7 +1412,7 @@ async fn soap_post_raw(control_url: &str, soap_action: &str, envelope: &str) -> 
 
 /// reqwest 兜底通道。
 async fn soap_post_reqwest(control_url: &str, soap_action: &str, envelope: &str) -> Result<(u16, String), String> {
-    let response = HTTP
+    let response = http()
         .post(control_url)
         .header("SOAPAction", format!("\"{}\"", soap_action))
         .header("Content-Type", "text/xml; charset=utf-8")
@@ -1976,7 +2086,7 @@ pub async fn resolve_vip_url(page_url: String, api_base: String) -> Result<Resol
         format!("{}/?url={}", base, urlencode(&page_url))
     };
 
-    let resp = HTTP
+    let resp = http()
         .get(&api_url)
         .header(
             reqwest::header::USER_AGENT,
@@ -2199,7 +2309,7 @@ pub async fn cast_to_airplay(base_url: String, video_url: String) -> Result<(), 
     let url = format!("{}/play", base_url.trim_end_matches('/'));
     // text/parameters：每行 Key: Value，CRLF 结尾
     let body = format!("Content-Location: {}\r\nStart-Position: 0.000000\r\n\r\n", video_url);
-    let resp = HTTP
+    let resp = http()
         .post(&url)
         .header(reqwest::header::CONTENT_TYPE, "text/parameters")
         .header("User-Agent", "LibreTV/1.0")
@@ -2640,7 +2750,7 @@ transferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nConnection: 
     let target = String::from_utf8(target_bytes).map_err(|_| "代理地址不是合法 UTF-8")?;
 
     // 构造上游请求：带鉴权头 + Range 透传；未提供 UA 时补默认浏览器 UA
-    let mut request = HTTP.get(mirror_url(&target));
+    let mut request = http().get(mirror_url(&target));
     if let Some(referer) = &upstream.referer {
         request = request.header(reqwest::header::REFERER, referer);
     }
@@ -2777,7 +2887,16 @@ transferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nConnection: 
 /// 带会话鉴权头的上游 GET（TS 串流专用；直取通道的 Range 透传逻辑不同，不复用）。
 /// 同步构建 RequestBuilder（非 async——构建器不涉及 IO）。
 fn upstream_get(url: &str, upstream: &Upstream) -> reqwest::RequestBuilder {
-    let mut request = HTTP.get(mirror_url(url));
+    upstream_get_on(&http(), url, upstream)
+}
+
+/// 同上，但用调用方指定的客户端（重试路径传全新客户端以避开池内死连接）。
+fn upstream_get_on(
+    client: &reqwest::Client,
+    url: &str,
+    upstream: &Upstream,
+) -> reqwest::RequestBuilder {
+    let mut request = client.get(mirror_url(url));
     if let Some(referer) = &upstream.referer {
         request = request.header(reqwest::header::REFERER, referer);
     }
@@ -2879,12 +2998,23 @@ fn parse_media_playlist(
     text: &str,
     base_url: &str,
     ad_uris: &[String],
-) -> Result<(Vec<String>, bool), String> {
+) -> Result<(Vec<String>, Vec<f64>, bool), String> {
     let mut segments = Vec::new();
+    let mut durations: Vec<f64> = Vec::new();
+    let mut pending_duration = 0f64;
     let mut endlist = false;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("#EXTINF:") {
+            // 记录时长：与保留分片一一对应（换源恢复按累计时长定位播放位置）
+            pending_duration = rest
+                .split(',')
+                .next()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(0.0);
             continue;
         }
         if let Some(rest) = line.strip_prefix("#EXT-X-KEY:") {
@@ -2911,18 +3041,21 @@ fn parse_media_playlist(
         let resolved = resolve_url(base_url, line);
         // 广告分片：跳过。判定在前端完成，这里只执行。
         if is_ad_segment(line, &resolved, ad_uris) {
+            pending_duration = 0.0;
             continue;
         }
         segments.push(resolved);
+        durations.push(pending_duration);
+        pending_duration = 0.0;
     }
-    Ok((segments, endlist))
+    Ok((segments, durations, endlist))
 }
 
 /// 拉取并解析媒体清单。
 async fn fetch_media_playlist(
     url: &str,
     upstream: &Upstream,
-) -> Result<(Vec<String>, bool), String> {
+) -> Result<(Vec<String>, Vec<f64>, bool), String> {
     let text = upstream_text(url, upstream).await?;
     parse_media_playlist(&text, url, &upstream.ad_uris)
 }
@@ -2934,19 +3067,49 @@ async fn fetch_media_playlist(
 /// reqwest 客户端只设了 connect_timeout，建连成功后卡住是没有保护的。
 const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// 单个分片的拉取重试次数。
+/// 单个分片拉取的重试时间窗（替代「固定重试 N 次」）。
 ///
-/// 只在「拉取阶段」重试是安全的：此时还一个字节都没写进流里，重试不会产生
-/// 重复数据。写阶段失败是电视断开，重试没有意义。
-const SEGMENT_FETCH_RETRIES: usize = 1;
+/// 窗口内按指数退避反复重试，每次重试都用全新连接（不走旧池）——
+/// 网络抖动/熄屏恢复/CDN 短暂失联都能在窗口内自愈。窗口耗尽才判定该
+/// 分片失败，交给上层跳过。真机实证：CDN 短暂失联 40s×8 片就放弃整条流，
+/// 电视随即报错——而窗口内坚持重试完全有机会熬过去。
+const SEGMENT_ATTEMPT_WINDOW: Duration = if cfg!(test) {
+    Duration::from_secs(6)
+} else {
+    Duration::from_secs(120)
+};
 
-/// 连续多少个分片失败后放弃整条流。
-///
-/// 单片失败绝不能断流：电视一旦看到连接关闭就会重连，而重连后 `serve_live_ts`
-/// 从头重新解析清单、从第一个分片重新开始 —— 于是又倒在同一片坏分片上，
-/// 反复重连、反复从头拉，表现就是「投一会儿就中断」或「黑色转圈」。
-/// 但连续失败说明源已不可用，硬撑只会让电视挂在一条没有数据的长连接上。
-const MAX_CONSECUTIVE_SEGMENT_FAILURES: usize = 8;
+/// 整条流的故障时间窗：连续故障从第一片算起，超过它才放弃整条流
+/// （期间每一片都仍在按自己的窗口坚持重试）。测试构型缩短到 10s。
+const STREAM_FAILURE_WINDOW: Duration = if cfg!(test) {
+    Duration::from_secs(10)
+} else {
+    Duration::from_secs(300)
+};
+
+/// 指数退避的上限（秒）。
+const RETRY_BACKOFF_CAP_SECS: u64 = 10;
+
+/// 403/410（地址疑似过期）时重抓清单，取该下标的新地址。
+/// 仅 VOD（清单已缓存且 ENDLIST）可信：新旧清单都经过同样的 ad_uris 过滤，
+/// 下标可对齐。新地址与旧地址相同则返回 None（CDN 没轮换，按普通失败处理，
+/// 避免无限刷新循环）。
+async fn refresh_expired_segment(
+    media_url: &str,
+    upstream: &Arc<Upstream>,
+    seg_index: usize,
+    old_url: &str,
+) -> Option<String> {
+    let (segments, _durations, endlist) = fetch_media_playlist(media_url, upstream).await.ok()?;
+    if !endlist || seg_index >= segments.len() {
+        return None;
+    }
+    let new_url = segments[seg_index].clone();
+    if new_url == old_url {
+        return None;
+    }
+    Some(new_url)
+}
 
 /// 完整拉取一个分片到内存。
 ///
@@ -3022,7 +3185,7 @@ async fn warm_ts_stream(target: String, upstream: Arc<Upstream>) {
     }
     let prepared = async {
         let media_url = resolve_media_playlist(&target, &upstream).await?;
-        let (pending, _endlist) = fetch_media_playlist(&media_url, &upstream).await?;
+        let (pending, _durations, _endlist) = fetch_media_playlist(&media_url, &upstream).await?;
         Ok::<Vec<String>, String>(pending)
     }
     .await;
@@ -3098,40 +3261,62 @@ fn notify_entry(e: &SegHandle) {
     notify.notify_waiters();
 }
 
-/// 流式拉一个分片进共享缓冲。失败恢复策略（三层，从便宜到贵）：
-/// 1) 首块之前失败：安全整体重试（无字节追加，重试不会重复数据）；
-/// 2) 收到半截后失败：用上游 Range 从已收长度续接补齐（CDN 支持 206 时
-///    零成本愈合，布局表无需校正）；
-/// 3) 续接也失败：标 failed，由连接侧决定跳过——跳过时连接侧必须把布局
-///    表的片长校正为实际下发数（否则空洞会让后续分片累计偏移整体错位）。
+/// 流式拉一个分片进共享缓冲。失败恢复策略（时间窗 + 退避 + 每次重试换
+/// 全新连接，替代旧的「固定重试 1 次」）：
+/// 1) 窗口内（SEGMENT_ATTEMPT_WINDOW）按指数退避反复重试，每次重试都用
+///    全新客户端/全新 TCP 连接——网络抖动、熄屏恢复、CDN 短暂失联都能在
+///    窗口内自愈（真机实证：CDN 失联 40s×8 片就放弃整条流，电视随即报错）；
+/// 2) 首块之前失败可安全重试（无字节追加，不会重复数据）；
+/// 3) 收到半截后失败：先用上游 Range 续接补齐（206 校验起点）；
+/// 4) 403/410：URL 疑似过期，重试无意义——立即失败并打标记，让连接侧
+///    重抓清单换新地址。
 async fn stream_segment_into(seg: String, upstream: Arc<Upstream>, entry: SegHandle) {
     let t_start = Instant::now();
     let mut attempt = 0usize;
     loop {
-        match stream_segment_once(&seg, &upstream, &entry).await {
+        // 重试换全新连接：避开池里可能已被黑洞的旧连接（每次重建客户端）
+        let client = if attempt == 0 {
+            http()
+        } else {
+            build_upstream_client()
+        };
+        match stream_segment_once(&seg, &upstream, &entry, &client).await {
             Ok(()) => {
                 finish_segment(&entry, None);
                 note_slow_segment(&upstream, &seg, &entry, t_start);
                 return;
             }
             Err(err) => {
-                let has_data = lock_entry(&entry).data.len() > 0;
-                if has_data {
-                    // 半截失败：先试 Range 续接补齐
-                    match stream_segment_resume(&seg, &upstream, &entry).await {
-                        Ok(()) => finish_segment(&entry, None),
-                        Err(e2) => finish_segment(&entry, Some(format!("{}；半截续接失败: {}", err, e2))),
-                    }
-                    note_slow_segment(&upstream, &seg, &entry, t_start);
-                    return;
-                }
-                if attempt >= SEGMENT_FETCH_RETRIES {
+                // 403/410：地址过期类错误，重试无意义（要换地址得重抓清单，
+                // 那是连接侧的事）
+                if err.contains("HTTP403") || err.contains("HTTP410") {
                     finish_segment(&entry, Some(err));
                     note_slow_segment(&upstream, &seg, &entry, t_start);
                     return;
                 }
+                let has_data = lock_entry(&entry).data.len() > 0;
+                if has_data {
+                    // 半截失败：先试 Range 续接补齐（也用全新连接）
+                    match stream_segment_resume(&seg, &upstream, &entry, &client).await {
+                        Ok(()) => finish_segment(&entry, None),
+                        Err(e2) => {
+                            finish_segment(&entry, Some(format!("{}；半截续接失败: {}", err, e2)))
+                        }
+                    }
+                    note_slow_segment(&upstream, &seg, &entry, t_start);
+                    return;
+                }
+                if t_start.elapsed() >= SEGMENT_ATTEMPT_WINDOW {
+                    finish_segment(&entry, Some(format!("{}（重试窗口 {:.0}s 耗尽）", err, SEGMENT_ATTEMPT_WINDOW.as_secs_f32())));
+                    note_slow_segment(&upstream, &seg, &entry, t_start);
+                    return;
+                }
+                // 指数退避：1,2,4,8,10,10…秒
+                let backoff = Duration::from_secs(
+                    RETRY_BACKOFF_CAP_SECS.min(1u64 << attempt.min(6)),
+                );
+                tokio::time::sleep(backoff).await;
                 attempt += 1;
-                tokio::time::sleep(Duration::from_millis(300)).await;
             }
         }
     }
@@ -3181,13 +3366,19 @@ async fn stream_segment_once(
     url: &str,
     upstream: &Upstream,
     entry: &SegHandle,
+    client: &reqwest::Client,
 ) -> Result<(), String> {
-    let response = tokio::time::timeout(UPSTREAM_IDLE_TIMEOUT, upstream_get(url, upstream).send())
+    let response = tokio::time::timeout(UPSTREAM_IDLE_TIMEOUT, upstream_get_on(client, url, upstream).send())
         .await
         .map_err(|_| "拉取分片超时（上游无响应）".to_string())?
         .map_err(|e| format!("拉取分片失败: {}", e))?;
+    let status = response.status().as_u16();
     if !response.status().is_success() {
-        return Err(format!("分片拉取失败: HTTP {}", response.status().as_u16()));
+        // 403/410 用连续标记：下游据此判定「地址过期」，跳过盲目重试
+        if status == 403 || status == 410 {
+            return Err(format!("分片拉取失败: HTTP{}（地址疑似过期）", status));
+        }
+        return Err(format!("分片拉取失败: HTTP {}", status));
     }
     if let Some(len) = response.content_length() {
         let mut e = lock_entry(entry);
@@ -3207,11 +3398,12 @@ async fn stream_segment_resume(
     url: &str,
     upstream: &Upstream,
     entry: &SegHandle,
+    client: &reqwest::Client,
 ) -> Result<(), String> {
     let have = lock_entry(entry).data.len() as u64;
     let response = tokio::time::timeout(
         UPSTREAM_IDLE_TIMEOUT,
-        upstream_get(url, upstream)
+        upstream_get_on(client, url, upstream)
             .header(reqwest::header::RANGE, format!("bytes={}-", have))
             .send(),
     )
@@ -3394,9 +3586,19 @@ struct TsStreamState {
     conn_log: Vec<String>,
     last_conn_at: Option<std::time::Instant>,
     last_conn_total: u64, // 上次连入时的 total_bytes（算「上一连接送出量」）
+    /// 最后一次真正写出字节的时刻。供给率/静默时长都以它为界——
+    /// 连接可能一直挂着但早已没有数据流动（真机 #75 实证），
+    /// 用 last_conn_at 会把死连接之后的空窗误算成活动期。
+    last_write_at: Option<std::time::Instant>,
     /// 慢分片日志：上游拉取超过 SLOW_SEGMENT_LOG_SECS 的分片（尾部 URL + 耗时）。
     /// 与连接轨迹配合，定位「是手机没上网」还是「上游本身就慢」。
     slow_log: Vec<String>,
+    /// 整条流被判故障放弃的原因（供 JS 轮询做自动换源恢复）。
+    abandoned: Option<String>,
+    /// 分片时长表（EXTINF 秒），与 segments 一一对应。
+    /// delivered_secs = durations[..served.len()] 之和 —— 换源恢复时用来
+    /// 在新源的清单里定位到相同的播放位置。
+    durations: Vec<f64>,
 }
 
 static TS_STREAM_STATES: Lazy<Mutex<HashMap<String, TsStreamState>>> =
@@ -3428,7 +3630,9 @@ struct TsSessionSnap {
     started_at: Option<std::time::Instant>,
     conn_log: Vec<String>,
     last_conn_at: Option<std::time::Instant>,
+    last_write_at: Option<std::time::Instant>,
     slow_log: Vec<String>,
+    abandoned: Option<String>,
 }
 
 fn ts_session_snap(st: &TsStreamState) -> TsSessionSnap {
@@ -3441,7 +3645,9 @@ fn ts_session_snap(st: &TsStreamState) -> TsSessionSnap {
         started_at: st.started_at,
         conn_log: st.conn_log.clone(),
         last_conn_at: st.last_conn_at,
+        last_write_at: st.last_write_at,
         slow_log: st.slow_log.clone(),
+        abandoned: st.abandoned.clone(),
     }
 }
 
@@ -3513,12 +3719,17 @@ async fn serve_live_ts(
         if let Ok(map) = TS_STREAM_STATES.lock() {
             if let Some(st) = map.get(&token) {
                 if st.endlist && !st.media_url.is_empty() && !st.segments.is_empty() {
-                    return Ok((st.media_url.clone(), st.segments.clone(), st.endlist));
+                    return Ok((
+                        st.media_url.clone(),
+                        st.segments.clone(),
+                        st.durations.clone(),
+                        st.endlist,
+                    ));
                 }
             }
         }
         let media_url = resolve_media_playlist(&target, &upstream).await?;
-        let (pending, endlist) = fetch_media_playlist(&media_url, &upstream).await?;
+        let (pending, durations, endlist) = fetch_media_playlist(&media_url, &upstream).await?;
         if pending.is_empty() {
             return Err("媒体清单里没有可用分片".to_string());
         }
@@ -3528,14 +3739,15 @@ async fn serve_live_ts(
                 if let Some(st) = map.get_mut(&token) {
                     st.media_url = media_url.clone();
                     st.segments = pending.clone();
+                    st.durations = durations.clone();
                     st.endlist = endlist;
                 }
             }
         }
-        Ok((media_url, pending, endlist))
+        Ok((media_url, pending, durations, endlist))
     }
     .await;
-    let (media_url, mut pending, mut endlist) = match prepared {
+    let (media_url, mut pending, durations, mut endlist) = match prepared {
         Ok(value) => value,
         Err(e) => {
             record_proxy_error(format!("TS 串流准备失败: {}", e));
@@ -3687,25 +3899,43 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
 
     let mut served: std::collections::HashSet<String> =
         resume_seed_urls.iter().cloned().collect();
-    let mut consecutive_failures = 0usize;
+    // 故障时间窗：连续故障从第一片起算，超过 STREAM_FAILURE_WINDOW 才放弃
+    // 整条流（窗口内每一片各自坚持重试，上游恢复即自动续上——旧实现
+    // 「8 连败即放弃」，真机 CDN 失联 5 分钟直接把电视送进 ERROR_OCCURRED）。
+    let mut failure_since: Option<Instant> = None;
+    // 已为哪个分片下标刷新过地址（403/410 重抓清单，防无限刷新循环）
+    let mut refreshed: std::collections::HashSet<usize> = std::collections::HashSet::new();
     // 续传时首个写出分片的片内偏移：电视要第 N 字节起的数据，
     // 写出前先丢弃其之前的部分（同字节位置的同内容重发，无害）。
     let mut skip_now = resume_skip;
     // 诊断轨迹：电视每次连入记一行——出事时能直接区分「缓冲饿死」
     // （上一连接送出少、间隔长）与「偏移错位」（Range 与表位置对不上）。
+    // 标签按真实续传计划生成（外部审查指出旧标签把「会话末尾续传」
+    // 误标成「从头发送」——offset=0 的末尾续传与全新下发是两回事）。
+    let mut my_conn_no: u32 = 0;
     if let Ok(mut map) = TS_STREAM_STATES.lock() {
         if let Some(st) = map.get_mut(&token) {
+            my_conn_no = st.connections;
             let now = Instant::now();
             let since = st.last_conn_at.map(|t| now.duration_since(t).as_secs_f32());
             let sent = st.total_bytes.saturating_sub(st.last_conn_total);
-            let range_desc = match requested_offset {
-                Some(n) => format!("Range {:.2}MB", n as f64 / 1048576.0),
-                None if skip_now > 0 => "无 Range（按会话末尾续传）".to_string(),
-                None => "无 Range（从头发送）".to_string(),
+            let range_desc = match (requested_offset, &resume_plan) {
+                (Some(n), Some(_)) => format!("Range {:.2}MB（表内续传）", n as f64 / 1048576.0),
+                (Some(n), None) => {
+                    format!("Range {:.2}MB（落表外→重置）", n as f64 / 1048576.0)
+                }
+                (None, Some((_, 0))) => "无 Range（续传·会话末尾）".to_string(),
+                (None, Some((_, off))) => {
+                    format!("无 Range（续传·片内 +{}KB）", off / 1024)
+                }
+                (None, None) if replay_vod => "无 Range（已播完→重播从头）".to_string(),
+                (None, None) if has_session_progress => "无 Range（对不上→重置）".to_string(),
+                (None, None) => "无 Range（全新下发）".to_string(),
             };
             st.conn_log.push(format!(
-                "#{} +{:.1}s {} · 上一连接送出 {:.2}MB",
-                st.connections,
+                "[t={}] #{} +{:.1}s {} · 上一连接送出 {:.2}MB",
+                epoch_ms(),
+                my_conn_no,
                 since.unwrap_or(0.0),
                 range_desc,
                 sent as f64 / 1048576.0,
@@ -3716,6 +3946,7 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
             }
             st.last_conn_at = Some(now);
             st.last_conn_total = st.total_bytes;
+            st.durations = durations;
         }
     }
     // 预取管线：上游并行挂 TS_PREFETCH_DEPTH 个分片请求，写出严格按清单顺序。
@@ -3727,12 +3958,15 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
     // 结构性缺陷——旧连接卡在 await 冷分片时感知不到电视已断开，要等写失败
     // 才移交，那已是数秒之后）。取消统一收口：会话重置/淘汰/开新投屏。
     let mut pipeline_hits: u32 = 0; // 本连接复用既有缓冲的次数（诊断用）
-    // 本连接的送出量与最长「无数据可写」停顿（诊断用：区分缓冲饿死与
-    // 位置/内容问题——熄屏断流排查时看这两项即可）。
+    // 本连接的送出量与两类最长停顿（诊断用：区分缓冲饿死与位置/内容问题，
+    // 以及「等上游」（手机→CDN 断供）与「写电视」（电视侧收不动）两个方向）。
     let mut conn_sent: u64 = 0;
-    let mut max_stall = Duration::ZERO;
-    let mut window: std::collections::VecDeque<(String, SegHandle)> =
+    let mut max_stall_up = Duration::ZERO; // 等上游：缓冲里没有新数据可写
+    let mut max_stall_write = Duration::ZERO; // 写电视：write_all+flush 耗时
+    let mut window: std::collections::VecDeque<(String, SegHandle, usize)> =
         std::collections::VecDeque::new();
+    // 窗口内分片在清单里的下标游标（403/410 重抓清单时按它对齐新地址）
+    let mut next_index: usize = resume_plan.map(|(idx, _)| idx).unwrap_or(0);
     // 续传锚点若命中失败条目：丢弃重下——续传要的是「剩余完整字节」，
     // 半截缓冲补不齐（与旧实现「失败分片永远重建」的语义一致）。
     if skip_now > 0 {
@@ -3771,6 +4005,8 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
             let Some(seg) = pending.pop_front() else {
                 break;
             };
+            let seg_index = next_index;
+            next_index += 1;
             if !served.insert(seg.clone()) {
                 continue; // 直播轮询时跳过已服务的分片
             }
@@ -3786,7 +4022,7 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
                     if existed {
                         pipeline_hits += 1;
                     }
-                    window.push_back((seg, handle));
+                    window.push_back((seg, handle, seg_index));
                 }
                 None => {
                     // 会话被作废（新投屏/淘汰）：本连接没有继续的意义，
@@ -3799,7 +4035,7 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
         if session_gone {
             break;
         }
-        let Some((seg, entry)) = window.pop_front() else {
+        let Some((seg, entry, seg_index)) = window.pop_front() else {
             // 本批分片已全部喂完
             if endlist {
                 break; // VOD：整部播完
@@ -3807,7 +4043,7 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
             // 直播清单：隔 2 秒重取，把新分片继续喂给电视
             tokio::time::sleep(Duration::from_secs(2)).await;
             match fetch_media_playlist(&media_url, &upstream).await {
-                Ok((next, e)) => {
+                Ok((next, _d, e)) => {
                     pending.extend(next);
                     endlist = e;
                 }
@@ -3848,12 +4084,12 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
                     }
                     break 'seg SegOutcome::Failed(reason, pos);
                 }
-                // 等待期间没有数据可写 = 潜在供给停顿
+                // 等待期间没有数据可写 = 潜在供给停顿（等上游方向）
                 let t_wait = Instant::now();
                 notified.await;
                 let gap = t_wait.elapsed();
-                if gap > max_stall {
-                    max_stall = gap;
+                if gap > max_stall_up {
+                    max_stall_up = gap;
                 }
             };
             if let Some(total) = reg_total {
@@ -3890,11 +4126,16 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
                     if aligned > 0 {
                         pos += aligned as u64;
                         conn_sent += aligned as u64;
+                        let t_write = Instant::now();
                         // 写失败只可能是电视主动断开（切集/退出投屏），是正常结束。
                         if stream.write_all(&c[..aligned]).await.is_err()
                             || stream.flush().await.is_err()
                         {
                             break 'seg SegOutcome::WriteBroken;
+                        }
+                        let wgap = t_write.elapsed();
+                        if wgap > max_stall_write {
+                            max_stall_write = wgap;
                         }
                         continue;
                     }
@@ -3915,10 +4156,15 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
                     };
                     if !tail.is_empty() {
                         conn_sent += tail.len() as u64;
+                        let t_write = Instant::now();
                         if stream.write_all(&tail).await.is_err()
                             || stream.flush().await.is_err()
                         {
                             break 'seg SegOutcome::WriteBroken;
+                        }
+                        let wgap = t_write.elapsed();
+                        if wgap > max_stall_write {
+                            max_stall_write = wgap;
                         }
                     }
                     break 'seg SegOutcome::Done;
@@ -3928,12 +4174,12 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
                     // 计数/跳过——delivered = pos 恒为 188 的整数倍。
                     break 'seg SegOutcome::Failed(reason, pos);
                 }
-                // 无数据可写：这里等多久 = 电视多久没收到字节（供给停顿）
+                // 无数据可写：这里等多久 = 电视多久没收到字节（等上游方向）
                 let t_wait = Instant::now();
                 notified.await;
                 let gap = t_wait.elapsed();
-                if gap > max_stall {
-                    max_stall = gap;
+                if gap > max_stall_up {
+                    max_stall_up = gap;
                 }
             }
         };
@@ -3948,28 +4194,49 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
                         ts_fix_served_size(st, &seg, delivered);
                     }
                 }
-                consecutive_failures += 1;
-                SKIPPED_SEGMENT_COUNT.fetch_add(1, Ordering::Relaxed);
-                if consecutive_failures >= MAX_CONSECUTIVE_SEGMENT_FAILURES {
-                    // 只有「放弃整条流」才算故障，才写进诊断的错误字段。
-                    // 单片跳过不写：流还在正常往前走，写进去会让用户看到
-                    // 「最近一次代理错误」有内容而误以为投屏失败了。
-                    record_proxy_error(format!(
-                        "TS 连续 {} 个分片失败，已放弃本条流（最后一片: {} — {}）",
-                        consecutive_failures, seg, reason
-                    ));
-                    end_result = Err(format!(
-                        "连续 {} 个分片失败，放弃本条流（最后一片: {}）",
-                        consecutive_failures, seg
-                    ));
-                    break;
+                // 403/410：地址疑似过期（带时效签名的源）——重抓清单换新地址，
+                // 不计入故障窗。每个下标至多刷新 2 次，防清单没轮换时的死循环。
+                if (reason.contains("HTTP403") || reason.contains("HTTP410")) && endlist {
+                    if refreshed.len() < 64 && refreshed.insert(seg_index) {
+                        if let Some(new_url) =
+                            refresh_expired_segment(&media_url, &upstream, seg_index, &seg).await
+                        {
+                            pending.push_front(new_url);
+                            next_index = next_index.saturating_sub(1);
+                            continue;
+                        }
+                    }
                 }
+                // 故障时间窗：从第一片失败起算，窗口内坚持跳过重试（上游恢复
+                // 即自动续上）；超窗才放弃。旧实现 8 连败即放弃——真机 CDN 失联
+                // 5 分钟时电视直接进 ERROR_OCCURRED，而其中相当一部分抖动
+                // 本来熬得过。
+                match failure_since {
+                    None => failure_since = Some(Instant::now()),
+                    Some(t0) if t0.elapsed() >= STREAM_FAILURE_WINDOW => {
+                        // 只有「放弃整条流」才算故障，才写进诊断的错误字段。
+                        // 单片跳过不写：流还在正常往前走，写进去会让用户看到
+                        // 「最近一次代理错误」有内容而误以为投屏失败了。
+                        record_proxy_error(format!(
+                            "上游持续故障 {:.0}s，已放弃本条流（最后一片: {} — {}）",
+                            STREAM_FAILURE_WINDOW.as_secs_f32(),
+                            seg, reason
+                        ));
+                        end_result = Err(format!(
+                            "上游持续故障 {:.0}s，放弃本条流（最后一片: {}）",
+                            STREAM_FAILURE_WINDOW.as_secs_f32(),
+                            seg
+                        ));
+                        break;
+                    }
+                    _ => {}
+                }
+                SKIPPED_SEGMENT_COUNT.fetch_add(1, Ordering::Relaxed);
                 // 单片坏不中断整条流：跳过继续喂下一片。
-                // 断流会让电视重连并从头开始，那才是「投一会儿就中断」的来源。
                 continue;
             }
             SegOutcome::Done => {
-                consecutive_failures = 0;
+                failure_since = None;
                 // 按播放位置修剪管道：保留当前读窗 + 最近 12 个已下发分片
                 // （续传锚点窗口）。旧 TS_SEGMENT_CACHE 用 HashMap 随机顺序
                 // 淘汰，可能误删正被续传需要的锚点分片。
@@ -3980,7 +4247,7 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
                         let real = lock_entry(&entry).data.len() as u64;
                         ts_fix_served_size(st, &seg, real);
                         let mut keep: std::collections::HashSet<String> =
-                            window.iter().map(|(u, _)| u.clone()).collect();
+                            window.iter().map(|(u, _, _)| u.clone()).collect();
                         for (u, _) in st.served.iter().rev().take(12) {
                             keep.insert(u.clone());
                         }
@@ -3993,21 +4260,32 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
     }
     // 连接结束：管道条目留在会话里（属于会话不属于连接），下一个连接直接接着读。
     // 任务取消统一收口在会话作废路径（重置/淘汰/开新投屏）。
-    if pipeline_hits > 0 || conn_sent > 0 {
+    if pipeline_hits > 0 || conn_sent > 0 || end_result.is_err() {
         if let Ok(mut map) = TS_STREAM_STATES.lock() {
             if let Some(st) = map.get_mut(token.as_str()) {
                 st.pipeline_hits += pipeline_hits;
-                // 收尾轨迹行：本连接送出量与最长无数据停顿——熄屏断流排查
-                // 直接看这里（送出骤降+长停顿 = 网络被系统限制）。
+                // 收尾轨迹行：本连接的送出量与两向最长停顿——「等上游」长 =
+                // 手机→CDN 断供（熄屏限网/CDN 故障/连接池死连接），「写电视」
+                // 长 = 电视侧收不动。连接号用本连接自己的（旧实现读当前计数，
+                // 并发连接时会串号）。
                 st.conn_log.push(format!(
-                    "  ↳ #{} 结束: 送出 {:.2}MB · 最长停顿 {:.1}s",
-                    st.connections,
+                    "[t={}]   ↳ #{} 结束: 送出 {:.2}MB · 停顿 等上游 {:.1}s / 写电视 {:.1}s",
+                    epoch_ms(),
+                    my_conn_no,
                     conn_sent as f64 / 1048576.0,
-                    max_stall.as_secs_f32(),
+                    max_stall_up.as_secs_f32(),
+                    max_stall_write.as_secs_f32(),
                 ));
                 if st.conn_log.len() > 12 {
                     let drop_n = st.conn_log.len() - 12;
                     st.conn_log.drain(..drop_n);
+                }
+                // 有过真实写出才算「最后活动」——死连接挂着的空窗不算
+                if conn_sent > 0 {
+                    st.last_write_at = Some(Instant::now());
+                }
+                if let Err(reason) = &end_result {
+                    st.abandoned = Some(reason.clone());
                 }
             }
         }
@@ -4704,7 +4982,7 @@ xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>402</errorCode>\
                     #EXTINF:10,\n\
                     https://other.cdn/seg003.ts\n\
                     #EXT-X-ENDLIST\n";
-        let (segments, endlist) =
+        let (segments, _durations, endlist) =
             parse_media_playlist(text, "https://a.b/vod/index.m3u8", &[]).expect("parse ok");
         assert!(endlist);
         assert_eq!(segments.len(), 3);
@@ -4716,7 +4994,7 @@ xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>402</errorCode>\
     #[test]
     fn parse_media_playlist_live_has_no_endlist() {
         let text = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nlive.ts\n";
-        let (segments, endlist) =
+        let (segments, _durations, endlist) =
             parse_media_playlist(text, "http://a.b/live.m3u8", &[]).expect("parse ok");
         assert!(!endlist);
         assert_eq!(segments, vec!["http://a.b/live.ts".to_string()]);
@@ -4748,7 +5026,7 @@ xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>402</errorCode>\
                     #EXTINF:10,\n\
                     seg002.ts\n";
         let ads = vec!["https://a.b/vod/ad001.ts".to_string()];
-        let (segments, _) =
+        let (segments, _durations, _endlist) =
             parse_media_playlist(text, "https://a.b/vod/index.m3u8", &ads).expect("parse ok");
         assert_eq!(segments.len(), 2, "广告分片应被剔除");
         assert!(!segments.iter().any(|s| s.ends_with("ad001.ts")));
@@ -5736,6 +6014,88 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         let sizes: Vec<u64> = snap.served.iter().map(|(_, sz)| *sz).collect();
         assert_eq!(sizes, vec![500, 1000, 400], "布局表应保持完整片长");
         assert_eq!(snap.total_bytes, 1900);
+    }
+
+    /// 断网注入回归（本轮验收项）：上游短暂失联时，窗口内退避重试 +
+    /// 每次重试全新连接应自愈——整条流不放弃，电视拿到完整字节，serve 以
+    /// Ok 结束（而非 Err）。对应真机场景：CDN 失联 40s×8 片即放弃 → 电视
+    /// ERROR_OCCURRED；新策略在窗口内熬过抖动。
+    #[tokio::test]
+    async fn upstream_blackout_recovers_within_window() {
+        use tokio::io::AsyncWriteExt;
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let up = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        let hits2 = hits.clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = up.accept().await else { break };
+                let hits = hits2.clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    if path.contains("index.m3u8") {
+                        let body = b"#EXTM3U\n#EXTINF:5,\nseg1.ts\n#EXT-X-ENDLIST\n";
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        let _ = sock.write_all(body).await;
+                        return;
+                    }
+                    // 断网注入：前 2 次分片请求直接 500（快速失败，模拟上游失联）
+                    let k = hits.fetch_add(1, Ordering::SeqCst);
+                    if k < 2 {
+                        let head = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        return;
+                    }
+                    let body = vec![b'S'; 1000];
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&body).await;
+                });
+            }
+        });
+
+        let target = format!("http://{}/index.m3u8", up_addr);
+        let upstream = Arc::new(Upstream {
+            referer: None,
+            user_agent: None,
+            cookie: None,
+            token: "blackout-token-1".to_string(),
+            is_samsung: false,
+            ad_uris: Vec::new(),
+        });
+        let tv = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tv_addr = tv.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(tv_addr).await.unwrap();
+        let (sock, _) = tv.accept().await.unwrap();
+        let server = tokio::spawn(serve_live_ts(
+            sock,
+            "blackout-token-1".to_string(),
+            target,
+            upstream,
+            None,
+        ));
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        let result = server.await.unwrap();
+        assert!(result.is_ok(), "窗口内应自愈而不是放弃整条流: {:?}", result.err());
+        let body_pos = out.windows(4).position(|w| w == b"\r\n\r\n").expect("头体分界") + 4;
+        let body = &out[body_pos..];
+        assert_eq!(body.len(), 1000, "上游恢复后应拿到完整分片");
+        assert!(body.iter().all(|b| *b == b'S'));
+        assert!(
+            hits.load(Ordering::SeqCst) >= 3,
+            "应至少重试过 2 次（注入 2 次失败 + 1 次成功）"
+        );
     }
 
     /// 外部审查实证的 bug 回归（场景 2）：上游不支持半截续接时，失败分片

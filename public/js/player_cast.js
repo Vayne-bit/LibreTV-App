@@ -382,7 +382,7 @@
     }
 
     // 按协议把视频地址投到指定设备：DLNA 走 cast_to_device，AirPlay 走 cast_to_airplay
-    function castUrlToDevice(device, url, referer, pauseSelf) {
+    function castUrlToDevice(device, url, referer, pauseSelf, positionOverride) {
         const art = activeArt;
         if (!url || !art) {
             notice(art, '未拿到可投屏的视频地址');
@@ -396,6 +396,8 @@
             setCastingUi(art, true);
             setCastKeepAwake(true);
             maybeNudgeBatteryOptimization();
+            // 上游死亡自动恢复的轮询（放弃后换源重投的配套）
+            startCastRecoveryPolling(device.name || '');
             let msg = isAirPlay ? '已投屏到电视（AirPlay）' : '已投屏到电视';
             if (/Windows/i.test(navigator.userAgent) && !isAirPlay) {
                 msg += '；若电视一直加载不出，通常是防火墙拦了电视访问本机，请在防火墙「允许应用通过防火墙」中勾选本应用后重试';
@@ -404,6 +406,7 @@
         };
         const onErr = function (err) {
             setCastKeepAwake(false);
+            stopCastRecoveryPolling();
             console.warn('cast failed', err);
             notice(art, '投屏失败：' + errMsg(err));
         };
@@ -426,7 +429,11 @@
                 controlUrl: device.control_url,
                 url: url,
                 title: (typeof currentVideoTitle === 'string' && currentVideoTitle) ? currentVideoTitle : 'LibreTV',
-                position: (art.video && art.video.currentTime) || 0,
+                // 换源恢复时用 Rust 报告的「已实际下发秒数」定位（App 播放器的
+                // currentTime 与投屏进度可能不同步）
+                position: (typeof positionOverride === 'number' && positionOverride > 0)
+                    ? positionOverride
+                    : ((art.video && art.video.currentTime) || 0),
                 referer: referer || null,
                 adUris: adUris
             }).then(onOk).catch(onErr);
@@ -741,7 +748,104 @@
     function stopDlna(deviceControlUrl) {
         if (!isTauri() || typeof tauriInvoke !== 'function') return;
         setCastKeepAwake(false);
+        stopCastRecoveryPolling();
         tauriInvoke('stop_dlna_cast', { controlUrl: deviceControlUrl }).catch(() => { /* ignore */ });
+    }
+
+    // ---------- 上游死亡自动换源恢复 ----------
+    // Rust 侧放弃整条流（上游持续故障超窗）后，轮询 cast_upstream_status
+    // 发现 abandoned → 复用换源模块的搜索/探测/选集找新源同集数 → 按已实际
+    // 下发的秒数重新投屏（deliver_secs 由 Rust 按 EXTINF 累计，新源清单里
+    // 以相同位置续播）。整个恢复对用户只表现为一次「已切换到 XX 源继续看」。
+
+    const castRecovery = { timer: null, tried: false, lastDeviceName: '' };
+
+    function startCastRecoveryPolling(deviceName) {
+        castRecovery.lastDeviceName = deviceName || '';
+        castRecovery.tried = false;
+        stopCastRecoveryPolling();
+        if (!isTauri() || typeof tauriInvoke !== 'function') return;
+        castRecovery.timer = setInterval(async function () {
+            if (castRecovery.tried) return;
+            try {
+                const st = await tauriInvoke('cast_upstream_status');
+                if (!st || !st.abandoned) return;
+                castRecovery.tried = true;
+                stopCastRecoveryPolling();
+                await recoverCastViaRelink(st);
+            } catch (e) { /* 状态查询失败不影响投屏 */ }
+        }, 3000);
+    }
+
+    function stopCastRecoveryPolling() {
+        if (castRecovery.timer) {
+            clearInterval(castRecovery.timer);
+            castRecovery.timer = null;
+        }
+    }
+
+    function formatCastPosition(secs) {
+        const s = Math.floor(secs || 0);
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        const ss = String(s % 60).padStart(2, '0');
+        return (h ? h + ':' : '') + m + ':' + ss;
+    }
+
+    async function recoverCastViaRelink(status) {
+        const art = activeArt;
+        try {
+            if (typeof loadSwitchSources !== 'function' || typeof pickRelinkCandidate !== 'function') {
+                notice(art, '投屏上游中断（' + (status.reason || '未知') + '）：请手动换源后重新投屏');
+                return;
+            }
+            notice(art, '投屏上游持续中断，正在自动换源恢复…');
+            await loadSwitchSources();
+            const items = (typeof switchSourceState !== 'undefined' && Array.isArray(switchSourceState.items))
+                ? switchSourceState.items : [];
+            const currentSource = (typeof getCurrentVideoInfo === 'function'
+                ? (getCurrentVideoInfo() || {}) : {}).sourceCode || '';
+            const candidates = items.filter(item => item.probe === 'ok' && item.source_code !== currentSource);
+            const targetIndex = typeof currentEpisodeIndex === 'number' ? currentEpisodeIndex : 0;
+            const picked = pickRelinkCandidate(candidates, targetIndex);
+            if (!picked || !picked.item || !picked.item.episodes || !picked.item.episodes[picked.episodeIndex]) {
+                notice(art, '自动换源没有找到可用替代源，请手动处理');
+                return;
+            }
+            // 同步 App 内的片源状态（与 autoRelinkAndPlay 的做法一致），
+            // 后续 App 内播放/记录/再投屏都不串台
+            if (typeof getCurrentVideoInfo === 'function') {
+                const info = { ...(getCurrentVideoInfo() || {}) };
+                info.sourceCode = picked.item.source_code;
+                info.sourceName = picked.item.source_name || '';
+                info.vodId = picked.item.vod_id || '';
+                info.needsRelink = false;
+                localStorage.setItem('currentVideoInfo', JSON.stringify(info));
+            }
+            if (typeof clearRelinkFlag === 'function') clearRelinkFlag();
+            if (Array.isArray(picked.item.episodes)) {
+                currentEpisodes = picked.item.episodes.slice();
+                if (Array.isArray(picked.item.episodeNames) && picked.item.episodeNames.length) {
+                    currentEpisodeNames = picked.item.episodeNames.slice();
+                    localStorage.setItem('currentEpisodeNames', JSON.stringify(currentEpisodeNames));
+                }
+            }
+            currentEpisodeIndex = picked.episodeIndex;
+            const url = picked.item.episodes[picked.episodeIndex];
+            currentVideoUrl = url;
+            const positionSecs = Math.max(0, Math.floor(status.delivered_secs || 0));
+            const device = {
+                name: castRecovery.lastDeviceName || '电视',
+                control_url: dlnaActiveControlUrl,
+                protocol: 'dlna'
+            };
+            notice(art, '已切换到「' + (picked.item.source_name || '新源') + '」，从 '
+                + formatCastPosition(positionSecs) + ' 继续投屏…');
+            castUrlToDevice(device, url, typeof currentReferer === 'function' ? currentReferer() : null, false, positionSecs);
+        } catch (e) {
+            console.warn('cast recovery failed', e);
+            notice(art, '自动换源恢复失败：' + (e && e.message || e));
+        }
     }
 
     // ---------- 投屏诊断 ----------
@@ -795,6 +899,12 @@
             if (report.indexOf(tail) >= 0) report = report.replace(tail, '');
             report = report + androidExtra + '\n' + tail;
         }
+        // Rust 无本地时区，日志时间戳记的是 epoch 毫秒（t=...），这里渲染成本地 HH:mm:ss
+        report = String(report).replace(/t=(\d{13})/g, function (_, ms) {
+            try {
+                return new Date(Number(ms)).toLocaleTimeString('zh-CN', { hour12: false });
+            } catch (e) { return 't=' + ms; }
+        });
         return '=== LibreTV 投屏环境诊断 ===\n' +
             'App版本: ' + version + '\n' +
             '平台: ' + navigator.userAgent + '\n' +

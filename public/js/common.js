@@ -24,6 +24,19 @@ function getAndroidBridge() {
     return window.LibreTVAndroid || null;
 }
 
+// Android 网络变化（Wi-Fi 切换/熄屏后恢复/流量切换）→ 重建 Rust 上游
+// HTTP 客户端，丢弃可能已被系统黑洞的连接池（熄屏断流修复的一环：
+// 真机实证池内死连接会让亮屏后的首个请求继续超时）。由 MainActivity 的
+// registerDefaultNetworkCallback 触发。
+window.__libretvNetworkChanged = function () {
+    try {
+        if (typeof isTauriApp === 'function' && isTauriApp() && typeof tauriInvoke === 'function') {
+            tauriInvoke('reset_http_client').catch(function () { /* 静默 */ });
+        }
+    } catch (e) { /* 非安卓环境忽略 */ }
+    return true;
+};
+
 // Tauri serves custom schemes as http://<scheme>.localhost on Windows/Android and <scheme>://localhost elsewhere.
 function imageProxyUrl(src) {
     if (!isTauriApp() || !src) return '';

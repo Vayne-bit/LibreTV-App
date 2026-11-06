@@ -748,7 +748,9 @@ pub fn run() {
         dlna::pick_local_video,
         dlna::resolve_vip_url,
         dlna::search_airplay_devices,
-        dlna::cast_to_airplay
+        dlna::cast_to_airplay,
+        dlna::reset_http_client,
+        dlna::cast_upstream_status
     ])
     .setup(|app| {
       if let Ok(cache_dir) = app.path().app_cache_dir() {

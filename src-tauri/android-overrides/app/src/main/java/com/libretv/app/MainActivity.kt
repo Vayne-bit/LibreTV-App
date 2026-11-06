@@ -77,6 +77,24 @@ class MainActivity : TauriActivity() {
       // 注册失败只影响诊断信息，不影响功能
     }
 
+    // 网络变化回调：Wi-Fi/流量切换、熄屏后网络恢复时通知 WebView → JS 调用
+    // reset_http_client 重建 Rust 上游客户端，丢弃可能已被系统黑洞的连接池
+    // （熄屏断流修复的一环：池内死连接会让亮屏后的首个请求继续超时）。
+    try {
+      val cm = getSystemService(CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+      cm.registerDefaultNetworkCallback(object : android.net.ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: android.net.Network) {
+          notifyNetworkChanged()
+        }
+
+        override fun onLost(network: android.net.Network) {
+          notifyNetworkChanged()
+        }
+      })
+    } catch (e: Exception) {
+      // 回调失败只影响恢复速度，不影响功能
+    }
+
     window.statusBarColor = Color.TRANSPARENT
     window.navigationBarColor = Color.BLACK
     WindowInsetsControllerCompat(window, window.decorView).apply {
@@ -202,6 +220,18 @@ class MainActivity : TauriActivity() {
     synchronized(screenEvents) {
       screenEvents.add("$ts $label")
       while (screenEvents.size > 12) screenEvents.removeAt(0)
+    }
+  }
+
+  /** 网络变化通知 WebView（JS 侧 __libretvNetworkChanged → reset_http_client）。 */
+  private fun notifyNetworkChanged() {
+    runOnUiThread {
+      try {
+        webView?.evaluateJavascript(
+          "(window.__libretvNetworkChanged && window.__libretvNetworkChanged()) === true",
+          null
+        )
+      } catch (e: Exception) { /* WebView 未就绪等场景忽略 */ }
     }
   }
 
