@@ -783,6 +783,17 @@ pub async fn dlna_diagnostics(
                 if st.resume_hits > 0 && st.pipeline_hits == 0 && st.connections > 6 {
                     report.push_str("  判读: 电视频繁重连但管道从未复用——每次重连都在从零重下锚点分片（活锁特征，请反馈此报告）\n");
                 }
+                if !st.conn_log.is_empty() {
+                    report.push_str("  最近连接轨迹（连入时刻 +距上次断线/位置/上一连接送出）:\n");
+                    let skip = st.conn_log.len().saturating_sub(6);
+                    for line in st.conn_log.iter().skip(skip) {
+                        report.push_str(&format!("    {}\n", line));
+                    }
+                    // 便宜的自动判读：最近几次「上一连接送出」都远小于供给能力
+                    // 且间隔很短 = 电视在缓冲饿死边缘反复重连；送出正常却反复
+                    // 重连 = 优先怀疑位置/内容问题。
+                    report.push_str("    判读提示: 「上一连接送出」持续 <0.5MB 且间隔 <3s = 电视缓冲饿死反复重连；送出正常仍频繁重连 = 查位置/内容\n");
+                }
                 if st.resume_hits == 0 && st.connections > 2 {
                     report.push_str("  判读: 电视多次重连但从未命中断点续传——旧版本 APK 请升级后重试\n");
                 } else if elapsed > 10.0 && st.total_bytes > 0 {
@@ -3313,6 +3324,13 @@ struct TsStreamState {
     // 按播放位置开窗修剪（ts_prune_pipeline）。
     pipeline: HashMap<String, SegHandle>,
     pipeline_hits: u32,          // 诊断：连接复用既有缓冲（在途或已完成）的累计次数
+    // ---- 诊断：最近连接轨迹 ----
+    // 每次电视连入记一行（连入时刻 / Range 位置 / 距上次断线时长 / 上一连接
+    // 送出字节）。用来把「缓冲饿死」（送出少、间隔长）与「偏移错位」
+    // （Range 与表位置对不上）在现场报告里区分开——不再靠事后推演。
+    conn_log: Vec<String>,
+    last_conn_at: Option<std::time::Instant>,
+    last_conn_total: u64, // 上次连入时的 total_bytes（算「上一连接送出量」）
 }
 
 static TS_STREAM_STATES: Lazy<Mutex<HashMap<String, TsStreamState>>> =
@@ -3320,7 +3338,14 @@ static TS_STREAM_STATES: Lazy<Mutex<HashMap<String, TsStreamState>>> =
 /// 会话上限（兜底防泄漏）。生产路径上开新投屏会清空全部旧会话，同时在用的
 /// 最多 1~2 个；此上限主要服务于并行跑的单元测试（多个测试各自持有会话），
 /// 太小会在测试中途淘汰活跃会话（曾导致随机的跨测试失败）。
-const TS_STREAM_STATE_MAX: usize = 16;
+/// 用 cfg! 表达式而不是 #[cfg] 属性对：属性形态会被 no_dangling 守卫
+/// 当作孤儿属性形态审查，表达式形态没有这个负担。
+const TS_STREAM_STATE_MAX: usize = if cfg!(test) { 16 } else { 4 };
+
+/// MPEG-TS 包长。下行写出按它对齐：不足一个包的尾巴扣住不写（对电视
+/// 本就没有消费价值——解复用器按 188 字节单位取用），等下一块凑齐；
+/// 分片失败被跳过时尾巴丢弃，分界因而永远落在包边界上。
+const TS_PACKET_SIZE: usize = 188;
 
 /// 续传/诊断用的会话只读快照。
 /// 需要会话数据的地方在锁内按需拷贝标量字段（管道里的任务句柄不适合整体克隆）。
@@ -3332,6 +3357,7 @@ struct TsSessionSnap {
     resume_hits: u32,
     pipeline_hits: u32,
     started_at: Option<std::time::Instant>,
+    conn_log: Vec<String>,
 }
 
 fn ts_session_snap(st: &TsStreamState) -> TsSessionSnap {
@@ -3342,6 +3368,7 @@ fn ts_session_snap(st: &TsStreamState) -> TsSessionSnap {
         resume_hits: st.resume_hits,
         pipeline_hits: st.pipeline_hits,
         started_at: st.started_at,
+        conn_log: st.conn_log.clone(),
     }
 }
 
@@ -3591,6 +3618,33 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
     // 续传时首个写出分片的片内偏移：电视要第 N 字节起的数据，
     // 写出前先丢弃其之前的部分（同字节位置的同内容重发，无害）。
     let mut skip_now = resume_skip;
+    // 诊断轨迹：电视每次连入记一行——出事时能直接区分「缓冲饿死」
+    // （上一连接送出少、间隔长）与「偏移错位」（Range 与表位置对不上）。
+    if let Ok(mut map) = TS_STREAM_STATES.lock() {
+        if let Some(st) = map.get_mut(&token) {
+            let now = Instant::now();
+            let since = st.last_conn_at.map(|t| now.duration_since(t).as_secs_f32());
+            let sent = st.total_bytes.saturating_sub(st.last_conn_total);
+            let range_desc = match requested_offset {
+                Some(n) => format!("Range {:.2}MB", n as f64 / 1048576.0),
+                None if skip_now > 0 => "无 Range（按会话末尾续传）".to_string(),
+                None => "无 Range（从头发送）".to_string(),
+            };
+            st.conn_log.push(format!(
+                "#{} +{:.1}s {} · 上一连接送出 {:.2}MB",
+                st.connections,
+                since.unwrap_or(0.0),
+                range_desc,
+                sent as f64 / 1048576.0,
+            ));
+            if st.conn_log.len() > 8 {
+                let drop_n = st.conn_log.len() - 8;
+                st.conn_log.drain(..drop_n);
+            }
+            st.last_conn_at = Some(now);
+            st.last_conn_total = st.total_bytes;
+        }
+    }
     // 预取管线：上游并行挂 TS_PREFETCH_DEPTH 个分片请求，写出严格按清单顺序。
     // 单连接串行时，任一分片的下载慢都会直接饿死电视缓冲（转圈）；
     // 并行预取把有效供给拉回多连接水平（与浏览器里 hls.js 的行为一致）。
@@ -3745,18 +3799,48 @@ Content-Length: {}\r\nConnection: close\r\n\r\n",
                     (chunk, e.done, e.failed.clone())
                 };
                 if let Some(c) = chunk {
-                    pos += c.len() as u64;
-                    // 写失败只可能是电视主动断开（切集/退出投屏），是正常结束。
-                    if stream.write_all(&c).await.is_err() || stream.flush().await.is_err() {
-                        break 'seg SegOutcome::WriteBroken;
+                    // 只送出 188 对齐的部分：不足一个 TS 包的尾巴对电视本来
+                    // 就没有消费价值（解复用器按 188 字节单位取用），扣住它
+                    // 等下一块凑齐——解码失败被跳过时尾巴直接丢弃，分片边界
+                    // 因而永远落在 TS 包边界上，不会拦腰截断一个包。
+                    let aligned = (c.len() / TS_PACKET_SIZE) * TS_PACKET_SIZE;
+                    if aligned > 0 {
+                        pos += aligned as u64;
+                        // 写失败只可能是电视主动断开（切集/退出投屏），是正常结束。
+                        if stream.write_all(&c[..aligned]).await.is_err()
+                            || stream.flush().await.is_err()
+                        {
+                            break 'seg SegOutcome::WriteBroken;
+                        }
+                        continue;
                     }
-                    continue;
+                    // 不足一包：进入收尾/等待判断（尾巴等下一块；done 时整段 flush）
                 }
                 if done {
+                    // 收尾：把最后不足 188 的尾巴也写出去——分片自身的字节
+                    // 完整性优先（源的片长本就不是 188 整数倍时，尾巴是它
+                    // 真实存在的字节；下一个分片以自己的 0x47 开头，解复用器
+                    // 照常重同步）。
+                    let tail = {
+                        let e = lock_entry(&entry);
+                        if (e.data.len() as u64) > pos {
+                            e.data[pos as usize..].to_vec()
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    if !tail.is_empty() {
+                        if stream.write_all(&tail).await.is_err()
+                            || stream.flush().await.is_err()
+                        {
+                            break 'seg SegOutcome::WriteBroken;
+                        }
+                    }
                     break 'seg SegOutcome::Done;
                 }
                 if let Some(reason) = failed {
-                    // 半截失败：已写出的部分保留，按坏分片计数/跳过（旧策略）
+                    // 半截失败：已写出的对齐部分保留（尾巴丢弃），按坏分片
+                    // 计数/跳过——delivered = pos 恒为 188 的整数倍。
                     break 'seg SegOutcome::Failed(reason, pos);
                 }
                 notified.await;
@@ -5583,8 +5667,9 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         let _ = server.await;
         let body_pos = out.windows(4).position(|w| w == b"\r\n\r\n").expect("头体分界") + 4;
         let body = &out[body_pos..];
-        // 500×A + 300×B（半截即失败，续接被 404 拒绝）+ 400×C
-        assert_eq!(body.len(), 1200, "失败分片只应有已下发的 300 字节");
+        // 500×A + 188×B（半截 300 字节中只有 188 对齐部分写出，尾巴丢弃——
+        // 分片边界永远落在 TS 包边界上）+ 400×C
+        assert_eq!(body.len(), 1088, "失败分片只应下发 188 对齐的部分");
         assert_eq!(resumes.load(Ordering::SeqCst), 1, "应尝试过 1 次续接（被拒）");
         let snap = TS_STREAM_STATES
             .lock()
@@ -5595,12 +5680,13 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         let sizes: Vec<u64> = snap.served.iter().map(|(_, sz)| *sz).collect();
         assert_eq!(
             sizes,
-            vec![500, 300, 400],
+            vec![500, 188, 400],
             "失败分片的登记长度必须校正为实际下发数（否则偏移整体错位）"
         );
-        assert_eq!(snap.total_bytes, 1200, "total_bytes 同步校正");
+        assert_eq!(snap.total_bytes, 1088, "total_bytes 同步校正");
+        assert_eq!(sizes[1] % 188, 0, "失败分界的下发量必须是 188 的整数倍");
 
-        // 重连定位必须与「实际字节流」一致：bytes=900- 应落在 seg3 内偏移 100
+        // 重连定位必须与「实际字节流」一致：bytes=900- 应落在 seg3 内偏移 212
         // （若表仍是 500+1000，900 会错落到 seg2 的幽灵区间）
         let mut client2 = tokio::net::TcpStream::connect(tv_addr).await.unwrap();
         let (sock2, _) = tv.accept().await.unwrap();
@@ -5618,7 +5704,8 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         assert!(head2.starts_with("HTTP/1.1 206"), "续传应 206: {}", head2);
         let body2_pos = out2.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
         let body2 = &out2[body2_pos..];
-        assert_eq!(body2.len(), 300, "从实际字节流第 900 字节起应剩 300 字节");
+        // 表：500 + 188 + 400 = 1088；900 落在 seg3 内偏移 212 → 剩 188 字节
+        assert_eq!(body2.len(), 188, "从实际字节流第 900 字节起应剩 188 字节");
         assert!(body2.iter().all(|b| *b == b'C'), "第 900 字节应落在 seg3 内");
     }
 
