@@ -56,6 +56,8 @@ const permissions = {
   // （HyperOS/ColorOS 等尤其激进，仅靠前台服务+Wi-Fi 锁不足以保证熄屏后网络不被限速）。
   // 本应用经 GitHub 直发，不受 Google Play 对该权限的上架政策约束。
   REQUEST_IGNORE_BATTERY_OPTIMIZATIONS: 'android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS',
+  // 音乐后台播放前台服务（mediaPlayback 类型）：Android 14+ 要求声明对应权限
+  FOREGROUND_SERVICE_MEDIA_PLAYBACK: 'android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK',
 };
 const missing = Object.values(permissions).filter((name) => !manifest.includes(name));
 if (missing.length > 0) {
@@ -81,6 +83,20 @@ if (!manifest.includes('CastKeepAliveService')) {
     // 静默失败会导致服务未注册：投屏保活一启动就 ActivityNotFoundException。
     // 在 CI 阶段直接失败，比真机排查便宜得多。
     console.error('[android-overrides] 无法定位 </application>，CastKeepAliveService 未注册。');
+    process.exit(1);
+  }
+}
+
+// 音乐后台播放前台服务（与 PlayerBridge.music* / MusicPlaybackService 配套）。
+// foregroundServiceType="mediaPlayback"：音频播放类前台服务的标准类型。
+if (!manifest.includes('MusicPlaybackService')) {
+  const before = manifest;
+  manifest = manifest.replace(
+    '</application>',
+    '    <service\n        android:name=".MusicPlaybackService"\n        android:exported="false"\n        android:foregroundServiceType="mediaPlayback" />\n</application>'
+  );
+  if (manifest === before) {
+    console.error('[android-overrides] 无法定位 </application>，MusicPlaybackService 未注册。');
     process.exit(1);
   }
 }

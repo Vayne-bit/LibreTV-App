@@ -10,6 +10,63 @@ const musicPlayer = {
     objectUrl: null // 离线播放的 ObjectURL（切歌时 revoke，防句柄泄漏）
 };
 
+// ---- 原生后台播放（Android 桥）----
+// 检测到 musicPlay 桥方法时把播放委派给原生 MediaPlayer 前台服务：
+// 离开音乐页面（文档销毁）、熄屏、切 App 都不中断——<audio> 做不到这些。
+// 进度由轮询驱动，完成/出错由服务经 __libretvMusicEvent 回推。
+
+function musicUseNative() {
+    const bridge = typeof getAndroidBridge === 'function' ? getAndroidBridge() : null;
+    return !!(bridge && typeof bridge.musicPlay === 'function');
+}
+
+let musicNativePollTimer = null;
+function musicNativeStartPolling() {
+    if (musicNativePollTimer) return;
+    musicNativePollTimer = setInterval(() => {
+        const bridge = typeof getAndroidBridge === 'function' ? getAndroidBridge() : null;
+        if (!bridge) return;
+        const pos = bridge.musicGetPosition ? bridge.musicGetPosition() : 0;
+        const dur = bridge.musicGetDuration ? bridge.musicGetDuration() : 0;
+        if (typeof musicPlayerUI !== 'undefined' && musicPlayerUI.onTimeUpdate) {
+            musicPlayerUI.onTimeUpdate(pos || 0, dur || 0);
+        }
+    }, 500);
+}
+
+function musicNativeStopPolling() {
+    if (musicNativePollTimer) {
+        clearInterval(musicNativePollTimer);
+        musicNativePollTimer = null;
+    }
+}
+
+// 服务事件回推入口（MainActivity.MusicEventSink 调用）
+window.__libretvMusicEvent = function (event) {
+    if (event === 'ended') {
+        musicState.playing = false;
+        if (typeof musicPlayerUI !== 'undefined' && musicPlayerUI.onPlayState) musicPlayerUI.onPlayState(false);
+        musicNativeStopPolling();
+        musicPlayerPlayNext(true);
+    } else if (event === 'error') {
+        musicPlayerHandleLoadFail();
+    } else if (event === 'playing') {
+        musicState.playing = true;
+        musicPlayer.failStreak = 0;
+        if (typeof musicPlayerUI !== 'undefined' && musicPlayerUI.onPlayState) musicPlayerUI.onPlayState(true);
+        musicPlayerSyncMediaSessionState();
+    } else if (event === 'paused') {
+        musicState.playing = false;
+        if (typeof musicPlayerUI !== 'undefined' && musicPlayerUI.onPlayState) musicPlayerUI.onPlayState(false);
+        musicPlayerSyncMediaSessionState();
+    } else if (event === 'stopped') {
+        musicState.playing = false;
+        musicNativeStopPolling();
+        if (typeof musicPlayerUI !== 'undefined' && musicPlayerUI.onPlayState) musicPlayerUI.onPlayState(false);
+    }
+    return true;
+};
+
 function musicPlayerEnsure() {
     if (musicPlayer.audio) return musicPlayer.audio;
     const audio = new Audio();
@@ -122,6 +179,25 @@ async function musicPlayerPlayAt(index) {
     }
 
     musicState.currentSource = source;
+    // 原生后台播放路径：委派给 Android 服务（离线 blob 不能进原生——
+    // 离线曲目的 URL 是本进程的 blob:，仍走 <audio>）
+    if (musicUseNative() && !source.offline) {
+        const bridge = getAndroidBridge();
+        bridge.musicPlay(source.url, item.title || '未知曲名', item.artist || '', 0);
+        musicNativeStartPolling();
+        if (typeof musicPlayerUI !== 'undefined' && musicPlayerUI.onTrackChange) {
+            musicPlayerUI.onTrackChange(item, index);
+        }
+        if (typeof musicLyricsLoad === 'function') musicLyricsLoad(item);
+        if (typeof navigator !== 'undefined' && navigator.mediaSession) {
+            try {
+                navigator.mediaSession.metadata = new MediaMetadata({
+                    title: item.title || '未知曲名', artist: item.artist || ''
+                });
+            } catch (e) { /* 忽略 */ }
+        }
+        return;
+    }
     musicPlayerRevokeObjectUrl();
     if (source.offline && source.url.startsWith('blob:')) musicPlayer.objectUrl = source.url;
     // <audio> 无法带自定义请求头：先直接播；Tauri 环境下带 headers 的源走 Blob 兜底
@@ -205,6 +281,17 @@ function musicPlayerPlayResolved(item, source, queueIndex) {
     const audio = musicPlayerEnsure();
     audio.pause();
     musicState.currentSource = source;
+    // 原生后台播放路径（替代源也走服务）
+    if (musicUseNative() && !source.offline) {
+        const bridge = getAndroidBridge();
+        bridge.musicPlay(source.url, item.title || '未知曲名', item.artist || '', 0);
+        musicNativeStartPolling();
+        if (typeof musicPlayerUI !== 'undefined' && musicPlayerUI.onTrackChange) {
+            musicPlayerUI.onTrackChange(item, queueIndex);
+        }
+        if (typeof musicLyricsLoad === 'function') musicLyricsLoad(item);
+        return;
+    }
     musicPlayerRevokeObjectUrl();
     if (source.offline && source.url.startsWith('blob:')) musicPlayer.objectUrl = source.url;
     audio.src = source.url;
@@ -254,6 +341,18 @@ function musicPlayerPlayPrev() {
 }
 
 function musicPlayerToggle() {
+    // 原生后台播放：暂停/继续走服务（无 src 概念，用位置判断是否已开播）
+    if (musicUseNative()) {
+        const bridge = getAndroidBridge();
+        const pos = bridge.musicGetPosition ? bridge.musicGetPosition() : 0;
+        if (!pos) {
+            if (musicState.queue.length) musicPlayerPlayAt(Math.max(0, musicState.index));
+            return;
+        }
+        if (bridge.musicIsPlaying && bridge.musicIsPlaying()) bridge.musicPause();
+        else bridge.musicResume();
+        return;
+    }
     const audio = musicPlayerEnsure();
     if (!audio.src) {
         if (musicState.queue.length) musicPlayerPlayAt(Math.max(0, musicState.index));
@@ -268,6 +367,12 @@ function musicPlayerToggle() {
 }
 
 function musicPlayerSeek(seconds) {
+    // 原生后台播放：seek 走服务
+    if (musicUseNative()) {
+        const bridge = getAndroidBridge();
+        if (bridge.musicSeek) bridge.musicSeek(seconds);
+        return;
+    }
     const audio = musicPlayer.audio;
     if (!audio || !isFinite(audio.duration)) return;
     audio.currentTime = Math.max(0, Math.min(audio.duration - 0.2, seconds));

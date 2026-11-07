@@ -144,6 +144,108 @@
         }
     };
 
+    // ---------- 咪咕源（借鉴 go-music-dl/music-lib 的公开端点，2026-11-07 实测）----------
+    // 搜索 pd.musicapp.migu.cn search_all.do（全球可用，实测 200/20 条）；
+    // 播放 c.musicapp.migu.cn listen-url（App 头 GET，按 toneFlag 取 PQ/HQ/SQ）。
+    // 免费内容给完整曲（4.3MB/128k 实测大小合理）；版权方限制或海外 IP 会返回
+    // cannotCode 440001「暂无法在当前地区提供服务」——如实报错。
+    // 免登录可用；登录 Cookie 提升音质（本项目不引入登录）。
+    const miguSource = {
+        platform: '咪咕',
+        version: '1.0.0',
+        builtin: true,
+        description: '咪咕音乐公开接口（搜索/播放/歌词）。免费内容给完整曲；部分版权内容有地区限制。',
+        _UA_APP: 'Android_migu/7.41.13 okhttp/3.12.13',
+
+        async _get(url, headers) {
+            const useTauri = typeof isTauriApp === 'function' && isTauriApp() && typeof tauriInvoke === 'function';
+            const h = Object.assign({ 'User-Agent': this._UA_APP }, headers || {});
+            if (useTauri) {
+                // App 内走 Rust 通道（咪咕接口无 CORS 头，WebView 直连会被拦）
+                const resp = await tauriInvoke('make_http_request', {
+                    options: { url, method: 'GET', headers: h, timeout_secs: 12, response_as_text: true }
+                });
+                if (!(resp.status >= 200 && resp.status < 300)) throw new Error('HTTP ' + resp.status);
+                return resp.body;
+            }
+            const resp = await fetch(url, { headers: h });
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            return resp.text();
+        },
+
+        async search(query, page, type) {
+            if (type !== 'music') return { isEnd: true, data: [] };
+            const sw = encodeURIComponent('{"song":1,"album":0,"singer":0,"tagSong":0,"mvSong":0,"songlist":0,"bestShow":1}');
+            const text = await this._get('http://pd.musicapp.migu.cn/MIGUM2.0/v1.0/content/search_all.do?ua=Android_migu&version=5.0.1&text='
+                + encodeURIComponent(query) + '&pageNo=' + (page || 1) + '&pageSize=20&searchSwitch=' + sw,
+                { Referer: 'http://m.music.migu.cn/' });
+            const json = JSON.parse(text);
+            const list = (json.songResultData && json.songResultData.result) || [];
+            const data = list.map(item => {
+                const toneOf = t => (item.newRateFormats || []).find(f => f.formatType === t);
+                const artwork = ((item.imgItems || [])[0] || {}).img || '';
+                return {
+                    id: String(item.contentId || item.copyrightId || ''),
+                    contentId: String(item.contentId || ''),
+                    copyrightId: String(item.copyrightId || ''),
+                    songId: String(item.songId || ''),
+                    resourceType: String(item.resourceType || '2'),
+                    lyricUrl: item.lyricUrl || '',
+                    hasHQ: !!toneOf('HQ'),
+                    hasSQ: !!toneOf('SQ'),
+                    title: stripTags(item.songName || item.name || '未知曲名'),
+                    artist: stripTags((item.singers || []).map(s => s.name).join('/')
+                        || String(item.singerName || '').replace(/<[^>]+>/g, '') || '未知歌手'),
+                    album: stripTags(((item.albums || [])[0] || {}).name || ''),
+                    artwork: artwork.startsWith('http') ? artwork : (artwork ? 'https://d.musicapp.migu.cn/' + artwork.replace(/^\//, '') : ''),
+                    duration: Number(item.duration) || 0,
+                    payHint: false
+                };
+            });
+            const total = (json.songResultData && json.songResultData.totalCount) || data.length;
+            return { isEnd: (page || 1) * 20 >= total, data };
+        },
+
+        async getMediaSource(musicItem, quality) {
+            // 音质映射：standard=PQ(128k)，high=HQ(320k)，super=SQ(flac)；
+            // 目标档拿不到自动落到 PQ（与 music-lib 的 [ZQ32, target, PQ] 阶梯同思路的简化版）
+            const tones = quality === 'super' ? ['SQ', 'HQ', 'PQ']
+                : quality === 'high' ? (musicItem.hasHQ ? ['HQ', 'PQ'] : ['PQ'])
+                : ['PQ'];
+            for (const tone of tones) {
+                const p = new URLSearchParams({
+                    netType: '01',
+                    resourceType: musicItem.resourceType || '2',
+                    contentId: musicItem.contentId || musicItem.id || '',
+                    toneFlag: tone
+                });
+                if (musicItem.copyrightId) p.set('copyrightId', musicItem.copyrightId);
+                if (musicItem.songId) p.set('songId', musicItem.songId);
+                const text = await this._get('https://c.musicapp.migu.cn/MIGUM2.0/v2.1/content/listen-url?' + p.toString(), {
+                    channel: '0146832', version: '7.41.13', Referer: 'https://music.migu.cn/'
+                });
+                const json = JSON.parse(text);
+                const d = json.data || {};
+                if (d.url) {
+                    const url = d.url.startsWith('//') ? 'https:' + d.url : d.url;
+                    return { url, headers: null };
+                }
+                // 地区限制/版权限制：如实抛出（不再往低档试——地区错误换档也一样）
+                if (d.cannotCode === '440001' || (d.dialogInfo && d.dialogInfo.text)) {
+                    throw new Error((d.dialogInfo && d.dialogInfo.text) || '该内容在当前地区不可用');
+                }
+            }
+            return null; // 各档都无 URL：交给上层「暂无可用音源」提示/换源
+        },
+
+        async getLyric(musicItem) {
+            if (!musicItem.lyricUrl) return null;
+            const text = await this._get(musicItem.lyricUrl.startsWith('//') ? 'https:' + musicItem.lyricUrl : musicItem.lyricUrl);
+            if (!text || text.length < 4) return null;
+            return { rawLrc: text };
+        }
+    };
+
     // ---------- 插件加载与导入 ----------
 
     function registerSource(source, builtin) {
@@ -163,6 +265,7 @@
     function initBuiltinMusicSources() {
         if (builtinRegistered) return;
         registerSource(kugouSource, true);
+        registerSource(miguSource, true);
         builtinRegistered = true;
     }
 

@@ -17,6 +17,9 @@ function makeSandbox() {
     encodeURIComponent, decodeURIComponent, atob: (s) => Buffer.from(s, 'base64').toString('binary'),
     escape: (s) => String(s).replace(/[^\x00-\x7e]/g, ch => '%' + ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0')),
     localStorage: storage, navigator: {},
+    // music_player 的提示路径用（music.html 页面里有内联兜底，沙箱里补桩）
+    showToast: () => {},
+    Audio: class { addEventListener() {} pause() {} play() { return Promise.resolve(); } set src(v) {} get src() { return ''; } },
   };
   // __win 必须就是全局自身：浏览器里 window===globalThis，
   // 插件挂到 window 上的东西其它模块要能用裸名访问到

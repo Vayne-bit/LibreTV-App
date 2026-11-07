@@ -19,6 +19,11 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 
+/** 音乐服务 → WebView 的事件回传通道（ended/error/playing/paused/stopped）。 */
+object MusicEventSink {
+  @Volatile var emit: ((String) -> Unit)? = null
+}
+
 class MainActivity : TauriActivity() {
   private var webView: WebView? = null
 
@@ -123,6 +128,12 @@ class MainActivity : TauriActivity() {
     this.webView = webView
     webView.settings.mediaPlaybackRequiresUserGesture = false
     webView.addJavascriptInterface(PlayerBridge(), "LibreTVAndroid")
+    // 音乐服务事件（ended/error…）回推到当前 WebView
+    MusicEventSink.emit = { js ->
+      runOnUiThread {
+        try { webView.evaluateJavascript(js, null) } catch (e: Exception) { /* 已销毁 */ }
+      }
+    }
   }
 
   override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -398,5 +409,56 @@ class MainActivity : TauriActivity() {
         }
       }
     }
+
+    // ---- 音乐后台播放（原生 MediaPlayer 挂前台服务，换页/熄屏/切 App 不停）----
+    // JS 侧 music_player.js 检测到这些桥方法时把播放委派给服务；
+    // 进度由 JS 轮询 musicGetPosition，完成/出错经 MusicEventSink 回推 WebView。
+
+    @JavascriptInterface
+    fun musicPlay(url: String, title: String, artist: String, position: Double) {
+      try {
+        val intent = Intent(this@MainActivity, MusicPlaybackService::class.java)
+          .setAction(MusicPlaybackService.ACTION_PLAY)
+          .putExtra(MusicPlaybackService.EXTRA_URL, url)
+          .putExtra(MusicPlaybackService.EXTRA_TITLE, title)
+          .putExtra(MusicPlaybackService.EXTRA_ARTIST, artist)
+          .putExtra(MusicPlaybackService.EXTRA_POSITION, position.toFloat())
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent)
+        else @Suppress("DEPRECATION") startService(intent)
+      } catch (e: Exception) { /* 启动失败静默：JS 侧有 <audio> 兜底 */ }
+    }
+
+    @JavascriptInterface
+    fun musicPause() {
+      try { startService(Intent(this@MainActivity, MusicPlaybackService::class.java).setAction(MusicPlaybackService.ACTION_PAUSE)) }
+      catch (e: Exception) { /* 忽略 */ }
+    }
+
+    @JavascriptInterface
+    fun musicResume() {
+      try { startService(Intent(this@MainActivity, MusicPlaybackService::class.java).setAction(MusicPlaybackService.ACTION_RESUME)) }
+      catch (e: Exception) { /* 忽略 */ }
+    }
+
+    @JavascriptInterface
+    fun musicStop() {
+      try { startService(Intent(this@MainActivity, MusicPlaybackService::class.java).setAction(MusicPlaybackService.ACTION_STOP)) }
+      catch (e: Exception) { /* 忽略 */ }
+    }
+
+    @JavascriptInterface
+    fun musicSeek(seconds: Double) {
+      try { startService(Intent(this@MainActivity, MusicPlaybackService::class.java).setAction(MusicPlaybackService.ACTION_SEEK).putExtra(MusicPlaybackService.EXTRA_POSITION, seconds.toFloat())) }
+      catch (e: Exception) { /* 忽略 */ }
+    }
+
+    @JavascriptInterface
+    fun musicGetPosition(): Double = MusicPlaybackService.getPositionSeconds()
+
+    @JavascriptInterface
+    fun musicGetDuration(): Double = MusicPlaybackService.getDurationSeconds()
+
+    @JavascriptInterface
+    fun musicIsPlaying(): Boolean = MusicPlaybackService.isPlayingNow()
   }
 }

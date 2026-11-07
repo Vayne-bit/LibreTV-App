@@ -78,9 +78,19 @@ function loadModule(sb, relPath, exportsName) {
   check('重新启用后恢复',
     MusicPlugin.getEnabledMusicSources().some(s => s.platform === '测试源'));
 
-  // 删除
+  // 删除（内置源现有酷狗+咪咕两个）
   MusicPlugin.removeMusicPlugin('测试源');
-  check('删除后仅剩内置源', MusicPlugin.listMusicSources().length === 1);
+  check('删除后仅剩内置源', MusicPlugin.listMusicSources().length === 2
+    && MusicPlugin.listMusicSources().some(s => s.platform === '酷狗')
+    && MusicPlugin.listMusicSources().some(s => s.platform === '咪咕'));
+
+  // 导入静态扫描：触达宿主能力的插件被硬拒绝（纵深防御第二层）
+  let hostBlocked = false;
+  try { MusicPlugin.importMusicPlugin('module.exports = { platform: "坏2", search: () => tauriInvoke("x") };'); }
+  catch (e) { hostBlocked = /宿主能力/.test(e.message); }
+  check('触达宿主能力的插件被拒绝', hostBlocked);
+  // 内置源注册数在拒绝后不变
+  check('拒绝后源注册数不变', MusicPlugin.listMusicSources().length === 2);
 }
 
 // ---------- 2. LRC 解析 ----------
