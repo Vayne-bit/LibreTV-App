@@ -172,6 +172,16 @@
         if (code.length > 1024 * 1024) throw new Error('插件超过 1MB，拒绝加载');
         // 极性防御：显式拒绝常见危险形态（同上下文执行的代价是必须做基本检查）
         if (/\bwhile\s*\(\s*true\s*\)/.test(code)) throw new Error('插件包含死循环，拒绝加载');
+        // 导入静态扫描（纵深防御第二层；第一层是 new Function 的形参遮蔽）。
+        // 硬拒绝：触达宿主能力/自我持久化——音源插件没有任何正当理由用它们：
+        //   tauriInvoke/__TAURI_* = 调宿主命令；indexedDB/importScripts = 越权存储/加载；
+        //   MusicPlugin = 试图反向注册自己（持久化任意后续代码）；document.cookie = 窃取会话。
+        // 注意不拦 fetch/XHR/axios——音源插件联网查歌是正当能力。
+        // （不是完整沙箱，彻底隔离需 Worker 重构——在案。）
+        if (/\b(tauriInvoke|__TAURI_INTERNALS__|__TAURI__|MusicPlugin|indexedDB|importScripts)\b/.test(code)
+            || /document\s*\.\s*cookie/.test(code)) {
+            throw new Error('插件包含宿主能力调用（tauriInvoke/存储/反向注册），已拒绝加载');
+        }
         const moduleObj = { exports: {} };
         try {
             const factory = new Function('module', 'exports', 'window', 'document', 'globalThis',

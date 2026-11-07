@@ -234,10 +234,24 @@ function musicUIBind() {
             if (!q) return;
             musicUISetView('search');
             musicSearchStart(q);
+            musicUISyncHotTagActive(q);
         });
+    }
+    if (searchInput) {
+        // 手动改词即熄灭标签（新搜索还没发起，旧高亮已不成立）
+        searchInput.addEventListener('input', () => musicUISyncHotTagActive(searchInput.value));
     }
     // 热门标签
     const hotRow = document.getElementById('musicHotTags');
+    // 点亮与当前搜索词一致的标签：点击标签=自动搜索+点亮；手动搜索命中
+    // 同词也点亮；改输入框即熄灭（CSS 的 .chip.active 样式原本就有，一直没人挂）
+    function musicUISyncHotTagActive(query) {
+        if (!hotRow) return;
+        const q = String(query || '').trim();
+        hotRow.querySelectorAll('[data-music-hot]').forEach(chip => {
+            chip.classList.toggle('active', chip.dataset.musicHot === q);
+        });
+    }
     if (hotRow) {
         hotRow.innerHTML = MUSIC_HOT_KEYWORDS.map(kw => `<button type="button" class="chip" data-music-hot="${escapeHtml(kw)}">${escapeHtml(kw)}</button>`).join('');
         hotRow.addEventListener('click', e => {
@@ -246,6 +260,7 @@ function musicUIBind() {
             if (searchInput) searchInput.value = chip.dataset.musicHot;
             musicUISetView('search');
             musicSearchStart(chip.dataset.musicHot);
+            musicUISyncHotTagActive(chip.dataset.musicHot);
         });
     }
 

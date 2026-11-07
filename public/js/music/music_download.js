@@ -89,8 +89,34 @@ function onMusicDlChange(listener) {
     return () => musicDlListeners.delete(listener);
 }
 
-// 下载一首：解析地址 -> 带进度取回 blob -> 入库
-async function musicDownloadTrack(item) {
+// 并发限流队列：MUSIC_DL_CONCURRENCY 此前声明了从未实现——多曲连点会
+// 互相抢带宽拖慢全部。现在排队执行，同时最多 2 首在传。
+const musicDlQueue = [];
+let musicDlActive = 0;
+
+// 下载一首：解析地址 -> 带进度取回 blob -> 入库（经队列限流）
+function musicDownloadTrack(item) {
+    return new Promise(resolve => {
+        musicDlQueue.push({ item, resolve });
+        musicDlPump();
+    });
+}
+
+function musicDlPump() {
+    while (musicDlActive < MUSIC_DL_CONCURRENCY && musicDlQueue.length) {
+        const job = musicDlQueue.shift();
+        musicDlActive++;
+        musicDownloadTrackRun(job.item)
+            .catch(e => ({ ok: false, reason: (e && e.message) || '下载失败' }))
+            .then(result => {
+                musicDlActive--;
+                job.resolve(result);
+                musicDlPump();
+            });
+    }
+}
+
+async function musicDownloadTrackRun(item) {
     const key = musicKey(item);
     const running = musicDlTasks.get(key);
     if (running && (running.status === 'downloading')) return { ok: false, reason: '该曲目正在下载' };

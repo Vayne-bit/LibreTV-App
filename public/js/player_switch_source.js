@@ -365,9 +365,14 @@ async function loadSwitchSources() {
     }
     renderSwitchSourceList();
 
-    for (const item of matches) {
+    // 分批并发探测（每批 4 个）：串行逐个探测时，10 个同名源最坏要等
+    // 1 分钟以上弹窗才填满（每项含详情请求 + 测速）。token 守卫照旧——
+    // 用户关弹窗/重新搜索后，过期批次的结果直接丢弃。
+    const BATCH = 4;
+    for (let i = 0; i < matches.length; i += BATCH) {
         if (token !== switchSourceState.token) return;
-        await resolveSwitchSourceItem(item);
+        const batch = matches.slice(i, i + BATCH);
+        await Promise.allSettled(batch.map(item => resolveSwitchSourceItem(item)));
         if (token !== switchSourceState.token) return;
         renderSwitchSourceList();
     }
