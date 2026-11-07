@@ -231,6 +231,18 @@ async function search() {
             });
         }
 
+        // 相关度过滤 + 排序：bfzy 等上游按「单字 OR」匹配（实证：千与千寻 33 条
+        // 中 18 条不相关），不滤的话第一屏全是垃圾。复用 apiSearchHandlers 的
+        // 同一实现（index.html 里先于本文件加载），与 api.js 聚合路径行为一致；
+        // 其中也包含标题/简介级的成人内容二次过滤。
+        if (typeof applySearchRelevanceAndFilter === 'function') {
+            const relevance = applySearchRelevanceAndFilter(allResults, query);
+            allResults = relevance.list;
+            if (relevance.droppedIrrelevant || relevance.droppedAdult) {
+                console.log(`[search] 相关度过滤: 丢弃无关 ${relevance.droppedIrrelevant} 条、成人 ${relevance.droppedAdult} 条，保留 ${allResults.length} 条`);
+            }
+        }
+
         const safeResults = allResults.map(item => {
             // 所有来自采集站 API 的字段统一走 escapeHtml（common.js），
             // 旧版这里的 .replace(/</g,'<') 是恒等替换（真 bug，等于没转义）。
