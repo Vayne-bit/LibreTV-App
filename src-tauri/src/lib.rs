@@ -205,6 +205,9 @@ async fn search_videos(
     query: String,
     source_id: String,
     custom_api_url: Option<String>,
+    // config.js 的 API_SITES 对象原样传入（site → {api, name}）——
+    // 消除「Rust 硬编码站点表与 JS 配置漂移」的双端同步负担
+    site_config: Option<std::collections::HashMap<String, serde_json::Value>>,
 ) -> Result<String, HttpError> {
     let source_info: ApiSourceInfo;
     let base_url: String;
@@ -233,7 +236,31 @@ async fn search_videos(
             }
         }
     } else {
-        match API_SITES_CONFIG.get(&source_id) {
+        // 优先用 JS 传入的站点配置（config.js 的 API_SITES 对象原样传入——
+        // 它是唯一事实源，新增站点即用，不再有「Rust 硬编码表漂移、
+        // 新站 Unknown source_id」的问题）；未传/不匹配时回退到内置表。
+        let mut from_js: Option<ApiSourceInfo> = None;
+        if let Some(sites) = &site_config {
+            if let Some(item) = sites.get(&source_id) {
+                from_js = Some(ApiSourceInfo {
+                    api_base_url: item
+                        .get("api")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    name: item
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(source_id.as_str())
+                        .to_string(),
+                    detail_base_url: None,
+                    api_type: ApiType::Json,
+                    search_path: None,
+                    detail_path: None,
+                });
+            }
+        }
+        match from_js.or_else(|| API_SITES_CONFIG.get(&source_id).cloned()) {
             Some(info) => {
                 source_info = info.clone();
                 base_url = source_info.api_base_url.clone();

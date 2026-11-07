@@ -964,6 +964,9 @@ function parseRawPlaylist(m3u8Content, baseUrl) {
         segments: blocks.reduce((acc, b) => acc.concat(b.segments), []),
         totalDuration: clock,
         baseUrl: baseUrl,
+        // 直播/滑窗清单（无 ENDLIST）：时间轴随播放滑动，广告标记/换算
+        // 全部无意义——标记入口按它拦截
+        isLive: m3u8Content.indexOf('#EXT-X-ENDLIST') < 0,
         at: Date.now()
     };
 }
@@ -1589,6 +1592,16 @@ function finishFiltering(filteredText, baseUrl) {
 // 再在过滤结果上走标记法（CUE / DATERANGE-SCTE35）或结构法。
 function filterAdsFromM3U8(m3u8Content, applyFilter, baseUrl) {
     if (!m3u8Content) return '';
+    // 直播/滑窗清单旁路：无 #EXT-X-ENDLIST 的清单没有固定时间轴，
+    // 删分片会让 MEDIA-SEQUENCE 与播放位置错位（hls.js 序号断层），
+    // 手动/自动标记的时间换算也全部失效——直播源整体跳过去广告
+    // （宁看广告不可断流；直播广告多为轮播贴片，跳过逻辑风险大于收益）。
+    const isLive = m3u8Content.indexOf('#EXT-X-ENDLIST') < 0
+        && (m3u8Content.indexOf('#EXTINF') >= 0 || m3u8Content.indexOf('#EXT-X-TARGETDURATION') >= 0);
+    if (isLive) {
+        recordAdFilterStats(m3u8Content, 0, false, 'live-bypass', 0);
+        return finishFiltering(m3u8Content, baseUrl);
+    }
     const lines = m3u8Content.split('\n');
     const afterHost = filterByHostRules(m3u8Content, lines, baseUrl, applyFilter);
     const linesAfter = afterHost.split('\n');

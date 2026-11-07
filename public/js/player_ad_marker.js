@@ -122,6 +122,11 @@
         if (typeof AdBlockLocator === 'undefined') return null;
         const playlist = currentPlaylist();
         if (!playlist) return null;
+        // 直播/滑窗清单没有固定时间轴（旧分片会滑出），标记换算无意义
+        if (playlist.isLive) {
+            toast('直播源不支持广告标记（时间轴随播放滑动）');
+            return null;
+        }
         const t = art && art.currentTime ? art.currentTime : 0;
         const removed = (typeof getRemovedSegmentIds === 'function') ? getRemovedSegmentIds(currentPlaylistUrl()) : null;
         try {
@@ -376,6 +381,11 @@
 
     function markStart() {
         if (!art) return;
+        const livePlaylist = currentPlaylist();
+        if (livePlaylist && livePlaylist.isLive) {
+            toast('直播源不支持广告标记（时间轴随播放滑动）');
+            return;
+        }
         const playTime = Math.round((art.currentTime || 0) * 10) / 10;
         // 起点也换算成原始时间轴（与自动标记、与存储格式保持一致）
         const playlist = currentPlaylist();

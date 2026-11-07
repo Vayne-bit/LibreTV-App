@@ -15,6 +15,9 @@ async function handleSingleSourceSearch(searchQuery, source, customApi) {
             query: searchQuery,
             sourceId: source,
             customApiUrl: customApi,
+            // config.js 的 API_SITES 原样传入：站点配置的唯一事实源在 JS——
+            // 新增站点即用，Rust 不再有会漂移的硬编码表（缺失时 Rust 回退内置表）
+            siteConfig: (typeof API_SITES === 'object' && API_SITES) || null,
         });
     } catch (error) {
         // Handle errors from tauri.invoke (e.g., Rust command panicked or returned HttpError)

@@ -65,8 +65,52 @@ function openDownloadDb() {
     return downloadDbPromise;
 }
 
-function downloadEpisodeKey(title, index) {
-    return `${String(title || '')}||${Number(index) || 0}`;
+// 键带来源（v2）：跨源同名剧集此前互相覆盖/误标已下载。
+// sourceCode 缺省时从当前页面上下文取（同一页面内所有调用点来源一致，
+// 外部调用方零改动）。
+function downloadSourceCodeForKeys() {
+    try {
+        const meta = downloadSourceMeta();
+        return (meta && meta.sourceCode) || '';
+    } catch (e) {
+        return '';
+    }
+}
+
+function downloadEpisodeKey(title, index, sourceCode) {
+    const src = sourceCode !== undefined ? (sourceCode || '') : downloadSourceCodeForKeys();
+    return `d2||${src}||${String(title || '')}||${Number(index) || 0}`;
+}
+
+function isLegacyEpisodeKey(key) {
+    return typeof key === 'string' && key.indexOf('d2||') !== 0;
+}
+
+// 一次性迁移：旧键（无来源）按记录里存的 sourceCode 重写为新键。
+// 迁移失败不致命——done 集合同时收录新旧两个键，标记不丢。
+let downloadKeysMigrated = false;
+async function migrateEpisodeKeys(db, rows) {
+    if (downloadKeysMigrated) return rows;
+    downloadKeysMigrated = true;
+    const legacy = rows.filter(r => isLegacyEpisodeKey(r.key));
+    if (!legacy.length) return rows;
+    const next = rows.slice();
+    try {
+        const tx = db.transaction(DOWNLOAD_EPISODE_STORE, 'readwrite');
+        const store = tx.objectStore(DOWNLOAD_EPISODE_STORE);
+        legacy.forEach(record => {
+            const newKey = downloadEpisodeKey(record.title, record.index, record.sourceCode || '');
+            if (!newKey || newKey === record.key) return;
+            store.delete(record.key);
+            store.put(Object.assign({}, record, { key: newKey, kver: 2 }));
+            const i = next.indexOf(record);
+            if (i >= 0) next[i] = Object.assign({}, record, { key: newKey, kver: 2 });
+        });
+        await new Promise(resolve => {
+            tx.oncomplete = resolve; tx.onerror = resolve; tx.onabort = resolve;
+        });
+    } catch (e) { /* 忽略：双键兜底仍生效 */ }
+    return next;
 }
 
 // 与 segmentCacheKey 保持一致，播放时 loader 才能用同一个 key 命中
@@ -291,11 +335,21 @@ function onDownloadChange(listener) {
 }
 
 // 剧集列表要判断「哪几集已经下好了」，每次刷新只读一次库，结果缓存在内存里
-function refreshDownloadedKeys() {
-    return listDownloadedEpisodes().then(rows => {
-        downloadDoneKeys = new Set(rows.filter(record => record.status === 'done').map(record => record.key));
+async function refreshDownloadedKeys() {
+    try {
+        const db = await openDownloadDb();
+        let rows = await listDownloadedEpisodes();
+        rows = await migrateEpisodeKeys(db, rows);
+        downloadDoneKeys = new Set();
+        rows.filter(record => record.status === 'done').forEach(record => {
+            // 新键（按来源区分）+ 旧键兜底：迁移失败的记录标记也不丢
+            downloadDoneKeys.add(downloadEpisodeKey(record.title, record.index, record.sourceCode || ''));
+            downloadDoneKeys.add(record.key);
+        });
         return downloadDoneKeys;
-    }).catch(() => downloadDoneKeys);
+    } catch (e) {
+        return downloadDoneKeys;
+    }
 }
 
 function isEpisodeDownloaded(title, index) {
@@ -615,7 +669,7 @@ function pumpDownloadQueue() {
 function queueEpisodeDownload({ title, index, label, url, episodes, episodeNames, cover, sourceName, sourceCode, info }) {
     if (!isDownloadSupported()) return { ok: false, reason: '当前环境不支持离线下载' };
     if (!url) return { ok: false, reason: '这一集没有可下载的地址' };
-    const key = downloadEpisodeKey(title, index);
+    const key = downloadEpisodeKey(title, index, sourceCode || '');
     const existing = downloadTasks.get(key);
     if (existing && (existing.status === 'downloading' || existing.status === 'queued')) {
         return { ok: false, reason: '这一集正在下载' };
