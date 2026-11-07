@@ -36,11 +36,6 @@ class MusicPlaybackService : Service() {
     private var pendingSeekMs = 0
     private var shouldPlayWhenReady = true
 
-    override fun onCreate() {
-        super.onCreate()
-        createNotificationChannel()
-    }
-
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_PLAY -> {
