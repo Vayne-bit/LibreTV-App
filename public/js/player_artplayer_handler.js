@@ -1134,32 +1134,78 @@ function adSinglePrefix(segments) {
     return set.size === 1 ? set.values().next().value : '';
 }
 
-// 找出广告块下标。判据：断点 + 无加密 KEY + 单一前缀 + 时长规整 + 三道安全阀。
-// 片头贴片（第 0 块，前面没断点）放宽「必须有断点」，但额外要求它的前缀不被其它块使用。
+// 找出广告块下标。两条判据：
+//   1. 严判据：断点 + 无加密 KEY + 单一前缀 + 时长规整 + 三道安全阀
+//      （片头贴片放宽「必须有断点」，但要求前缀不被其它块使用）
+//   2. 短广告夹层：同目录、无 KEY 的 SSAI（ffzy 系就是这样），广告块很短且被长正片夹住
 function findAdBlockIndexes(blocks) {
     let totalDuration = 0;
     blocks.forEach(block => block.segments.forEach(s => { totalDuration += s.duration; }));
     const indexes = [];
     blocks.forEach((block, index) => {
         if (!block.segments.length) return;
-        const isHead = index === 0 && !block.discontinuity;
-        if (!block.discontinuity && !isHead) return;
-        if (!block.keyNone) return;
-        const prefix = adSinglePrefix(block.segments);
-        if (!prefix) return;
-        if (!isUniformAdDuration(block.segments)) return;
-        if (block.duration <= 0 || block.duration > AD_BLOCK_MAX_SECONDS) return;
-        if (block.segments.length > AD_BLOCK_MAX_SEGMENTS) return;
-        let prefixDuration = 0;
-        blocks.forEach(b => b.segments.forEach(s => { if (s.pathPrefix === prefix) prefixDuration += s.duration; }));
-        if (totalDuration > 0 && prefixDuration / totalDuration > AD_PREFIX_MAX_RATIO) return;
-        if (isHead) {
-            const exclusive = blocks.slice(1).every(b => b.segments.every(s => s.pathPrefix !== prefix));
-            if (!exclusive) return;
+        if (matchesStrictAdBlock(block, index, blocks, totalDuration)) {
+            indexes.push(index);
+            return;
         }
-        indexes.push(index);
+        if (isShortAdPod(blocks, index, totalDuration)) indexes.push(index);
     });
     return indexes;
+}
+
+function matchesStrictAdBlock(block, index, blocks, totalDuration) {
+    const isHead = index === 0 && !block.discontinuity;
+    if (!block.discontinuity && !isHead) return false;
+    if (!block.keyNone) return false;
+    const prefix = adSinglePrefix(block.segments);
+    if (!prefix) return false;
+    if (!isUniformAdDuration(block.segments)) return false;
+    if (block.duration <= 0 || block.duration > AD_BLOCK_MAX_SECONDS) return false;
+    if (block.segments.length > AD_BLOCK_MAX_SEGMENTS) return false;
+    let prefixDuration = 0;
+    blocks.forEach(b => b.segments.forEach(s => { if (s.pathPrefix === prefix) prefixDuration += s.duration; }));
+    if (totalDuration > 0 && prefixDuration / totalDuration > AD_PREFIX_MAX_RATIO) return false;
+    if (isHead) {
+        // 贴片必须独占目录，否则普通播放列表的第一块会被误删
+        const exclusive = blocks.slice(1).every(b => b.segments.every(s => s.pathPrefix !== prefix));
+        if (!exclusive) return false;
+    }
+    return true;
+}
+
+// ---- 短广告夹层：同目录、无 KEY 的 SSAI ----
+// 有的站源（ffzy 系）把广告和正片放在同一个 CDN 目录，整条清单连一条
+// #EXT-X-KEY 都没有。严判据的两条（KEY:NONE、前缀隔离）在这里必然不满足，
+// 但广告块的特征依然明显：断点夹住、只有几个分片、总长十几二十秒，
+// 而两侧正片块都比它长一个数量级。
+// 实测样本（2026-11）：广告块 4~5 个分片 / 17~20s，邻居 330 个分片 / 1321s。
+const AD_POD_MAX_SECONDS = 90;
+const AD_POD_MAX_SEGMENTS = 20;
+const AD_POD_MAX_RATIO = 0.08;
+const AD_POD_NEIGHBOR_RATIO = 5;
+
+function isShortAdPod(blocks, index, totalDuration) {
+    const block = blocks[index];
+    if (!block.segments.length) return false;
+    // 第 0 块没有前置断点，同样按贴片处理；其余块必须有断点
+    const isHead = index === 0 && !block.discontinuity;
+    if (!block.discontinuity && !isHead) return false;
+    if (block.duration <= 0 || block.duration > AD_POD_MAX_SECONDS) return false;
+    if (block.segments.length > AD_POD_MAX_SEGMENTS) return false;
+    if (totalDuration > 0 && block.duration / totalDuration > AD_POD_MAX_RATIO) return false;
+    let prev = null;
+    for (let i = index - 1; i >= 0; i--) {
+        if (blocks[i].segments.length) { prev = blocks[i]; break; }
+    }
+    let next = null;
+    for (let i = index + 1; i < blocks.length; i++) {
+        if (blocks[i].segments.length) { next = blocks[i]; break; }
+    }
+    const muchLonger = b => !!b && b.duration >= block.duration * AD_POD_NEIGHBOR_RATIO;
+    if (isHead) return muchLonger(next);
+    if (prev && next) return muchLonger(prev) && muchLonger(next);
+    // 片尾贴片：只有前一侧有正片，那一侧必须远长于它
+    return muchLonger(prev);
 }
 
 function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
