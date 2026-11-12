@@ -2,9 +2,22 @@
 
 const PLAYER_ICONS = {
     next: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M6 6.5v11a1 1 0 0 0 1.52.85l8.5-5.5a1 1 0 0 0 0-1.7l-8.5-5.5A1 1 0 0 0 6 6.5zM17 6h2v12h-2z"/></svg>',
+    forward15: '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a7 7 0 1 1-6.6 4.7"/><path d="M12 2v6"/><path d="M9 5l3-3 3 3"/></svg>',
     fullscreenOn: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M4 9V4h5v2H6v3H4zm11-5h5v5h-2V6h-3V4zM6 15v3h3v2H4v-5h2zm12 0h2v5h-5v-2h3v-3z"/></svg>',
     fullscreenOff: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M7 4h2v5H4V7h3V4zm8 0h2v3h3v2h-5V4zM4 15h5v5H7v-3H4v-2zm11 0h5v2h-3v3h-2v-5z"/></svg>'
 };
+
+// 前进 15 秒：自动过滤漏掉的广告只能手动跳过。
+// 按钮挂在控制条左侧「下一集」旁边，只在全屏出现（见 .art-control-forward-15）。
+function seekForward15() {
+    if (!art || !art.video) return;
+    const duration = art.video.duration || 0;
+    const target = duration > 0
+        ? Math.min(duration - 1, art.video.currentTime + 15)
+        : art.video.currentTime + 15;
+    art.video.currentTime = Math.max(0, target);
+    if (typeof showToast === 'function') showToast('前进 15 秒', 'info');
+}
 
 const HLS_BASE_CONFIG = {
     debug: false,
@@ -212,7 +225,7 @@ function applyEpisodeDownloadToggle() {
     const result = toggleEpisodeDownload(currentEpisodeIndex);
     const message = (result && (result.message || result.reason)) || '无法下载这一集';
     if (art && art.notice) art.notice.show = message;
-    if (typeof updateEpisodeDownloadBadges === 'function') updateEpisodeDownloadBadges();
+    if (typeof renderDownloadModal === 'function') renderDownloadModal();
 }
 
 function requestEpisodeDownload() {
@@ -439,9 +452,17 @@ function initPlayer(videoUrl) {
         settings: buildPlayerSettings(),
         plugins: [buildHlsControlPlugin()].filter(Boolean),
         icons: androidBridge ? { fullscreenWebOn: PLAYER_ICONS.fullscreenOn, fullscreenWebOff: PLAYER_ICONS.fullscreenOff } : {},
-        // 控制条只留「下一集」一个自定义按钮。之前这里还挂了下载和片头标记，
-        // 361px 宽的手机上会把「全屏」按钮挤出屏幕，两个动作都挪到全屏顶部条去了。
+        // 控制条只留「前进 15 秒」「下一集」两个自定义按钮。下载和片头标记
+        // 之前也挂在这里，361px 宽的手机上会把「全屏」按钮挤出屏幕，都挪到全屏顶部条去了。
+        // 前进 15 秒只在全屏显示（CSS 控制），竖屏不占位置。
         controls: [{
+            name: 'forward-15',
+            position: 'left',
+            index: 14,
+            html: PLAYER_ICONS.forward15,
+            tooltip: '前进 15 秒',
+            click: () => seekForward15()
+        }, {
             name: 'next-episode',
             position: 'left',
             index: 15,
@@ -834,19 +855,26 @@ function isDiscontinuityLine(text) {
 }
 
 // 把播放列表按断点标记切成块，每块记录自己的分片、时长、以及前面有没有断点
-function splitPlaylistBlocks(lines) {
+// 块上额外带两个字段，是给「广告块结构判据」用的：
+//   keyNone —— 块内出现过 #EXT-X-KEY:METHOD=NONE（正片通常全程加密，广告块会切到明文）
+//   segments[].pathPrefix —— 分片所在的 host+目录（广告块整块来自另一个目录）
+function splitPlaylistBlocks(lines, baseUrl) {
     const blocks = [];
-    let block = { discontinuity: false, lines: [], segments: [], duration: 0 };
+    let block = { discontinuity: false, keyNone: false, lines: [], segments: [], duration: 0 };
     let pending = 0;
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
         const trimmed = line.trim();
         if (isDiscontinuityLine(trimmed)) {
             blocks.push(block);
-            block = { discontinuity: true, lines: [], segments: [], duration: 0 };
+            block = { discontinuity: true, keyNone: false, lines: [], segments: [], duration: 0 };
             continue;
         }
         block.lines.push(line);
+        if (trimmed.indexOf('#EXT-X-KEY') === 0) {
+            if (trimmed.indexOf('METHOD=NONE') >= 0) block.keyNone = true;
+            continue;
+        }
         if (trimmed.indexOf('#EXTINF') === 0) {
             const value = parseFloat(trimmed.slice(8));
             pending = isNaN(value) ? 0 : value;
@@ -854,13 +882,28 @@ function splitPlaylistBlocks(lines) {
         }
         // 非 # 开头的非空行就是分片地址
         if (trimmed && trimmed.charAt(0) !== '#') {
-            block.segments.push({ uri: trimmed, duration: pending });
+            block.segments.push({
+                uri: trimmed,
+                duration: pending,
+                pathPrefix: playlistPathPrefix(trimmed, baseUrl)
+            });
             block.duration += pending;
             pending = 0;
         }
     }
     blocks.push(block);
     return blocks;
+}
+
+// 分片所在的 host + 目录。相对路径必须按真实 baseUrl 解析，
+// 否则前缀全坍缩成 placeholder.invalid/…，「前缀隔离」这条安全阀直接失效。
+function playlistPathPrefix(uri, baseUrl) {
+    try {
+        const resolved = new URL(uri, baseUrl || 'https://placeholder.invalid/');
+        return resolved.host + resolved.pathname.replace(/[^/]*$/, '');
+    } catch (e) {
+        return '';
+    }
 }
 
 function playlistHost(uri, baseUrl) {
@@ -881,7 +924,7 @@ function playlistHost(uri, baseUrl) {
 function filterByHostRules(m3u8Content, lines, baseUrl, applyFilter) {
     const learned = new Set(getLearnedAdHosts());
     const hostHit = uri => isAdSegmentUri(uri) || learned.has(playlistHost(uri, baseUrl));
-    const blocks = splitPlaylistBlocks(lines);
+    const blocks = splitPlaylistBlocks(lines, baseUrl);
     const hasMarkers = blocks.some(block => block.discontinuity);
     if (hasMarkers) {
         const hitBlocks = [];
@@ -1048,49 +1091,86 @@ function isAdEndTag(trimmed) {
     return trimmed.indexOf('#EXT-X-DATERANGE') === 0 && trimmed.indexOf('SCTE35-IN=') >= 0;
 }
 
-// 结构法：断点夹住、分片全在别的域名上、且整块很短的，判定为广告块，整块删掉。
-// 删的时候连同块前那个断点一起丢，让下一个保留块自己的断点顶上，
-// 正片前后正好剩一个断点——时间轴需要它重新对齐，少了会出现缓冲空洞。
+// 结构法：认「整块就是广告」的插播块。
+//
+// 旧判据「这块的域名，前面的正片一个都没用过」有致命缺陷：contentHosts 只在
+// 非广告块累积，被判广告的块直接 return 不记域名，首块之后判据几乎恒真，
+// 连锁误删正片（真实站源实测 40 个清单误删 8 块、精确率 52.9%）。
+// 换成严判据：断点 + 无加密 KEY + 整块同一路径前缀 + 块内时长规整，
+// 再加三道安全阀（时长 ≤300s、分片数 ≤40、该前缀时长占比 ≤30%）。
+// 宁可漏删广告，也不能删掉正片。
+const AD_BLOCK_MAX_SEGMENTS = 40;
+const AD_PREFIX_MAX_RATIO = 0.3;
+const AD_UNIFORM_TOLERANCE = 0.15;
+
+// 块内分片时长是否规整。广告块末尾常有一段偏短残片（对齐回正片时间轴），
+// 也可能混一条偏长的创意——两者都算离群，但「与众数同长」的分片必须过半。
+function isUniformAdDuration(segments) {
+    if (!segments.length) return false;
+    const counts = new Map();
+    segments.forEach(s => {
+        const key = Math.round(s.duration * 10) / 10;
+        counts.set(key, (counts.get(key) || 0) + 1);
+    });
+    let mode = 0;
+    let modeCount = 0;
+    counts.forEach((n, d) => { if (n > modeCount) { modeCount = n; mode = d; } });
+    if (!mode) return false;
+    let matching = 0;
+    let outliers = 0;
+    segments.forEach(s => {
+        const d = Math.round(s.duration * 10) / 10;
+        if (Math.abs(d - mode) <= mode * AD_UNIFORM_TOLERANCE) matching += 1;
+        else if (s.duration < mode * 0.7) outliers += 1;
+        else if (s.duration <= mode * 2.5) outliers += 1;
+    });
+    if (matching + outliers < segments.length) return false;
+    return matching >= Math.max(1, Math.ceil(segments.length / 2));
+}
+
+// 块内分片是否全部来自同一路径前缀，是则返回该前缀
+function adSinglePrefix(segments) {
+    const set = new Set(segments.map(s => s.pathPrefix));
+    return set.size === 1 ? set.values().next().value : '';
+}
+
+// 找出广告块下标。判据：断点 + 无加密 KEY + 单一前缀 + 时长规整 + 三道安全阀。
+// 片头贴片（第 0 块，前面没断点）放宽「必须有断点」，但额外要求它的前缀不被其它块使用。
+function findAdBlockIndexes(blocks) {
+    let totalDuration = 0;
+    blocks.forEach(block => block.segments.forEach(s => { totalDuration += s.duration; }));
+    const indexes = [];
+    blocks.forEach((block, index) => {
+        if (!block.segments.length) return;
+        const isHead = index === 0 && !block.discontinuity;
+        if (!block.discontinuity && !isHead) return;
+        if (!block.keyNone) return;
+        const prefix = adSinglePrefix(block.segments);
+        if (!prefix) return;
+        if (!isUniformAdDuration(block.segments)) return;
+        if (block.duration <= 0 || block.duration > AD_BLOCK_MAX_SECONDS) return;
+        if (block.segments.length > AD_BLOCK_MAX_SEGMENTS) return;
+        let prefixDuration = 0;
+        blocks.forEach(b => b.segments.forEach(s => { if (s.pathPrefix === prefix) prefixDuration += s.duration; }));
+        if (totalDuration > 0 && prefixDuration / totalDuration > AD_PREFIX_MAX_RATIO) return;
+        if (isHead) {
+            const exclusive = blocks.slice(1).every(b => b.segments.every(s => s.pathPrefix !== prefix));
+            if (!exclusive) return;
+        }
+        indexes.push(index);
+    });
+    return indexes;
+}
+
 function filterByStructure(m3u8Content, lines, baseUrl, applyFilter) {
-    const blocks = splitPlaylistBlocks(lines);
+    const blocks = splitPlaylistBlocks(lines, baseUrl);
     let totalSegments = 0;
     let totalDuration = 0;
     blocks.forEach(block => block.segments.forEach(segment => {
         totalSegments += 1;
         totalDuration += segment.duration;
     }));
-    // 判广告不看「哪个域名分片多」——广告块比正片块长时那个判据会反过来。
-    // 改成「这块用的域名，前面的正片一个都没用过」：广告和正片永远不在同一个域名上。
-    const contentHosts = new Set();
-    const dropped = [];
-    blocks.forEach((block, index) => {
-        if (!block.segments.length) return;
-        const hosts = block.segments.map(segment => playlistHost(segment.uri, baseUrl));
-        const resetKey = block.lines.some(line => line.trim().indexOf('#EXT-X-KEY:METHOD=NONE') === 0);
-        const short = block.duration > 0 && block.duration <= AD_BLOCK_MAX_SECONDS;
-        const disjoint = hosts.every(host => !contentHosts.has(host));
-        // 没有前置断点就不是插播块：这一条保证「没有断点标记的播放列表一律不动」
-        const isAd = block.discontinuity && short && (disjoint || resetKey);
-        if (isAd) {
-            dropped.push(index);
-            return;
-        }
-        hosts.forEach(host => contentHosts.add(host));
-    });
-    // 片头贴片广告：第一块没有前置断点，上面的规则碰不到它。
-    // 两遍扫描：等正片域名收集完，若第一块全部分片都在正片没用过的域名上且很短，判为片头广告。
-    if (blocks.length > 1 && blocks[0].segments.length && dropped.indexOf(0) < 0) {
-        const first = blocks[0];
-        const firstHosts = first.segments.map(segment => playlistHost(segment.uri, baseUrl)).filter(Boolean);
-        const otherHosts = new Set();
-        blocks.slice(1).forEach(block => block.segments.forEach(segment => {
-            const host = playlistHost(segment.uri, baseUrl);
-            if (host) otherHosts.add(host);
-        }));
-        const disjoint = firstHosts.length > 0 && firstHosts.every(host => !otherHosts.has(host));
-        const short = first.duration > 0 && first.duration <= AD_BLOCK_MAX_SECONDS;
-        if (disjoint && short) dropped.push(0);
-    }
+    const dropped = findAdBlockIndexes(blocks);
     if (!dropped.length) {
         recordAdFilterStats(m3u8Content, 0, false, 'none', 0);
         return m3u8Content;

@@ -67,16 +67,13 @@ function renderEpisodeGroups() {
     }).join('');
 }
 
-const EPISODE_DOWNLOAD_ICON = '<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><path d="M12 3a1 1 0 0 1 1 1v8.6l2.3-2.3a1 1 0 0 1 1.4 1.4l-4 4a1 1 0 0 1-1.4 0l-4-4a1 1 0 0 1 1.4-1.4L11 12.6V4a1 1 0 0 1 1-1zM5 18a1 1 0 0 1 1 1h12a1 1 0 0 1 1-1v1a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-1z"/></svg>';
-const EPISODE_DONE_ICON = '<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><path d="M9.5 17.4 4.6 12.5a1 1 0 0 1 1.4-1.4l3.5 3.5 7.5-7.5a1 1 0 1 1 1.4 1.4l-8.2 8.2a1 1 0 0 1-1.4 0z"/></svg>';
-
 function renderEpisodes() {
     const episodesList = document.getElementById('episodesList');
     if (!episodesList) return;
     renderEpisodeGroups();
-    // 单集片源没有「整季」可言，按钮藏掉
+    // 没有集数时下载入口没有意义
     const seasonBtn = document.getElementById('downloadSeasonBtn');
-    if (seasonBtn) seasonBtn.classList.toggle('hidden', !(currentEpisodes && currentEpisodes.length > 1));
+    if (seasonBtn) seasonBtn.classList.toggle('hidden', !(currentEpisodes && currentEpisodes.length > 0));
 
     if (!currentEpisodes || currentEpisodes.length === 0) {
         episodesList.innerHTML = '<div class="empty-tip">没有可用的集数</div>';
@@ -97,42 +94,61 @@ function renderEpisodes() {
         return `<button type="button" class="episode-btn ${active ? 'active' : ''}" data-index="${i}" title="${escapeHtml(label)}">
             ${active ? '<span class="episode-playing" aria-hidden="true"><i></i><i></i><i></i></span>' : ''}
             <span class="episode-label">${escapeHtml(label)}</span>
-            <span class="episode-dl" data-download="${i}" role="button" aria-label="下载本集" title="下载本集">${EPISODE_DOWNLOAD_ICON}</span>
         </button>`;
     }).join('');
 
     const activeButton = episodesList.querySelector('.episode-btn.active');
     if (activeButton) activeButton.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-    updateEpisodeDownloadBadges();
+    renderDownloadModal();
 }
 
-// 只改小图标，不整块重绘列表，否则正在滑动的列表会被拽回去
-function updateEpisodeDownloadBadges() {
-    const episodesList = document.getElementById('episodesList');
-    if (!episodesList || typeof isEpisodeDownloaded !== 'function') return;
-    episodesList.querySelectorAll('.episode-dl[data-download]').forEach(badge => {
-        const index = parseInt(badge.dataset.download, 10);
-        if (!Number.isFinite(index)) return;
-        const key = downloadEpisodeKey(currentVideoTitle, index);
-        const task = typeof downloadTaskFor === 'function' ? downloadTaskFor(key) : null;
-        const running = task && (task.status === 'downloading' || task.status === 'queued');
-        if (running) {
-            const percent = task.total ? Math.min(99, Math.floor(task.done / task.total * 100)) : 0;
-            badge.classList.add('busy');
-            badge.classList.remove('done');
-            badge.textContent = task.status === 'queued' ? '排队' : `${percent}%`;
-            badge.title = '点击取消下载';
-            badge.setAttribute('aria-label', '取消下载');
-            return;
-        }
-        const done = isEpisodeDownloaded(currentVideoTitle, index);
-        badge.classList.remove('busy');
-        badge.classList.toggle('done', done);
-        badge.innerHTML = done ? EPISODE_DONE_ICON : EPISODE_DOWNLOAD_ICON;
-        badge.title = done ? '已下载，点击删除' : '下载本集';
-        badge.setAttribute('aria-label', done ? '删除离线文件' : '下载本集');
-    });
+// 下载入口统一走弹窗：集数按钮上的 24px 角标在手机上根本点不准，还容易连带切集。
+// 弹窗里一集一行，点哪集下哪集，状态（未下/下载中/已下载）也在这一份里刷新。
+function downloadModalEpisodeState(index) {
+    const key = downloadEpisodeKey(currentVideoTitle, index);
+    const task = typeof downloadTaskFor === 'function' ? downloadTaskFor(key) : null;
+    if (task && (task.status === 'downloading' || task.status === 'queued')) {
+        const percent = task.total ? Math.min(99, Math.floor(task.done / task.total * 100)) : 0;
+        return { cls: 'busy', text: task.status === 'queued' ? '排队中' : `下载中 ${percent}%` };
+    }
+    if (typeof isEpisodeDownloaded === 'function' && isEpisodeDownloaded(currentVideoTitle, index)) {
+        return { cls: 'done', text: '已下载' };
+    }
+    return { cls: '', text: '未下载' };
 }
+
+function renderDownloadModal() {
+    const list = document.getElementById('downloadModalList');
+    if (!list) return;
+    // 弹窗没打开就不建 DOM：几百集一次全量渲染纯浪费
+    const modal = document.getElementById('downloadModal');
+    if (modal && modal.classList.contains('hidden')) return;
+    if (!currentEpisodes || !currentEpisodes.length) {
+        list.innerHTML = '<div class="empty-tip">没有可下载的集数</div>';
+        return;
+    }
+    // 只在打开/状态变化时渲染，避免每集状态变化都整块重绘把滚动位置拽回去
+    list.innerHTML = currentEpisodes.map((_, index) => {
+        const state = downloadModalEpisodeState(index);
+        return `<button type="button" class="download-ep-row ${state.cls}" data-download-index="${index}">
+            <span class="download-ep-label">${escapeHtml(getEpisodeLabel(index))}</span>
+            <span class="download-ep-state">${state.text}</span>
+        </button>`;
+    }).join('');
+}
+
+function openDownloadModal() {
+    const modal = document.getElementById('downloadModal');
+    if (!modal) return;
+    modal.classList.remove('hidden');
+    renderDownloadModal();
+}
+
+function closeDownloadModal() {
+    const modal = document.getElementById('downloadModal');
+    if (modal) modal.classList.add('hidden');
+}
+
 
 function updateOrderButton() {
     const orderText = document.getElementById('orderText');
@@ -221,31 +237,38 @@ function setupPlayerPageEvents() {
     const episodesList = document.getElementById('episodesList');
     if (episodesList) {
         episodesList.addEventListener('click', (e) => {
-            // 下载图标在剧集按钮里面，要先拦下来，否则点下载会顺带切集
-            const badge = e.target.closest('.episode-dl');
-            if (badge) {
-                e.stopPropagation();
-                e.preventDefault();
-                const index = parseInt(badge.dataset.download, 10);
-                if (!Number.isFinite(index) || typeof toggleEpisodeDownload !== 'function') return;
-                const result = toggleEpisodeDownload(index);
-                if (result && result.message && typeof art !== 'undefined' && art && art.notice) {
-                    art.notice.show = result.message;
-                } else if (result && result.reason && typeof art !== 'undefined' && art && art.notice) {
-                    art.notice.show = result.reason;
-                }
-                updateEpisodeDownloadBadges();
-                return;
-            }
             const btn = e.target.closest('.episode-btn');
             if (btn) playEpisode(parseInt(btn.dataset.index, 10));
         });
         if (typeof onDownloadChange === 'function') {
-            onDownloadChange(() => updateEpisodeDownloadBadges());
+            onDownloadChange(() => renderDownloadModal());
         }
         if (typeof refreshDownloadedKeys === 'function') {
-            refreshDownloadedKeys().then(() => updateEpisodeDownloadBadges());
+            refreshDownloadedKeys().then(() => renderDownloadModal());
         }
+    }
+
+    // 下载弹窗：点哪集下哪集。已下好的再点一次是删除，正在下的再点一次是取消。
+    const downloadList = document.getElementById('downloadModalList');
+    if (downloadList) {
+        downloadList.addEventListener('click', (e) => {
+            const row = e.target.closest('[data-download-index]');
+            if (!row || typeof toggleEpisodeDownload !== 'function') return;
+            const index = parseInt(row.dataset.downloadIndex, 10);
+            if (!Number.isFinite(index)) return;
+            const result = toggleEpisodeDownload(index);
+            const message = (result && (result.message || result.reason)) || '';
+            if (message && typeof art !== 'undefined' && art && art.notice) art.notice.show = message;
+            renderDownloadModal();
+        });
+    }
+    const downloadClose = document.getElementById('downloadModalCloseBtn');
+    if (downloadClose) downloadClose.addEventListener('click', closeDownloadModal);
+    const downloadBackdrop = document.getElementById('downloadModal');
+    if (downloadBackdrop) {
+        downloadBackdrop.addEventListener('click', (e) => {
+            if (e.target === downloadBackdrop) closeDownloadModal();
+        });
     }
 
     const groups = document.getElementById('episodeGroups');
@@ -274,7 +297,8 @@ function setupPlayerPageEvents() {
     bind('prevButton', playPreviousEpisode);
     bind('nextButton', playNextEpisode);
     bind('orderBtn', toggleEpisodeOrder);
-    bind('downloadSeasonBtn', () => {
+    bind('downloadSeasonBtn', openDownloadModal);
+    bind('downloadModalSeasonBtn', () => {
         if (typeof downloadAllEpisodes !== 'function') return;
         const result = downloadAllEpisodes();
         if (!result || !result.ok) {
@@ -287,7 +311,7 @@ function setupPlayerPageEvents() {
             : '整季都已在下载或已下载';
         if (art && art.notice) art.notice.show = message;
         if (typeof showToast === 'function') showToast(message, result.count ? 'success' : 'info');
-        updateEpisodeDownloadBadges();
+        renderDownloadModal();
     });
     bind('copyLinkBtn', copyLinks);
     bind('favoriteBtn', togglePlayerFavorite);

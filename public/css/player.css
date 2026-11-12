@@ -200,8 +200,8 @@
 
 .episode-grid {
     display: grid;
-    /* 加了下载角标和播放动画之后，64px 的格子放不下「第100集」这种五六个字的标签，
-       文字会被 ellipsis 吃掉。抬高到 100px，右边给角标留 26px、左右对称 */
+    /* 加了播放动画之后，64px 的格子放不下「第100集」这种五六个字的标签，
+       文字会被 ellipsis 吃掉。抬高到 100px，左右对称 */
     grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
     gap: 8px;
 }
@@ -242,38 +242,7 @@
     text-overflow: ellipsis;
 }
 
-/* 下载图标放在集数按钮右侧，单独吃点击事件，不触发切集 */
-.episode-dl {
-    position: absolute;
-    right: 2px;
-    top: 50%;
-    transform: translateY(-50%);
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 24px;
-    height: 24px;
-    border-radius: 50%;
-    font-size: 10px;
-    line-height: 1;
-    color: var(--text-muted, rgba(255, 255, 255, .45));
-    transition: background-color .15s, color .15s;
-}
-
-.episode-dl:hover,
-.episode-dl:active {
-    background: rgba(255, 255, 255, .1);
-    color: var(--text);
-}
-
-.episode-dl.busy,
-.episode-dl.done {
-    color: var(--accent);
-}
-
-.episode-dl.done {
-    background: var(--accent-soft);
-}
+/* 下载入口改到弹窗（见 .download-modal-list），集数按钮不再有角标 */
 
 /* 播放中的跳动条绝对定位在左侧，不参与 flex 排布，
    否则「正在播的这一集」标签会被挤短，正好就是用户看到的「看不到第几集」 */
@@ -604,6 +573,59 @@ body.player-fullscreen {
     font-size: 12px;
 }
 
+/* --- 下载弹窗：一集一行，点哪集下哪集 --- */
+
+.download-modal-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 50vh;
+    overflow-y: auto;
+}
+
+.download-ep-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    width: 100%;
+    padding: 11px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+    text-align: left;
+}
+
+.download-ep-row .download-ep-label {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+.download-ep-row .download-ep-state {
+    flex: 0 0 auto;
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+.download-ep-row.busy,
+.download-ep-row.done {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.download-ep-row.busy .download-ep-state,
+.download-ep-row.done .download-ep-state {
+    color: var(--accent);
+}
+
+.download-modal-all {
+    align-self: center;
+}
+
 /* --- 拖动后等缓冲的提示条 --- */
 
 .player-buffer-pill {
@@ -661,6 +683,13 @@ body.player-fullscreen {
     font-size: 14px;
     font-weight: 400;
     color: rgba(255, 255, 255, 0.68);
+}
+
+/* --- 前进 15 秒按钮 ---
+   挂在控制条左侧「下一集」旁边，只在全屏出现：竖屏 361px 宽时多一个按钮
+   会把「全屏」按钮挤出屏幕。自动过滤漏掉的广告只能手动跳过。 */
+.art-video-player:not(.art-fullscreen):not(.art-fullscreen-web) .art-control-forward-15 {
+    display: none;
 }
 
 /* --- 全屏顶部信息条 ---

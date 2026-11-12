@@ -89,7 +89,7 @@
                         </button>
                         <button id="downloadSeasonBtn" type="button" class="text-btn">
                             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v10"/><path d="M8 10.5l4 4 4-4"/><path d="M4 19h16"/></svg>
-                            <span>下载本季</span>
+                            <span>下载</span>
                         </button>
                     </div>
                 </div>
@@ -112,6 +112,19 @@
                 </button>
             </div>
             <div id="switchSourceList" class="switch-source-list"></div>
+        </div>
+    </div>
+
+    <div id="downloadModal" class="switch-source-modal hidden">
+        <div class="switch-source-box">
+            <div class="switch-source-head">
+                <h2>下载</h2>
+                <button id="downloadModalCloseBtn" type="button" class="icon-btn" aria-label="关闭">
+                    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+                </button>
+            </div>
+            <div id="downloadModalList" class="download-modal-list"></div>
+            <button id="downloadModalSeasonBtn" type="button" class="text-btn download-modal-all">下载整季</button>
         </div>
     </div>
 
