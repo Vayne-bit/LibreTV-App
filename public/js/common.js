@@ -71,3 +71,16 @@ document.addEventListener('error', (event) => {
         img.classList.add('poster-missing');
     }
 }, true);
+
+// 横向 chip 行（播放源、线路、分组、搜索源筛选）在桌面上滚轮滚不动：
+// 这些行只有横向溢出，鼠标滚轮默认只发纵向滚动，用户看不出还能横向翻。
+// 鼠标悬停时把纵向滚轮转成横向滚动；行本身没有溢出就不拦，页面照常滚。
+document.addEventListener('wheel', (event) => {
+    if (event.ctrlKey || event.deltaY === 0) return;
+    const row = event.target instanceof Element ? event.target.closest('.chip-row') : null;
+    if (!row || row.scrollWidth <= row.clientWidth + 1) return;
+    const delta = Math.abs(event.deltaY) > Math.abs(event.deltaX) ? event.deltaY : event.deltaX;
+    const before = row.scrollLeft;
+    row.scrollLeft = before + delta;
+    if (row.scrollLeft !== before) event.preventDefault();
+}, { passive: false });

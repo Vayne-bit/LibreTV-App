@@ -135,6 +135,18 @@ button {
 
 .chip-row::-webkit-scrollbar { display: none; }
 
+/* 手机靠手指滑动，隐藏滚动条更好看；桌面用鼠标既没有滚动条也滚不动，
+   就看不出这行还能横向滚动。有鼠标的设备上补一条细滚动条。 */
+@media (hover: hover) and (pointer: fine) {
+    .chip-row {
+        padding-bottom: 6px;
+        scrollbar-width: thin;
+        scrollbar-color: #3a3a42 transparent;
+    }
+
+    .chip-row::-webkit-scrollbar { display: block; height: 6px; }
+}
+
 .chip {
     flex-shrink: 0;
     height: 32px;
